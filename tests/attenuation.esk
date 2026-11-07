@@ -1,0 +1,152 @@
+// Point and spot lights on a white Lambert wall (z = 0, facing +Z) seen
+// straight on through an orthographic camera, linear float output. At a wall
+// point p the expected value is attenuation(|light - p|) * cone(angle) * N.L,
+// with the CPU curves of SceneLight_attenuation and SceneLight_cone. Then the
+// influence mask (a light that does not reach a node) and the limit of eight
+// lights per draw.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 64;
+const float VIEW = 8.0;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+float red(*uint16 px, int x, int y) {
+    return half_to_float(px[(y * N + x) * 4]);
+}
+
+float world(int p) {
+    return ((float)p + 0.5) / (float)N * VIEW - VIEW * 0.5;
+}
+
+bool near(float a, float b) {
+    float tol = 0.006 + 0.01 * b;
+    return a - b < tol && b - a < tol;
+}
+
+// The wall's expected value at pixel (x, y) under light l.
+float expect(*SceneLight l, int x, int y) {
+    Vec3 p = Vec3{world(x), -world(y), 0.0};
+    Vec3 to = l.position - p;
+    float dist = to.length();
+    Vec3 dir = to.normalize();
+    float nl = dir.z > 0.0 ? dir.z : 0.0;
+    float cone = 1.0;
+    if (l.type == SCENE_LIGHT_SPOT) cone = l.cone((float)acos((double)dir.dot(-l.direction)));
+    return l.attenuation(dist) * cone * nl * l.intensity;
+}
+
+int compare(string what, *uint16 px, *SceneLight l) {
+    int bad = 0;
+    int nonzero = 0;
+    int zero = 0;
+    for (y in 0..N / 2) {
+        int x = 32 + y;
+        if (x >= N) break;
+        float want = expect(l, x, 32);
+        float got = red(px, x, 32);
+        if (want > 0.05) nonzero++;
+        if (want == 0.0) zero++;
+        if (!near(got, want)) {
+            if (bad < 4) printf("  %s at x %d: got %.4f, want %.4f\n", what, x, (double)got, (double)want);
+            bad++;
+        }
+    }
+    if (bad > 0) {
+        printf("FAIL %s: %d pixels off\n", what, bad);
+        fails++;
+    }
+    check("the profile covers lit and unlit points", nonzero > 4 && zero > 2);
+    return bad;
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    SceneGeometry wall = scene_quad(VIEW, VIEW);
+    int mesh = scene.add_geometry(&wall)?;
+    wall.free();
+    SceneMaterial m = scene_material(SCENE_LAMBERT);
+    int node = scene.add_object(0, mesh, scene.add_material(m));
+    int cam = scene.add_camera(0, scene_orthographic(VIEW, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+
+    SceneLight point = scene_point(Vec3{0.0, 0.0, 1.0}, Vec3{1.0, 1.0, 1.0}, 1.0, 0.5, 3.0);
+    int li = scene.add_light(point);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    compare("point, falloff 2", px, &point);
+
+    scene.light(li).falloff = 1.0;
+    point.falloff = 1.0;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    compare("point, linear falloff", px, &point);
+
+    SceneLight spot = scene_spot(Vec3{0.0, 0.0, 2.0}, Vec3{0.0, 0.0, -1.0}, Vec3{1.0, 1.0, 1.0}, 1.5, 0.3, 0.6, 0.0, 30.0);
+    *SceneLight sl = scene.light(li);
+    *sl = spot;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    compare("spot cone", px, &spot);
+    check("spot: full inside the inner cone", near(red(px, 32, 32), expect(&spot, 32, 32)) && red(px, 32, 32) > 1.0);
+
+    // a light whose influence misses the node's mask lights nothing
+    scene.light(li).influence = 2;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("influence mask", red(px, 32, 32) == 0.0);
+    scene.node(node).light_mask = 3;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("influence mask shared bit", red(px, 32, 32) > 1.0);
+    scene.light(li).enabled = false;
+
+    // ten directional lights of 0.1 straight on: only eight reach the draw
+    for (i in 0..10) scene.add_light(scene_directional(Vec3{0.0, 0.0, -1.0}, Vec3{1.0, 1.0, 1.0}, 0.1));
+    scene.render_to(&target)?;
+    target.read(px)?;
+    float eight = red(px, 10, 10);
+    printf("  ten lights of 0.1: %.4f\n", (double)eight);
+    check("at most eight lights per draw", near(eight, 0.8));
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("attenuation: ok\n");
+    return 0;
+}
