@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    # Software Vulkan (lavapipe): the pixel tests run with no GPU. wgpu-native comes from the
+    # gpu package's [native] archives, fetched by eskiuc test.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu and lavapipe
+        run: |
+          curl -fsSL https://eskiu-lang.org/install.sh | ESKIU_PREFIX=$HOME/.eskiu sh
+          echo "$HOME/.eskiu/bin" >> $GITHUB_PATH
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 unzip
+      - name: Tests
+        run: eskiuc test
+      - name: API reference is current
+        run: python3 -I tools/gen_api.py --check
+      - name: The example type-checks
+        run: eskiuc examples/scene.esk --test-typechecker
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu and SDL3
+        run: brew install eskiu-lang/eskiu/eskiu sdl3
+      - name: Tests
+        run: eskiuc test
+      - name: Example builds
+        run: |
+          mkdir -p build
+          for f in examples/*.esk; do eskiuc -L$(brew --prefix)/lib "$f" -o build/$(basename "$f" .esk); done
+
+  windows:
+    # DirectX 12 through WARP, Windows' software adapter: the tests run with no GPU.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc unzip diffutils
+      - name: Install Eskiu
+        run: |
+          curl -fsSL -o eskiu.zip https://github.com/eskiu-lang/eskiu/releases/latest/download/eskiuc-windows-x86_64.zip
+          # The archive's paths use backslashes; unzip extracts it and exits with 1 (a warning).
+          unzip -q eskiu.zip -d $HOME/eskiu || [ $? -eq 1 ]
+          test -x $HOME/eskiu/bin/eskiuc.exe
+      - name: Tests
+        run: |
+          export PATH="$HOME/eskiu/bin:$PATH"
+          CC=gcc eskiuc test
