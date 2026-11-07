@@ -1,0 +1,305 @@
+// post.esk: tone mapping, gamma and bloom (`<scene/post>`).
+//
+// A scene is drawn into an RGBA16Float image in linear light, where values
+// may go past 1. The last pass maps it to the output: bloom first (the parts
+// brighter than bloom_threshold, blurred at half size and added back), then
+// the tone mapping operator, then sRGB encoding when the output format does
+// not do it.
+//
+//     scene.post.tone_mapping = SCENE_TONE_HABLE;
+//     scene.post.exposure = 0.5;        // stops: the image is scaled by 2^exposure
+//     scene.post.bloom = true;
+//
+// scene_tone_map and scene_srgb compute the same curves on the CPU.
+
+import <mem>;
+import <libc>;
+import <result>;
+import <list>;
+import <gpu/raw>;
+import <gpu/core>;
+import <gpu/render>;
+import <gpu/math>;
+
+// Tone mapping operators (ScenePost.tone_mapping), on c = color * 2^exposure:
+// NONE keeps c; REINHARD is c / (1 + c); EXPOSURE is 1 - exp(-c); HABLE is the filmic
+// curve of Uncharted 2 (A 0.15, B 0.50, C 0.10, D 0.20, E 0.02, F 0.30) divided by its
+// value at white_point. Each works on the red, green and blue channels separately.
+const int SCENE_TONE_NONE = 0;
+const int SCENE_TONE_REINHARD = 1;
+const int SCENE_TONE_EXPOSURE = 2;
+const int SCENE_TONE_HABLE = 3;
+
+// The final pass's settings; the zero value is no tone mapping, no bloom and sRGB
+// encoding off (Gpu_scene turns gamma on):
+// - tone_mapping: a SCENE_TONE_* operator; exposure in stops (0 keeps the brightness);
+//   white_point for HABLE (0 is 11.2).
+// - gamma: encode the result to sRGB when the output format is not an sRGB one (an sRGB
+//   format encodes it itself). Off, a float output gets linear values.
+// - bloom: add a blur of the bright parts; bloom_threshold is the luminance where it
+//   starts (0 is 1.0), bloom_strength scales it (0 is 1.0), bloom_passes is the number of
+//   horizontal and vertical blur pairs at half size (0 is 4; more spreads wider).
+struct ScenePost {
+    int tone_mapping;
+    float exposure;
+    float white_point;
+    bool gamma;
+    bool bloom;
+    float bloom_threshold;
+    float bloom_strength;
+    int bloom_passes;
+}
+
+float _scene_hable(float x) {
+    return ((x * (0.15 * x + 0.10 * 0.50) + 0.20 * 0.02) / (x * (0.15 * x + 0.50) + 0.20 * 0.30)) - 0.02 / 0.30;
+}
+
+float _scene_tone1(float c, *ScenePost p) {
+    float h = c * (float)pow(2.0, (double)p.exposure);
+    if (p.tone_mapping == SCENE_TONE_REINHARD) return h / (1.0 + h);
+    if (p.tone_mapping == SCENE_TONE_EXPOSURE) return 1.0 - (float)exp((double)(-h));
+    if (p.tone_mapping == SCENE_TONE_HABLE) {
+        float w = p.white_point > 0.0 ? p.white_point : 11.2;
+        float r = _scene_hable(h);
+        if (r < 0.0) r = 0.0;
+        return r / _scene_hable(w);
+    }
+    return h;
+}
+
+// A linear color through p's tone mapping operator and exposure (no bloom, no gamma), as
+// the final pass computes it.
+Vec3 scene_tone_map(Vec3 c, *ScenePost p) {
+    return Vec3{_scene_tone1(c.x, p), _scene_tone1(c.y, p), _scene_tone1(c.z, p)};
+}
+
+// A linear value (0 to 1) encoded with the sRGB curve.
+float scene_srgb(float c) {
+    if (c <= 0.0) return 0.0;
+    if (c >= 1.0) return 1.0;
+    if (c <= 0.0031308) return c * 12.92;
+    return 1.055 * (float)pow((double)c, 1.0 / 2.4) - 0.055;
+}
+
+// An sRGB-encoded value (0 to 1) back to linear light.
+float scene_linear(float c) {
+    if (c <= 0.04045) return c / 12.92;
+    return (float)pow((double)((c + 0.055) / 1.055), 2.4);
+}
+
+string _scene_post_wgsl =
+    "struct Post { a: vec4<f32>, b: vec4<f32> };\n"
+    "@group(0) @binding(0) var<uniform> post: Post;\n"
+    "@group(0) @binding(1) var src: texture_2d<f32>;\n"
+    "@group(0) @binding(2) var samp: sampler;\n"
+    "@group(0) @binding(3) var bloom_tex: texture_2d<f32>;\n"
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    var o: V;\n"
+    "    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    o.uv = vec2<f32>(p.x, 1.0 - p.y);\n"
+    "    return o;\n"
+    "}\n"
+    "@fragment fn fs_bright(v: V) -> @location(0) vec4<f32> {\n"
+    "    let c = textureSample(src, samp, v.uv).rgb;\n"
+    "    let lum = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));\n"
+    "    let w = max(lum - post.a.x, 0.0) / max(lum, 1e-4);\n"
+    "    return vec4<f32>(c * w, 1.0);\n"
+    "}\n"
+    "@fragment fn fs_blur(v: V) -> @location(0) vec4<f32> {\n"
+    "    var w = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);\n"
+    "    var c = textureSample(src, samp, v.uv).rgb * w[0];\n"
+    "    for (var i = 1; i < 5; i++) {\n"
+    "        let o = post.a.xy * f32(i);\n"
+    "        c += textureSample(src, samp, v.uv + o).rgb * w[i];\n"
+    "        c += textureSample(src, samp, v.uv - o).rgb * w[i];\n"
+    "    }\n"
+    "    return vec4<f32>(c, 1.0);\n"
+    "}\n"
+    "fn hable(x: vec3<f32>) -> vec3<f32> {\n"
+    "    return ((x * (0.15 * x + 0.05) + 0.004) / (x * (0.15 * x + 0.5) + 0.06)) - 0.02 / 0.3;\n"
+    "}\n"
+    "fn srgb(c: vec3<f32>) -> vec3<f32> {\n"
+    "    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));\n"
+    "    return select(1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055, x * 12.92, x <= vec3<f32>(0.0031308));\n"
+    "}\n"
+    "@fragment fn fs_tone(v: V) -> @location(0) vec4<f32> {\n"
+    "    let hdr = textureSample(src, samp, v.uv);\n"
+    "    let c = hdr.rgb + textureSample(bloom_tex, samp, v.uv).rgb * post.a.w;\n"
+    "    let h = c * exp2(post.a.y);\n"
+    "    var m = h;\n"
+    "    let op = u32(post.a.x + 0.5);\n"
+    "    if (op == 1u) { m = h / (1.0 + h); }\n"
+    "    if (op == 2u) { m = 1.0 - exp(-h); }\n"
+    "    if (op == 3u) { m = max(hable(h), vec3<f32>(0.0)) / hable(vec3<f32>(post.a.z)); }\n"
+    "    if (post.b.x > 0.5) { m = srgb(m); }\n"
+    "    return vec4<f32>(m, 1.0);\n"
+    "}\n";
+
+struct _ScenePipeFmt {
+    WGPUTextureFormat format;
+    GpuPipeline pipe;
+}
+
+struct _ScenePostGpu {
+    Gpu gpu;
+    bool made;
+    GpuBindLayout layout;
+    GpuPipeline bright;
+    GpuPipeline blur;
+    List<_ScenePipeFmt> tones;
+    GpuSampler samp;
+    GpuTexture black;
+    GpuTexture a;
+    GpuTexture b;
+    uint32 w;
+    uint32 h;
+    GpuBuffer u_bright;
+    GpuBuffer u_h;
+    GpuBuffer u_v;
+    GpuBuffer u_tone;
+    GpuBindGroup g_bright;
+    GpuBindGroup g_h;
+    GpuBindGroup g_v;
+    GpuBindGroup g_tone;
+}
+
+Result<int, string> _scene_post_make(*_ScenePostGpu self, *Gpu gpu) {
+    self.gpu = *gpu;
+    self.layout = gpu.bind_layout();
+    self.layout.uniform(0, WGPUShaderStage_Fragment);
+    self.layout.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    self.layout.sampler(2, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+    self.layout.texture(3, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    *GpuBindLayout[1] groups = {&self.layout};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_post_wgsl, vertex: "vs", fragment: "fs_bright",
+        format: WGPUTextureFormat_RGBA16Float, groups: &groups[0], group_count: 1};
+    self.bright = gpu.pipeline(&d)?;
+    d.fragment = "fs_blur";
+    self.blur = gpu.pipeline(&d)?;
+    GpuSamplerOptions so = GpuSamplerOptions{wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge};
+    self.samp = gpu.sampler_with(&so)?;
+    uint8[8] zero;
+    GpuTextureDesc bd = GpuTextureDesc{width: 1, height: 1, format: WGPUTextureFormat_RGBA16Float};
+    self.black = gpu.texture_with(&bd)?;
+    self.black.write_level(0, 0, &zero)?;
+    self.u_bright = gpu.uniform(null, 32)?;
+    self.u_h = gpu.uniform(null, 32)?;
+    self.u_v = gpu.uniform(null, 32)?;
+    self.u_tone = gpu.uniform(null, 32)?;
+    self.g_bright = self.layout.group()?;
+    self.g_h = self.layout.group()?;
+    self.g_v = self.layout.group()?;
+    self.g_tone = self.layout.group()?;
+    self.g_bright.buffer(0, &self.u_bright);
+    self.g_h.buffer(0, &self.u_h);
+    self.g_v.buffer(0, &self.u_v);
+    self.g_tone.buffer(0, &self.u_tone);
+    *GpuBindGroup[4] all = {&self.g_bright, &self.g_h, &self.g_v, &self.g_tone};
+    for (i in 0..4) {
+        all[i].sampler(2, &self.samp);
+        all[i].texture(1, &self.black);
+        all[i].texture(3, &self.black);
+    }
+    self.made = true;
+    return Ok<int, string>(0);
+}
+
+Result<*GpuPipeline, string> _scene_post_tone_pipe(*_ScenePostGpu self, WGPUTextureFormat format) {
+    for (i in 0..self.tones.size) {
+        if (self.tones.data[i].format == format) return Ok<*GpuPipeline, string>(&self.tones.data[i].pipe);
+    }
+    *GpuBindLayout[1] groups = {&self.layout};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_post_wgsl, vertex: "vs", fragment: "fs_tone",
+        format: format, groups: &groups[0], group_count: 1};
+    GpuPipeline p = self.gpu.pipeline(&d)?;
+    List_push(&self.tones, _ScenePipeFmt{format, p});
+    return Ok<*GpuPipeline, string>(&self.tones.data[self.tones.size - 1].pipe);
+}
+
+bool _scene_is_srgb(WGPUTextureFormat f) {
+    return f == WGPUTextureFormat_RGBA8UnormSrgb || f == WGPUTextureFormat_BGRA8UnormSrgb
+        || f == WGPUTextureFormat_BC1RGBAUnormSrgb || f == WGPUTextureFormat_BC7RGBAUnormSrgb;
+}
+
+// Records the bloom passes (when on) and the tone mapping pass from hdr into view.
+Result<int, string> _scene_post_run(*_ScenePostGpu self, *GpuEncoder enc, *GpuTexture hdr, WGPUTextureView view,
+                                    WGPUTextureFormat format, *ScenePost p) {
+    *GpuTexture bloom_src = &self.black;
+    if (p.bloom) {
+        uint32 w = hdr.width / 2;
+        uint32 h = hdr.height / 2;
+        if (w < 1) w = 1;
+        if (h < 1) h = 1;
+        if (self.w != w || self.h != h) {
+            self.a.release();
+            self.b.release();
+            self.a = self.gpu.target_with(w, h, WGPUTextureFormat_RGBA16Float)?;
+            self.b = self.gpu.target_with(w, h, WGPUTextureFormat_RGBA16Float)?;
+            self.w = w;
+            self.h = h;
+            self.g_h.texture(1, &self.a);
+            self.g_v.texture(1, &self.b);
+        }
+        self.g_bright.texture(1, hdr);
+        float thr = p.bloom_threshold > 0.0 ? p.bloom_threshold : 1.0;
+        float[8] ub = {thr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        self.u_bright.write(0, &ub, 32);
+        float[8] uh = {1.0 / (float)w, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        self.u_h.write(0, &uh, 32);
+        float[8] uv = {0.0, 1.0 / (float)h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        self.u_v.write(0, &uv, 32);
+        GpuPass bp = enc.pass(self.a.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+        bp.set_group(0, &self.g_bright);
+        bp.draw(&self.bright, null, 3, 1);
+        bp.end()?;
+        int passes = p.bloom_passes > 0 ? p.bloom_passes : 4;
+        for (i in 0..passes) {
+            GpuPass ph = enc.pass(self.b.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+            ph.set_group(0, &self.g_h);
+            ph.draw(&self.blur, null, 3, 1);
+            ph.end()?;
+            GpuPass pv = enc.pass(self.a.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+            pv.set_group(0, &self.g_v);
+            pv.draw(&self.blur, null, 3, 1);
+            pv.end()?;
+        }
+        bloom_src = &self.a;
+    }
+    self.g_tone.texture(1, hdr);
+    self.g_tone.texture(3, bloom_src);
+    float strength = p.bloom ? (p.bloom_strength > 0.0 ? p.bloom_strength : 1.0) : 0.0;
+    float white = p.white_point > 0.0 ? p.white_point : 11.2;
+    bool encode = p.gamma && !_scene_is_srgb(format);
+    float[8] ut = {(float)p.tone_mapping, p.exposure, white, strength, encode ? 1.0 : 0.0, 0.0, 0.0, 0.0};
+    self.u_tone.write(0, &ut, 32);
+    *GpuPipeline tone = _scene_post_tone_pipe(self, format)?;
+    GpuPass tp = enc.pass(view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    tp.set_group(0, &self.g_tone);
+    tp.draw(tone, null, 3, 1);
+    tp.end()?;
+    return Ok<int, string>(0);
+}
+
+void _scene_post_release(*_ScenePostGpu self) {
+    if (!self.made) return;
+    self.g_bright.release();
+    self.g_h.release();
+    self.g_v.release();
+    self.g_tone.release();
+    self.u_bright.release();
+    self.u_h.release();
+    self.u_v.release();
+    self.u_tone.release();
+    self.a.release();
+    self.b.release();
+    self.black.release();
+    self.samp.release();
+    for (i in 0..self.tones.size) self.tones.data[i].pipe.release();
+    List_free(&self.tones);
+    self.bright.release();
+    self.blur.release();
+    self.layout.release();
+    self.made = false;
+}
