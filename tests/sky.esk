@@ -1,0 +1,208 @@
+// The background and image-based lighting:
+// - with no skybox the background color fills the image;
+// - a cube of six colored faces set with set_skybox is sampled by world
+//   direction: a camera looking down -Z sees the -Z face, turned to +X the
+//   +X face, looking up the +Y face; an opaque quad covers it and
+//   sky_intensity scales it;
+// - six images set with set_skybox_faces follow the skybox image convention:
+//   looking down -Z shows the +Z image;
+// - a constant environment through <gpu/ibl> lights a PBR quad (base 0.5,
+//   roughness 1, facing the camera) to 0.5 * 0.5 * 0.96 diffuse plus
+//   0.5 * 0.04 * 0.32 specular, about 0.246, twice that at intensity 2.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/hdr>;
+import <gpu/image>;
+import <gpu/ibl>;
+import <scene>;
+
+const int N = 32;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+Vec3 pixel(*uint16 px, int x, int y) {
+    *uint16 p = px + (y * N + x) * 4;
+    return Vec3{half_to_float(p[0]), half_to_float(p[1]), half_to_float(p[2])};
+}
+
+bool near3(Vec3 a, Vec3 b, float tol) {
+    Vec3 d = a - b;
+    return d.x < tol && d.x > -tol && d.y < tol && d.y > -tol && d.z < tol && d.z > -tol;
+}
+
+void expect(string what, Vec3 got, Vec3 want, float tol) {
+    if (!near3(got, want, tol)) {
+        printf("FAIL %s: got %.3f %.3f %.3f, want %.3f %.3f %.3f\n", what, (double)got.x, (double)got.y, (double)got.z,
+            (double)want.x, (double)want.y, (double)want.z);
+        fails++;
+    }
+}
+
+// face i of the test cube: a distinct color per face
+Vec3 face_color(int i) {
+    Vec3[6] c = {Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 1.0}, Vec3{0.0, 1.0, 0.0}, Vec3{1.0, 0.0, 1.0},
+        Vec3{0.0, 0.0, 1.0}, Vec3{1.0, 1.0, 0.0}};
+    return c[i];
+}
+
+Result<int, string> look(*Scene scene, int cam, Vec3 dir, Vec3 up, *GpuTexture target, *uint16 px) {
+    scene.node(cam).rotation = quat_identity();
+    scene.look_at(cam, dir, up);
+    scene.render_to(target)?;
+    target.read(px)?;
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+    int cam = scene.add_camera(0, scene_perspective(1.2, 0.1, 50.0));
+    scene.set_camera(cam);
+
+    scene.background = Vec4{0.2, 0.4, 0.6, 1.0};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("background color", pixel(px, 5, 20), Vec3{0.2, 0.4, 0.6}, 0.002);
+
+    GpuTextureDesc cd = GpuTextureDesc{width: 4, height: 4, format: WGPUTextureFormat_RGBA16Float, cube: true};
+    GpuTexture cube = gpu.texture_with(&cd)?;
+    defer cube.release();
+    uint16[64] face;
+    for (f in 0..6) {
+        Vec3 c = face_color(f);
+        for (i in 0..16) {
+            face[i * 4] = image_f16(c.x);
+            face[i * 4 + 1] = image_f16(c.y);
+            face[i * 4 + 2] = image_f16(c.z);
+            face[i * 4 + 3] = image_f16(1.0);
+        }
+        cube.write_level((uint32)f, 0, &face[0])?;
+    }
+    scene.set_skybox(&cube);
+    Vec3 up = Vec3{0.0, 1.0, 0.0};
+    look(&scene, cam, Vec3{0.0, 0.0, -1.0}, up, &target, px)?;
+    expect("looking down -Z shows the -Z face", pixel(px, 16, 16), face_color(5), 0.002);
+    look(&scene, cam, Vec3{1.0, 0.0, 0.0}, up, &target, px)?;
+    expect("looking along +X shows the +X face", pixel(px, 16, 16), face_color(0), 0.002);
+    look(&scene, cam, Vec3{-1.0, 0.0, 0.0}, up, &target, px)?;
+    expect("looking along -X shows the -X face", pixel(px, 16, 16), face_color(1), 0.002);
+    look(&scene, cam, Vec3{0.0, 1.0, 0.0}, Vec3{0.0, 0.0, -1.0}, &target, px)?;
+    expect("looking up shows the +Y face", pixel(px, 16, 16), face_color(2), 0.002);
+    look(&scene, cam, Vec3{0.0, 0.0, 1.0}, up, &target, px)?;
+    expect("looking down +Z shows the +Z face", pixel(px, 16, 16), face_color(4), 0.002);
+    scene.sky_intensity = 2.0;
+    look(&scene, cam, Vec3{0.0, 0.0, -1.0}, up, &target, px)?;
+    expect("sky intensity", pixel(px, 16, 16), face_color(5) * 2.0, 0.004);
+    scene.sky_intensity = 1.0;
+
+    SceneGeometry q = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    SceneMaterial gm = scene_material(SCENE_CONSTANT);
+    gm.diffuse = Vec4{0.3, 0.3, 0.3, 1.0};
+    int wall = scene.add_object(0, quad, scene.add_material(gm));
+    scene.node(wall).position = Vec3{0.0, 0.0, -3.0};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("an opaque object covers the sky", pixel(px, 16, 16), Vec3{0.3, 0.3, 0.3}, 0.002);
+    expect("the sky around it", pixel(px, 1, 16), face_color(5), 0.002);
+    scene.remove(wall);
+
+    Bitmap[6] faces;
+    for (f in 0..6) {
+        faces[f].width = 4;
+        faces[f].height = 4;
+        faces[f].rgba = alloc<uint8>(64);
+        Vec3 c = face_color(f);
+        for (i in 0..16) {
+            faces[f].rgba[i * 4] = (uint8)(c.x * 255.0);
+            faces[f].rgba[i * 4 + 1] = (uint8)(c.y * 255.0);
+            faces[f].rgba[i * 4 + 2] = (uint8)(c.z * 255.0);
+            faces[f].rgba[i * 4 + 3] = 255;
+        }
+    }
+    scene.set_skybox_faces(&faces[0])?;
+    for (f in 0..6) faces[f].free();
+    look(&scene, cam, Vec3{0.0, 0.0, -1.0}, up, &target, px)?;
+    expect("six images: ahead is the +Z image", pixel(px, 16, 16), face_color(4), 0.002);
+    look(&scene, cam, Vec3{1.0, 0.0, 0.0}, up, &target, px)?;
+    expect("six images: right is the +X image", pixel(px, 16, 16), face_color(0), 0.002);
+    look(&scene, cam, Vec3{0.0, 1.0, 0.0}, Vec3{0.0, 0.0, -1.0}, &target, px)?;
+    expect("six images: up is the +Y image", pixel(px, 16, 16), face_color(2), 0.002);
+
+    // image-based lighting from a constant environment of radiance 0.5
+    HdrBitmap env;
+    env.width = 16;
+    env.height = 8;
+    env.rgba = alloc<float>(16 * 8 * 4);
+    for (i in 0..16 * 8) {
+        for (k in 0..3) env.rgba[i * 4 + k] = 0.5;
+        env.rgba[i * 4 + 3] = 1.0;
+    }
+    GpuIblOptions io = GpuIblOptions{environment_size: 16, irradiance_size: 8, specular_size: 16, specular_mips: 3,
+        brdf_size: 32, samples: 64, brdf_samples: 256};
+    GpuIbl ibl = gpu.ibl(&env, &io)?;
+    defer ibl.release();
+    env.free();
+    scene.set_ibl(&ibl);
+    scene.set_skybox(&ibl.environment);
+    SceneMaterial pm = scene_material(SCENE_PBR);
+    pm.diffuse = Vec4{0.5, 0.5, 0.5, 1.0};
+    pm.roughness = 1.0;
+    int lit = scene.add_object(0, quad, scene.add_material(pm));
+    int ocam = scene.add_camera(0, scene_orthographic(2.0, 0.1, 20.0));
+    scene.node(ocam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(ocam);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    Vec3 got = pixel(px, 16, 16);
+    printf("  ibl: quad %.4f, sky %.4f\n", (double)got.x, (double)pixel(px, 1, 1).x);
+    expect("environment sky", pixel(px, 1, 1), Vec3{0.5, 0.5, 0.5}, 0.01);
+    expect("image-based diffuse and specular", got, Vec3{0.246, 0.246, 0.246}, 0.015);
+    ibl.intensity = 2.0;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("ibl intensity", pixel(px, 16, 16), Vec3{0.493, 0.493, 0.493}, 0.03);
+    scene.set_ibl(null);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("without ibl or lights a PBR surface is dark", pixel(px, 16, 16), Vec3{0.0, 0.0, 0.0}, 0.001);
+    scene.node(lit).visible = false;
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("sky: ok\n");
+    return 0;
+}
