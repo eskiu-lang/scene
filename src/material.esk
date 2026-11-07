@@ -1,0 +1,350 @@
+// material.esk: materials and the shaders made for them (`<scene/material>`).
+//
+// A SceneMaterial picks a lighting model, its colors and textures, how alpha
+// is used and how a transparent surface blends with what is behind it.
+// Start from scene_material, which fills in the defaults:
+//
+//     SceneMaterial m = scene_material(SCENE_PBR);
+//     m.diffuse = Vec4{0.8, 0.1, 0.1, 1.0};
+//     m.roughness = 0.4;
+//     int red = scene.add_material(m);
+//
+// Colors are linear RGB (not sRGB) and may go above 1 for HDR. Texture fields
+// hold ids from Scene_add_texture and friends; 0 is no texture.
+//
+// The renderer makes one WGSL shader and pipeline per variant (lighting
+// model, alpha mode, blend mode, sidedness) and keeps it for every material
+// that shares the variant; scene_material_key and scene_material_shader are the
+// pieces it uses.
+
+import <string>;
+import <gpu/math>;
+
+// Lighting models (SceneMaterial.lighting). CONSTANT shows the diffuse color unlit;
+// LAMBERT is diffuse light only; PHONG and BLINN add a specular highlight (around the
+// reflection of the light, or around the half vector); PBR is the metallic-roughness
+// model (GGX, Smith visibility, Fresnel-Schlick) with image-based ambient light when the
+// scene has an environment.
+const int SCENE_CONSTANT = 0;
+const int SCENE_LAMBERT = 1;
+const int SCENE_PHONG = 2;
+const int SCENE_BLINN = 3;
+const int SCENE_PBR = 4;
+
+// Alpha modes (SceneMaterial.alpha_mode): the surface is opaque (alpha ignored), cut out
+// where alpha is below alpha_cutoff, or blended with what is behind it (drawn after the
+// opaque surfaces, back to front).
+const int SCENE_ALPHA_OPAQUE = 0;
+const int SCENE_ALPHA_MASK = 1;
+const int SCENE_ALPHA_BLEND = 2;
+
+// Blend modes of a SCENE_ALPHA_BLEND material (SceneMaterial.blend_mode), with s the
+// surface color, a its alpha and d the color behind it: ALPHA is s * a + d * (1 - a);
+// ADD is d + s * a; MULTIPLY is d * mix(1, s, a); SUBTRACT is d - s * a; SCREEN is
+// d + s * a * (1 - d); PREMULTIPLIED is s + d * (1 - a), for colors already multiplied
+// by their alpha.
+const int SCENE_BLEND_ALPHA = 0;
+const int SCENE_BLEND_ADD = 1;
+const int SCENE_BLEND_MULTIPLY = 2;
+const int SCENE_BLEND_SUBTRACT = 3;
+const int SCENE_BLEND_SCREEN = 4;
+const int SCENE_BLEND_PREMULTIPLIED = 5;
+
+// A material. Fields by lighting model:
+// - every model: diffuse (linear RGBA, multiplied by diffuse_texture and the vertex
+//   color), emissive (added after lighting, times emissive_texture), alpha_mode,
+//   alpha_cutoff, blend_mode, double_sided, normal_texture (tangent-space normal map,
+//   strength normal_scale; not used by CONSTANT).
+// - LAMBERT, PHONG, BLINN: diffuse_intensity scales the lit diffuse term; PHONG and BLINN
+//   add specular (times specular_texture) with exponent shininess.
+// - PBR: metalness and roughness (times the blue and green channels of
+//   metal_rough_texture, as glTF stores them) and occlusion_texture (red channel,
+//   strength occlusion_strength) on the ambient term.
+// Texture ids come from the Scene that draws the material (0 is none).
+struct SceneMaterial {
+    int lighting;
+    Vec4 diffuse;
+    int diffuse_texture;
+    float diffuse_intensity;
+    Vec3 specular;
+    float shininess;
+    int specular_texture;
+    int normal_texture;
+    float normal_scale;
+    Vec3 emissive;
+    int emissive_texture;
+    float metalness;
+    float roughness;
+    int metal_rough_texture;
+    int occlusion_texture;
+    float occlusion_strength;
+    int alpha_mode;
+    float alpha_cutoff;
+    int blend_mode;
+    bool double_sided;
+}
+
+// A material of lighting model lighting with the defaults: white diffuse at intensity 1,
+// white specular with shininess 32, no emission, metalness 0, roughness 0.5, normal scale
+// and occlusion strength 1, opaque, alpha cutoff 0.5, ALPHA blending, one-sided.
+SceneMaterial scene_material(int lighting) {
+    return SceneMaterial{lighting: lighting, diffuse: Vec4{1.0, 1.0, 1.0, 1.0}, diffuse_intensity: 1.0,
+        specular: Vec3{1.0, 1.0, 1.0}, shininess: 32.0, normal_scale: 1.0, roughness: 0.5,
+        occlusion_strength: 1.0, alpha_cutoff: 0.5, blend_mode: SCENE_BLEND_ALPHA};
+}
+
+// The shader variant of a material: the lighting model, the alpha mode, the blend mode
+// (only for blended materials) and the sidedness, packed in one int. Materials with the
+// same key share a pipeline.
+int scene_material_key(*SceneMaterial m) {
+    int lighting = m.lighting < 0 || m.lighting > SCENE_PBR ? SCENE_BLINN : m.lighting;
+    int alpha = m.alpha_mode < 0 || m.alpha_mode > SCENE_ALPHA_BLEND ? SCENE_ALPHA_OPAQUE : m.alpha_mode;
+    int blend = 0;
+    if (alpha == SCENE_ALPHA_BLEND) {
+        blend = m.blend_mode < 0 || m.blend_mode > SCENE_BLEND_PREMULTIPLIED ? SCENE_BLEND_ALPHA : m.blend_mode;
+    }
+    return lighting + alpha * 8 + blend * 32 + (m.double_sided ? 256 : 0);
+}
+
+// The lighting model of a material key.
+int scene_key_lighting(int key) {
+    return key % 8;
+}
+
+// The alpha mode of a material key.
+int scene_key_alpha(int key) {
+    return (key / 8) % 4;
+}
+
+// The blend mode of a material key (SCENE_BLEND_ALPHA unless the alpha mode is BLEND).
+int scene_key_blend(int key) {
+    return (key / 32) % 8;
+}
+
+// Whether a material key is double-sided.
+bool scene_key_double_sided(int key) {
+    return key >= 256;
+}
+
+string _scene_common_wgsl =
+    "struct Frame { view_proj: mat4x4<f32>, eye: vec4<f32>, forward: vec4<f32>, ambient: vec4<f32>,\n"
+    "    ibl: vec4<f32>, shadow: vec4<f32> };\n"
+    "struct Light { color: vec4<f32>, position: vec4<f32>, direction: vec4<f32>, atten: vec4<f32>,\n"
+    "    spot: vec4<f32>, shadow_vp: mat4x4<f32> };\n"
+    "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32> };\n"
+    "struct Material { diffuse: vec4<f32>, specular: vec4<f32>, emissive: vec4<f32>, pbr: vec4<f32>, extra: vec4<f32> };\n"
+    "@group(0) @binding(0) var<uniform> frame: Frame;\n"
+    "@group(0) @binding(1) var<storage, read> lights: array<Light>;\n"
+    "@group(0) @binding(2) var shadow_maps: texture_depth_2d_array;\n"
+    "@group(0) @binding(3) var shadow_samp: sampler_comparison;\n"
+    "@group(0) @binding(4) var irr_tex: texture_cube<f32>;\n"
+    "@group(0) @binding(5) var spec_tex: texture_cube<f32>;\n"
+    "@group(0) @binding(6) var brdf_tex: texture_2d<f32>;\n"
+    "@group(0) @binding(7) var ibl_samp: sampler;\n"
+    "@group(1) @binding(0) var<uniform> draw: Draw;\n"
+    "@group(2) @binding(0) var<uniform> mat: Material;\n"
+    "@group(2) @binding(1) var mat_samp: sampler;\n"
+    "@group(2) @binding(2) var diffuse_tex: texture_2d<f32>;\n"
+    "@group(2) @binding(3) var specular_tex: texture_2d<f32>;\n"
+    "@group(2) @binding(4) var normal_tex: texture_2d<f32>;\n"
+    "@group(2) @binding(5) var emissive_tex: texture_2d<f32>;\n"
+    "@group(2) @binding(6) var mr_tex: texture_2d<f32>;\n"
+    "@group(2) @binding(7) var occ_tex: texture_2d<f32>;\n"
+    "struct In { @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>,\n"
+    "    @location(3) tangent: vec4<f32>, @location(4) color: vec4<f32> };\n"
+    "struct V { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>,\n"
+    "    @location(2) uv: vec2<f32>, @location(3) tangent: vec4<f32>, @location(4) color: vec4<f32> };\n"
+    "@vertex fn vs(v: In) -> V {\n"
+    "    let world = draw.model * vec4<f32>(v.pos, 1.0);\n"
+    "    var o: V;\n"
+    "    o.clip = frame.view_proj * world;\n"
+    "    o.world = world.xyz;\n"
+    "    let nm = mat3x3<f32>(draw.normal[0].xyz, draw.normal[1].xyz, draw.normal[2].xyz);\n"
+    "    o.normal = nm * v.normal;\n"
+    "    let mm = mat3x3<f32>(draw.model[0].xyz, draw.model[1].xyz, draw.model[2].xyz);\n"
+    "    o.tangent = vec4<f32>(mm * v.tangent.xyz, v.tangent.w);\n"
+    "    o.uv = v.uv;\n"
+    "    o.color = v.color;\n"
+    "    return o;\n"
+    "}\n"
+    "const PI = 3.14159265358979;\n"
+    "fn draw_light(k: u32) -> u32 { return draw.lights[k / 4u][k % 4u]; }\n"
+    "fn light_at(i: u32, pos: vec3<f32>) -> vec4<f32> {\n"
+    "    let li = lights[i];\n"
+    "    if (li.position.w < 1.5) { return vec4<f32>(-li.direction.xyz, 1.0); }\n"
+    "    let to = li.position.xyz - pos;\n"
+    "    let dist = length(to);\n"
+    "    let l = to / max(dist, 1e-6);\n"
+    "    let d = clamp((dist - li.atten.x) / max(li.atten.y - li.atten.x, 1e-4), 0.0, 1.0);\n"
+    "    var att = 1.0 - select(pow(d, 1.0 / max(li.atten.z, 1e-3)), 0.0, d <= 0.0);\n"
+    "    if (li.position.w > 2.5) {\n"
+    "        let theta = dot(l, -li.direction.xyz);\n"
+    "        att = att * clamp((theta - li.spot.y) / max(li.spot.x - li.spot.y, 1e-4), 0.0, 1.0);\n"
+    "    }\n"
+    "    return vec4<f32>(l, att);\n"
+    "}\n"
+    "fn shadow_at(i: u32, world: vec3<f32>, n: vec3<f32>) -> f32 {\n"
+    "    let li = lights[i];\n"
+    "    if (li.direction.w < 0.0 || draw.info.y < 0.5) { return 1.0; }\n"
+    "    let p = li.shadow_vp * vec4<f32>(world + n * li.spot.w, 1.0);\n"
+    "    let c = p.xyz / p.w;\n"
+    "    let uv = vec2<f32>(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);\n"
+    "    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || c.z > 1.0) { return 1.0; }\n"
+    "    let layer = i32(li.direction.w + 0.5);\n"
+    "    let ref_d = c.z - li.atten.w;\n"
+    "    var lit = 0.0;\n"
+    "    for (var y = -1; y <= 1; y++) {\n"
+    "        for (var x = -1; x <= 1; x++) {\n"
+    "            lit += textureSampleCompareLevel(shadow_maps, shadow_samp, uv + vec2<f32>(f32(x), f32(y)) * frame.shadow.x, layer, ref_d);\n"
+    "        }\n"
+    "    }\n"
+    "    return mix(1.0, lit / 9.0, li.spot.z);\n"
+    "}\n"
+    "struct Surf { base: vec4<f32>, n: vec3<f32>, geo_n: vec3<f32>, v: vec3<f32>, pos: vec3<f32>, spec: vec3<f32>,\n"
+    "    shininess: f32, metal: f32, rough: f32, ao: f32 };\n";
+
+string _scene_constant_wgsl =
+    "fn shade(s: Surf) -> vec3<f32> { return s.base.rgb; }\n";
+
+string _scene_classic_head =
+    "fn shade(s: Surf) -> vec3<f32> {\n"
+    "    var diff = vec3<f32>(0.0);\n"
+    "    var spec = vec3<f32>(0.0);\n"
+    "    let count = u32(draw.info.x);\n"
+    "    for (var k = 0u; k < count; k++) {\n"
+    "        let i = draw_light(k);\n"
+    "        let la = light_at(i, s.pos);\n"
+    "        let l = la.xyz;\n"
+    "        let radiance = lights[i].color.rgb * lights[i].color.w * la.w * shadow_at(i, s.pos, s.geo_n);\n"
+    "        let nl = max(dot(s.n, l), 0.0);\n"
+    "        diff += radiance * nl;\n";
+
+string _scene_phong_spec =
+    "        if (nl > 0.0) { spec += radiance * pow(max(dot(s.v, reflect(-l, s.n)), 0.0), s.shininess); }\n";
+
+string _scene_blinn_spec =
+    "        if (nl > 0.0) { spec += radiance * pow(max(dot(normalize(s.v + l), s.n), 0.0), s.shininess); }\n";
+
+string _scene_classic_tail =
+    "    }\n"
+    "    return frame.ambient.rgb * s.base.rgb + diff * s.base.rgb * mat.extra.x + spec * s.spec;\n"
+    "}\n";
+
+string _scene_pbr_wgsl =
+    "fn shade(s: Surf) -> vec3<f32> {\n"
+    "    let a = s.rough * s.rough;\n"
+    "    let a2 = a * a;\n"
+    "    let f0 = mix(vec3<f32>(0.04), s.base.rgb, s.metal);\n"
+    "    let nv = max(dot(s.n, s.v), 1e-4);\n"
+    "    var color = vec3<f32>(0.0);\n"
+    "    let count = u32(draw.info.x);\n"
+    "    for (var k = 0u; k < count; k++) {\n"
+    "        let i = draw_light(k);\n"
+    "        let la = light_at(i, s.pos);\n"
+    "        let l = la.xyz;\n"
+    "        let radiance = lights[i].color.rgb * lights[i].color.w * la.w * shadow_at(i, s.pos, s.geo_n);\n"
+    "        let h = normalize(s.v + l);\n"
+    "        let nl = max(dot(s.n, l), 0.0);\n"
+    "        let nh = max(dot(s.n, h), 0.0);\n"
+    "        let vh = max(dot(s.v, h), 0.0);\n"
+    "        let f = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);\n"
+    "        let dn = nh * nh * (a2 - 1.0) + 1.0;\n"
+    "        let d = a2 / (PI * dn * dn);\n"
+    "        let gv = nl * sqrt(nv * nv * (1.0 - a2) + a2);\n"
+    "        let gl = nv * sqrt(nl * nl * (1.0 - a2) + a2);\n"
+    "        let vis = 0.5 / max(gv + gl, 1e-5);\n"
+    "        let kd = (1.0 - f) * (1.0 - s.metal);\n"
+    "        color += (kd * s.base.rgb / PI + f * d * vis) * radiance * nl * PI;\n"
+    "    }\n"
+    "    if (frame.ibl.x > 0.5) {\n"
+    "        let fa = f0 + (max(vec3<f32>(1.0 - s.rough), f0) - f0) * pow(1.0 - nv, 5.0);\n"
+    "        let irr = textureSampleLevel(irr_tex, ibl_samp, s.n, 0.0).rgb;\n"
+    "        let pre = textureSampleLevel(spec_tex, ibl_samp, reflect(-s.v, s.n), s.rough * frame.ibl.z).rgb;\n"
+    "        let ab = textureSampleLevel(brdf_tex, ibl_samp, vec2<f32>(nv, s.rough), 0.0).rg;\n"
+    "        color += (irr * s.base.rgb * (1.0 - s.metal) * (1.0 - fa) + pre * (f0 * ab.x + ab.y)) * s.ao * frame.ibl.y;\n"
+    "    } else {\n"
+    "        color += frame.ambient.rgb * s.base.rgb * s.ao;\n"
+    "    }\n"
+    "    return color;\n"
+    "}\n";
+
+string _scene_fs_head =
+    "@fragment fn fs(v: V, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {\n"
+    "    let d_s = textureSample(diffuse_tex, mat_samp, v.uv);\n"
+    "    let s_s = textureSample(specular_tex, mat_samp, v.uv);\n"
+    "    let n_s = textureSample(normal_tex, mat_samp, v.uv).xyz;\n"
+    "    let e_s = textureSample(emissive_tex, mat_samp, v.uv).rgb;\n"
+    "    let mr_s = textureSample(mr_tex, mat_samp, v.uv);\n"
+    "    let o_s = textureSample(occ_tex, mat_samp, v.uv).r;\n"
+    "    let dp1 = dpdx(v.world);\n"
+    "    let dp2 = dpdy(v.world);\n"
+    "    let duv1 = dpdx(v.uv);\n"
+    "    let duv2 = dpdy(v.uv);\n"
+    "    var n = normalize(v.normal);\n"
+    "    if (!front) { n = -n; }\n"
+    "    var s: Surf;\n"
+    "    s.geo_n = n;\n"
+    "    if (mat.pbr.z > 0.0) {\n"
+    "        var t = cross(dp2, n) * duv1.x + cross(n, dp1) * duv2.x;\n"
+    "        var b = cross(dp2, n) * duv1.y + cross(n, dp1) * duv2.y;\n"
+    "        let inv = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1e-20));\n"
+    "        t = t * inv;\n"
+    "        b = b * inv;\n"
+    "        if (abs(v.tangent.w) > 0.5) {\n"
+    "            t = normalize(v.tangent.xyz - n * dot(n, v.tangent.xyz));\n"
+    "            b = cross(n, t) * v.tangent.w;\n"
+    "        }\n"
+    "        let tn = (n_s * 2.0 - 1.0) * vec3<f32>(mat.pbr.z, mat.pbr.z, 1.0);\n"
+    "        n = normalize(t * tn.x + b * tn.y + n * tn.z);\n"
+    "    }\n"
+    "    s.base = mat.diffuse * v.color * d_s;\n"
+    "    s.n = n;\n"
+    "    s.pos = v.world;\n"
+    "    s.v = select(normalize(frame.eye.xyz - v.world), -frame.forward.xyz, frame.eye.w > 0.5);\n"
+    "    s.spec = mat.specular.rgb * s_s.rgb;\n"
+    "    s.shininess = mat.specular.w;\n"
+    "    s.metal = clamp(mat.pbr.x * mr_s.b, 0.0, 1.0);\n"
+    "    s.rough = clamp(mat.pbr.y * mr_s.g, 0.04, 1.0);\n"
+    "    s.ao = 1.0 + mat.pbr.w * (o_s - 1.0);\n";
+
+// The WGSL shader of a material key (scene_material_key): the vertex stage vs and the
+// fragment stage fs, over the bind groups the renderer sets (0: frame, lights, shadow
+// maps and environment; 1: the node; 2: the material). The text is appended to out.
+void scene_material_shader(int key, *String out) {
+    int lighting = scene_key_lighting(key);
+    int alpha = scene_key_alpha(key);
+    int blend = scene_key_blend(key);
+    String_append(out, _scene_common_wgsl);
+    if (lighting == SCENE_CONSTANT) {
+        String_append(out, _scene_constant_wgsl);
+    } else if (lighting == SCENE_PBR) {
+        String_append(out, _scene_pbr_wgsl);
+    } else {
+        String_append(out, _scene_classic_head);
+        if (lighting == SCENE_PHONG) String_append(out, _scene_phong_spec);
+        if (lighting == SCENE_BLINN) String_append(out, _scene_blinn_spec);
+        String_append(out, _scene_classic_tail);
+    }
+    String_append(out, _scene_fs_head);
+    if (alpha == SCENE_ALPHA_MASK) String_append(out, "    if (s.base.a < mat.emissive.w) { discard; }\n");
+    String_append(out, "    var color = shade(s) + mat.emissive.rgb * e_s;\n");
+    if (alpha != SCENE_ALPHA_BLEND) {
+        String_append(out, "    return vec4<f32>(color, 1.0);\n}\n");
+        return;
+    }
+    String_append(out, "    let alpha = clamp(s.base.a, 0.0, 1.0);\n");
+    if (blend == SCENE_BLEND_MULTIPLY) String_append(out, "    color = mix(vec3<f32>(1.0), color, alpha);\n");
+    if (blend == SCENE_BLEND_SCREEN) String_append(out, "    color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)) * alpha;\n");
+    String_append(out, "    return vec4<f32>(color, alpha);\n}\n");
+}
+
+// The depth-only shader of shadow maps: vs places a node's vertices with the light's
+// view and projection (group 0) and the node's model matrix (group 1).
+string scene_shadow_shader =
+    "struct Pass { vp: mat4x4<f32> };\n"
+    "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32> };\n"
+    "@group(0) @binding(0) var<uniform> sp: Pass;\n"
+    "@group(1) @binding(0) var<uniform> draw: Draw;\n"
+    "@vertex fn vs(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {\n"
+    "    return sp.vp * (draw.model * vec4<f32>(pos, 1.0));\n"
+    "}\n";
