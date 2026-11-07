@@ -1,0 +1,130 @@
+// glTF import: a small model built in memory (a parent node moved left, a
+// child node scaled by 0.5 holding an unlit quad of color (0.2, 0.6, 0.9))
+// becomes scene nodes with the same tree, transforms and material; moving
+// the glTF node and calling SceneGltf_pose moves the scene node.
+import <io>;
+import <mem>;
+import <string>;
+import <base64>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/gltf>;
+import <scene>;
+
+const int N = 32;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+Vec3 pixel(*uint16 px, int x, int y) {
+    *uint16 p = px + (y * N + x) * 4;
+    return Vec3{half_to_float(p[0]), half_to_float(p[1]), half_to_float(p[2])};
+}
+
+bool near3(Vec3 a, Vec3 b) {
+    Vec3 d = a - b;
+    return d.x < 0.004 && d.x > -0.004 && d.y < 0.004 && d.y > -0.004 && d.z < 0.004 && d.z > -0.004;
+}
+
+void put_f(*uint8 buf, int at, float v) {
+    memcpy(buf + at, &v, 4);
+}
+
+// A 2 x 2 quad facing +Z: 4 positions, 4 normals, 6 uint16 indices (108 bytes).
+void build(String* out) {
+    *uint8 b = alloc<uint8>(108);
+    defer free(b);
+    float[12] pos = {-1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 0.0, -1.0, 1.0, 0.0};
+    for (i in 0..12) put_f(b, i * 4, pos[i]);
+    for (v in 0..4) put_f(b, 48 + v * 12 + 8, 1.0);
+    int[6] idx = {0, 1, 2, 0, 2, 3};
+    for (i in 0..6) {
+        b[96 + i * 2] = (uint8)idx[i];
+        b[97 + i * 2] = 0;
+    }
+    *uint8 enc = alloc<uint8>(base64_encoded_len(108) + 1);
+    defer free(enc);
+    int n = base64_encode(b, 108, enc);
+    enc[n] = 0;
+    String_append(out, "{\"asset\":{\"version\":\"2.0\"},\"buffers\":[{\"byteLength\":108,\"uri\":\"data:application/octet-stream;base64,");
+    String_append(out, (string)enc);
+    String_append(out, "\"}],\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":48},{\"buffer\":0,\"byteOffset\":48,\"byteLength\":48},");
+    String_append(out, "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":12}],\"accessors\":[");
+    String_append(out, "{\"bufferView\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"min\":[-1,-1,0],\"max\":[1,1,0]},");
+    String_append(out, "{\"bufferView\":1,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    String_append(out, "{\"bufferView\":2,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"}],");
+    String_append(out, "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.2,0.6,0.9,1]},\"extensions\":{\"KHR_materials_unlit\":{}}}],");
+    String_append(out, "\"extensionsUsed\":[\"KHR_materials_unlit\"],");
+    String_append(out, "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1},\"indices\":2,\"material\":0}]}],");
+    String_append(out, "\"nodes\":[{\"name\":\"parent\",\"translation\":[-0.5,0,0],\"children\":[1]},{\"name\":\"quad\",\"mesh\":0,\"scale\":[0.5,0.5,0.5]}],");
+    String_append(out, "\"scenes\":[{\"nodes\":[0]}],\"scene\":0}");
+}
+
+Result<int, string> run() {
+    String json;
+    defer String_free(&json);
+    build(&json);
+    Gltf g = gltf_parse((*uint8)json.data, (uint64)json.len, null)?;
+    defer g.free();
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    SceneGltf model = scene.add_gltf(&g, 0)?;
+    defer model.free();
+    int parent = model.nodes.data[0];
+    int quad = model.nodes.data[1];
+    check("node tree", scene.node(quad).parent == parent && scene.node(parent).parent == model.root);
+    check("names", scene.find("quad") == quad && scene.find("parent") == parent);
+    check("one mesh, one material", model.meshes.size == 1 && model.meshes.data[0] > 0 && model.materials.size == 1);
+    check("unlit becomes CONSTANT", scene.material(model.materials.data[0]).lighting == SCENE_CONSTANT);
+    check("the primitive is a child of its node", scene.node(quad).children.size == 1);
+
+    int cam = scene.add_camera(0, scene_orthographic(4.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    // the quad spans x -1 to 0 and y -0.5 to 0.5: pixels 8 to 16 across, 12 to 20 down
+    Vec3 color = Vec3{0.2, 0.6, 0.9};
+    check("the quad at its place and color", near3(pixel(px, 10, 16), color) && near3(pixel(px, 14, 13), color));
+    check("nothing right of it", near3(pixel(px, 20, 16), Vec3{0.0, 0.0, 0.0}));
+
+    g.nodes.data[0].translation = Vec3{1.0, 0.0, 0.0};
+    model.pose(&scene, &g);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("pose moves the scene node", near3(pixel(px, 22, 16), color) && near3(pixel(px, 10, 16), Vec3{0.0, 0.0, 0.0}));
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("gltf: ok\n");
+    return 0;
+}
