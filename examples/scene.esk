@@ -1,0 +1,173 @@
+// A window with a small scene: a ground, spheres in each lighting model, a
+// glass box, a sun with shadows, a warm point light and a spot light, under a
+// sky made in code (an equirectangular gradient with a sun, which also lights
+// the PBR spheres through <gpu/ibl>), with Hable tone mapping and bloom.
+// Drag to orbit, scroll to zoom, B toggles bloom, T cycles tone mapping.
+//
+//     eskiuc run examples/scene.esk
+//     eskiuc run examples/scene.esk -- --frames 120    # stop after 120 frames
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/hdr>;
+import <gpu/ibl>;
+import <gpu/window>;
+import <scene>;
+
+// An equirectangular sky: blue overhead, pale at the horizon, brown below, and a bright sun.
+HdrBitmap make_sky(uint32 w, uint32 h) {
+    HdrBitmap sky;
+    sky.width = w;
+    sky.height = h;
+    sky.rgba = alloc<float>((int64)w * h * 4);
+    Vec3 sun = Vec3{0.4, 0.75, -0.5}.normalize();
+    for (y in 0..h) {
+        double v = ((double)y + 0.5) / (double)h;
+        double th = v * 3.14159265358979;
+        for (x in 0..w) {
+            double ph = (((double)x + 0.5) / (double)w - 0.5) * 2.0 * 3.14159265358979;
+            Vec3 d = Vec3{(float)(sin(th) * cos(ph)), (float)cos(th), (float)(sin(th) * sin(ph))};
+            Vec3 c;
+            if (d.y >= 0.0) {
+                float t = (float)pow((double)d.y, 0.5);
+                c = Vec3{0.75, 0.85, 1.0}.lerp(Vec3{0.18, 0.35, 0.8}, t);
+            } else {
+                c = Vec3{0.3, 0.25, 0.2} * (1.0 + d.y * 0.5);
+            }
+            float s = d.dot(sun);
+            if (s > 0.9995) c = c + Vec3{40.0, 36.0, 30.0};
+            *float p = sky.rgba + ((int64)y * w + x) * 4;
+            p[0] = c.x;
+            p[1] = c.y;
+            p[2] = c.z;
+            p[3] = 1.0;
+        }
+    }
+    return sky;
+}
+
+Result<int, string> build(*Scene scene) {
+    SceneGeometry ground = scene_plane(20.0, 20.0);
+    int plane = scene.add_geometry(&ground)?;
+    ground.free();
+    SceneGeometry ball = scene_sphere(0.6, 64, 32);
+    int sphere = scene.add_geometry(&ball)?;
+    ball.free();
+    SceneGeometry cube = scene_box(1.0, 1.0, 1.0);
+    int box = scene.add_geometry(&cube)?;
+    cube.free();
+
+    SceneMaterial gm = scene_material(SCENE_PBR);
+    gm.diffuse = Vec4{0.45, 0.42, 0.38, 1.0};
+    gm.roughness = 0.9;
+    scene.add_object(0, plane, scene.add_material(gm));
+
+    Vec4[5] colors = {Vec4{0.9, 0.9, 0.9, 1.0}, Vec4{0.8, 0.2, 0.15, 1.0}, Vec4{0.2, 0.6, 0.25, 1.0},
+        Vec4{0.2, 0.35, 0.85, 1.0}, Vec4{0.95, 0.7, 0.3, 1.0}};
+    for (i in 0..5) {
+        SceneMaterial m = scene_material(i);
+        m.diffuse = colors[i];
+        m.shininess = 48.0;
+        m.metalness = i == SCENE_PBR ? 1.0 : 0.0;
+        m.roughness = 0.3;
+        if (i == SCENE_CONSTANT) m.emissive = Vec3{3.0, 2.6, 2.0};
+        int n = scene.add_object(0, sphere, scene.add_material(m));
+        scene.node(n).position = Vec3{-3.0 + (float)i * 1.5, 0.6, 0.0};
+    }
+
+    SceneMaterial glass = scene_material(SCENE_BLINN);
+    glass.diffuse = Vec4{0.5, 0.8, 1.0, 0.35};
+    glass.alpha_mode = SCENE_ALPHA_BLEND;
+    glass.shininess = 96.0;
+    int b = scene.add_object(0, box, scene.add_material(glass));
+    scene.node(b).position = Vec3{0.0, 0.5, 2.0};
+    scene.node(b).casts_shadows = false;
+
+    SceneLight sun = scene_directional(Vec3{-0.4, -0.75, 0.5}, Vec3{1.0, 0.95, 0.85}, 2.5);
+    sun.casts_shadows = true;
+    scene.add_light(sun);
+    scene.add_light(scene_point(Vec3{2.5, 1.2, 1.5}, Vec3{1.0, 0.55, 0.25}, 3.0, 0.5, 4.0));
+    scene.add_light(scene_spot(Vec3{-3.0, 3.0, 1.5}, Vec3{0.3, -1.0, -0.3}, Vec3{0.4, 0.6, 1.0}, 4.0, 0.25, 0.45, 1.0, 8.0));
+    scene.add_light(scene_ambient(Vec3{0.25, 0.3, 0.4}, 0.4));
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run(int max_frames) {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Window win = window_open("Eskiu scene", 1024, 640)?;
+    defer win.release();
+    GpuSurface surface = win.surface(&gpu)?;
+    defer surface.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    build(&scene)?;
+
+    HdrBitmap sky = make_sky(256, 128);
+    GpuIblOptions io = GpuIblOptions{environment_size: 256, irradiance_size: 16, specular_size: 64, specular_mips: 5, samples: 128};
+    GpuIbl ibl = gpu.ibl(&sky, &io)?;
+    defer ibl.release();
+    sky.free();
+    ibl.intensity = 0.6;
+    scene.set_ibl(&ibl);
+    scene.set_skybox(&ibl.environment);
+    scene.sky_intensity = 0.8;
+    scene.post.tone_mapping = SCENE_TONE_HABLE;
+    scene.post.exposure = 1.0;
+    scene.post.bloom = true;
+
+    int cam = scene.add_camera(0, scene_perspective(0.9, 0.1, 100.0));
+    scene.set_camera(cam);
+    float yaw = 0.3;
+    float pitch = 0.35;
+    float dist = 9.0;
+    bool dragging = false;
+    int frames = 0;
+    bool running = true;
+    WindowEvent ev;
+    while (running) {
+        while (win.poll(&ev)) {
+            if (ev.kind == WINDOW_QUIT || (ev.kind == WINDOW_KEY_DOWN && ev.key == KEY_ESCAPE)) running = false;
+            if (ev.kind == WINDOW_RESIZE) surface.configure(ev.width, ev.height);
+            if (ev.kind == WINDOW_MOUSE_DOWN && ev.button == 1) dragging = true;
+            if (ev.kind == WINDOW_MOUSE_UP && ev.button == 1) dragging = false;
+            if (ev.kind == WINDOW_MOUSE_MOVE && dragging) {
+                yaw = yaw - ev.dx * 0.01;
+                pitch = pitch + ev.dy * 0.01;
+                if (pitch > 1.4) pitch = 1.4;
+                if (pitch < 0.05) pitch = 0.05;
+            }
+            if (ev.kind == WINDOW_WHEEL) dist = dist * (float)pow(0.9, (double)ev.y);
+            if (ev.kind == WINDOW_KEY_DOWN && ev.key == 'b') scene.post.bloom = !scene.post.bloom;
+            if (ev.kind == WINDOW_KEY_DOWN && ev.key == 't') scene.post.tone_mapping = (scene.post.tone_mapping + 1) % 4;
+        }
+        Vec3 target = Vec3{0.0, 0.5, 0.0};
+        scene.node(cam).position = target + Vec3{(float)(sin((double)yaw) * cos((double)pitch)), (float)sin((double)pitch),
+            (float)(cos((double)yaw) * cos((double)pitch))} * dist;
+        scene.look_at(cam, target, Vec3{0.0, 1.0, 0.0});
+        Result<GpuFrame, string> fr = surface.frame();
+        if (!fr.ok) {
+            surface.configure(surface.width, surface.height);
+            continue;
+        }
+        GpuFrame frame = fr.value;
+        scene.render(frame.view, surface.width, surface.height, surface.format)?;
+        surface.present(&frame);
+        frames++;
+        if (max_frames > 0 && frames >= max_frames) running = false;
+    }
+    return Ok<int, string>(frames);
+}
+
+int main(int argc, string* argv) {
+    int max_frames = 0;
+    if (argc > 2 && strcmp(argv[1], "--frames") == 0) max_frames = atoi(argv[2]);
+    Result<int, string> r = run(max_frames);
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}
