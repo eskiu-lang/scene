@@ -1,0 +1,171 @@
+// The scene graph without drawing: world matrices through parents, look_at,
+// reparenting and removal, the procedural shapes' sizes and bounds, matrix
+// decomposition, material keys and the light falloff curves.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b, float tol) {
+    return a - b < tol && b - a < tol;
+}
+
+bool near3(Vec3 a, Vec3 b, float tol) {
+    return near(a.x, b.x, tol) && near(a.y, b.y, tol) && near(a.z, b.z, tol);
+}
+
+void shapes() {
+    SceneGeometry box = scene_box(2.0, 4.0, 6.0);
+    check("box: 24 vertices, 36 indices", box.vertex_count == 24 && box.index_count == 36);
+    check("box bounds", near3(box.min, Vec3{-1.0, -2.0, -3.0}, 1e-5) && near3(box.max, Vec3{1.0, 2.0, 3.0}, 1e-5));
+    // every triangle winds counterclockwise seen from outside: its normal points away from the center
+    bool outward = true;
+    for (t in 0..box.index_count / 3) {
+        Vec3 a = box.position(box.indices[t * 3]);
+        Vec3 b = box.position(box.indices[t * 3 + 1]);
+        Vec3 c = box.position(box.indices[t * 3 + 2]);
+        Vec3 n = (b - a).cross(c - a);
+        if (n.dot((a + b + c) * (1.0 / 3.0)) <= 0.0) outward = false;
+    }
+    check("box faces wind outward", outward);
+    box.free();
+
+    SceneGeometry ball = scene_sphere(2.0, 16, 8);
+    check("sphere sizes", ball.vertex_count == 17 * 9 && ball.index_count == 16 * 8 * 6);
+    check("sphere bounds", near3(ball.max, Vec3{2.0, 2.0, 2.0}, 1e-4) && near3(ball.min, Vec3{-2.0, -2.0, -2.0}, 1e-4));
+    bool out2 = true;
+    bool unit = true;
+    for (t in 0..ball.index_count / 3) {
+        Vec3 a = ball.position(ball.indices[t * 3]);
+        Vec3 b = ball.position(ball.indices[t * 3 + 1]);
+        Vec3 c = ball.position(ball.indices[t * 3 + 2]);
+        Vec3 n = (b - a).cross(c - a);
+        if (n.length() > 1e-6 && n.dot(a + b + c) <= 0.0) out2 = false;
+    }
+    for (i in 0..ball.vertex_count) {
+        *float v = ball.vertices + (int64)i * SCENE_VERTEX_FLOATS;
+        if (!near(Vec3{v[3], v[4], v[5]}.length(), 1.0, 1e-4)) unit = false;
+    }
+    check("sphere faces wind outward", out2);
+    check("sphere normals are unit", unit);
+    ball.free();
+
+    SceneGeometry q = scene_quad(2.0, 1.0);
+    *float v0 = q.vertices;
+    check("quad faces +Z", near(v0[5], 1.0, 1e-6) && q.index_count == 6);
+    check("quad tangent along +X", near(v0[8], 1.0, 1e-5) && near(v0[11] * v0[11], 1.0, 1e-5));
+    q.free();
+    SceneGeometry p = scene_plane(4.0, 2.0);
+    check("plane faces +Y", near(p.vertices[4], 1.0, 1e-6) && near3(p.max, Vec3{2.0, 0.0, 1.0}, 1e-5));
+    p.free();
+}
+
+void math() {
+    Quat r = quat_axis_angle(Vec3{0.3, 1.0, -0.2}, 0.7);
+    Mat4 m = mat4_trs(Vec3{1.0, -2.0, 3.0}, r, Vec3{2.0, 0.5, 1.5});
+    Vec3 t;
+    Quat q;
+    Vec3 s;
+    scene_decompose(m, &t, &q, &s);
+    check("decompose translation", near3(t, Vec3{1.0, -2.0, 3.0}, 1e-5));
+    check("decompose scale", near3(s, Vec3{2.0, 0.5, 1.5}, 1e-4));
+    check("decompose rotation", near(q.dot(r) * q.dot(r), 1.0, 1e-4));
+
+    SceneMaterial a = scene_material(SCENE_PHONG);
+    SceneMaterial b = scene_material(SCENE_PHONG);
+    b.blend_mode = SCENE_BLEND_ADD;
+    check("blend mode ignored unless blending", scene_material_key(&a) == scene_material_key(&b));
+    b.alpha_mode = SCENE_ALPHA_BLEND;
+    int kb = scene_material_key(&b);
+    check("key parts", scene_key_lighting(kb) == SCENE_PHONG && scene_key_alpha(kb) == SCENE_ALPHA_BLEND
+        && scene_key_blend(kb) == SCENE_BLEND_ADD && !scene_key_double_sided(kb));
+    b.double_sided = true;
+    check("double sided key", scene_key_double_sided(scene_material_key(&b)));
+
+    SceneLight pl = scene_point(Vec3{0.0, 0.0, 0.0}, Vec3{1.0, 1.0, 1.0}, 1.0, 1.0, 3.0);
+    pl.falloff = 1.0;
+    check("attenuation: full before start", near(pl.attenuation(0.5), 1.0, 1e-6));
+    check("attenuation: linear half way", near(pl.attenuation(2.0), 0.5, 1e-5));
+    check("attenuation: none past end", near(pl.attenuation(3.5), 0.0, 1e-6));
+    pl.falloff = 2.0;
+    check("attenuation: falloff 2", near(pl.attenuation(2.0), 1.0 - (float)sqrt(0.5), 1e-5));
+    SceneLight sl = scene_spot(Vec3{0.0, 0.0, 0.0}, Vec3{0.0, -1.0, 0.0}, Vec3{1.0, 1.0, 1.0}, 1.0, 0.2, 0.4, 0.0, 10.0);
+    check("cone: inside", near(sl.cone(0.1), 1.0, 1e-6));
+    check("cone: outside", near(sl.cone(0.5), 0.0, 1e-6));
+    float mid = sl.cone(0.3);
+    check("cone: between", mid > 0.2 && mid < 0.8);
+
+    ScenePost p;
+    p.tone_mapping = SCENE_TONE_REINHARD;
+    check("reinhard(1) = 0.5", near(scene_tone_map(Vec3{1.0, 1.0, 1.0}, &p).x, 0.5, 1e-6));
+    p.exposure = 1.0;
+    check("reinhard(1) one stop up = 2/3", near(scene_tone_map(Vec3{1.0, 1.0, 1.0}, &p).x, 2.0 / 3.0, 1e-5));
+    p.tone_mapping = SCENE_TONE_HABLE;
+    p.exposure = 0.0;
+    p.white_point = 4.0;
+    check("hable(white point) = 1", near(scene_tone_map(Vec3{4.0, 4.0, 4.0}, &p).x, 1.0, 1e-5));
+    check("srgb(0.5)", near(scene_srgb(0.5), 0.735357, 1e-4) && near(scene_linear(scene_srgb(0.3)), 0.3, 1e-5));
+}
+
+Result<int, string> graph() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    int a = scene.add_node(0, "a");
+    int b = scene.add_node(a, "b");
+    int c = scene.add_node(b, "c");
+    scene.node(a).position = Vec3{1.0, 0.0, 0.0};
+    scene.node(a).rotation = quat_axis_angle(Vec3{0.0, 1.0, 0.0}, 1.5707963);
+    scene.node(b).position = Vec3{0.0, 0.0, -2.0};
+    scene.node(b).scale = Vec3{2.0, 2.0, 2.0};
+    scene.node(c).position = Vec3{1.0, 0.0, 0.0};
+    scene.update();
+    // a turns -Z into -X: b sits at (1 - 2, 0, 0); c is 2 units along b's x, which is a's -z
+    Vec3 pc = scene.node(c).world.point(Vec3{0.0, 0.0, 0.0});
+    check("world through parents", near3(pc, Vec3{-1.0, 0.0, -2.0}, 1e-4));
+    check("Scene_world matches update", near3(scene.world(c).point(Vec3{0.0, 0.0, 0.0}), pc, 1e-5));
+    check("find by name", scene.find("c") == c && scene.find("zz") == -1);
+
+    check("no cycles", !scene.set_parent(a, c));
+    check("reparent", scene.set_parent(c, 0));
+    scene.update();
+    check("reparented to the root", near3(scene.node(c).world.point(Vec3{0.0, 0.0, 0.0}), Vec3{1.0, 0.0, 0.0}, 1e-5));
+
+    int cam = scene.add_camera(b, scene_perspective(1.0, 0.1, 10.0));
+    scene.node(cam).position = Vec3{0.0, 1.0, 0.0};
+    scene.look_at(cam, Vec3{3.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0});
+    Mat4 w = scene.world(cam);
+    Vec3 eye = w.point(Vec3{0.0, 0.0, 0.0});
+    Vec3 ahead = w.point(Vec3{0.0, 0.0, -1.0}) - eye;
+    check("look_at under a rotated, scaled parent", near3(ahead.normalize(), (Vec3{3.0, 0.0, 0.0} - eye).normalize(), 1e-4));
+
+    scene.remove(a);
+    check("remove takes the subtree", !scene.node(a).alive && !scene.node(b).alive && !scene.node(cam).alive && scene.node(c).alive);
+    check("root stays", scene.node(0).alive && scene.node(0).children.size == 1);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    shapes();
+    math();
+    Result<int, string> r = graph();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("graph: ok\n");
+    return 0;
+}
