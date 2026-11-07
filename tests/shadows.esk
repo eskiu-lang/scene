@@ -1,0 +1,132 @@
+// Directional shadow maps: a white Lambert ground (y = 0, 4 x 4) under a
+// small box (1 x 0.2 x 1 at y = 1), lit at 45 degrees from -X (the light
+// travels toward +X and down), seen straight down through an orthographic
+// camera. The box's shadow falls on x 0.5 to 1.5. With casts_shadows on the
+// light, that ground is dark while open ground keeps cos(45) of the light;
+// half opacity leaves half the light; a node that does not cast (or a ground
+// that does not receive) brings the light back; a second shadowed light uses
+// the second layer of the map array.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 64;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+// The red value seen at ground point (x, z).
+float at(*uint16 px, float x, float z) {
+    int ix = (int)((x + 2.0) / 4.0 * (float)N);
+    int iz = (int)((z + 2.0) / 4.0 * (float)N);
+    return half_to_float(px[(iz * N + ix) * 4]);
+}
+
+bool near(float a, float b, float tol) {
+    return a - b < tol && b - a < tol;
+}
+
+Result<int, string> frame(*Scene scene, *GpuTexture target, *uint16 px) {
+    scene.render_to(target)?;
+    target.read(px)?;
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    scene.shadow_size = 512;
+    SceneGeometry pg = scene_plane(4.0, 4.0);
+    int plane = scene.add_geometry(&pg)?;
+    pg.free();
+    SceneGeometry bg = scene_box(1.0, 0.2, 1.0);
+    int box = scene.add_geometry(&bg)?;
+    bg.free();
+    int white = scene.add_material(scene_material(SCENE_LAMBERT));
+    int ground = scene.add_object(0, plane, white);
+    int occluder = scene.add_object(0, box, white);
+    scene.node(occluder).position = Vec3{0.0, 1.0, 0.0};
+    int cam = scene.add_camera(0, scene_orthographic(4.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 6.0, 0.0};
+    scene.look_at(cam, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 0.0, -1.0});
+    scene.set_camera(cam);
+    int sun = scene.add_light(scene_directional(Vec3{1.0, -1.0, 0.0}, Vec3{1.0, 1.0, 1.0}, 1.0));
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+    float lit = 0.70710678;
+
+    frame(&scene, &target, px)?;
+    printf("  off: open %.3f, shadow spot %.3f\n", (double)at(px, -1.5, 0.0), (double)at(px, 1.0, 0.0));
+    check("shadows off: the ground is evenly lit", near(at(px, -1.5, 0.0), lit, 0.01) && near(at(px, 1.0, 0.0), lit, 0.01));
+
+    scene.light(sun).casts_shadows = true;
+    frame(&scene, &target, px)?;
+    float open = at(px, -1.5, 0.0);
+    float shade = at(px, 1.0, 0.0);
+    float beside = at(px, 1.0, 1.2);
+    float top = at(px, 0.0, 0.0);
+    printf("  on: open %.3f, in shadow %.3f, beside %.3f, box top %.3f\n", (double)open, (double)shade, (double)beside, (double)top);
+    check("open ground keeps its light", near(open, lit, 0.01));
+    check("the box's shadow is dark", shade < 0.02);
+    check("beside the shadow is lit", near(beside, lit, 0.01));
+    check("the box's top is lit", near(top, lit, 0.01));
+    check("the shadow starts after x = 0.5", near(at(px, 0.3, 0.0), lit, 0.02) && at(px, 0.7, 0.0) < 0.05);
+
+    scene.light(sun).shadow_opacity = 0.5;
+    frame(&scene, &target, px)?;
+    check("half opacity", near(at(px, 1.0, 0.0), lit * 0.5, 0.02));
+    scene.light(sun).shadow_opacity = 1.0;
+
+    scene.node(occluder).casts_shadows = false;
+    frame(&scene, &target, px)?;
+    check("a node that does not cast", near(at(px, 1.0, 0.0), lit, 0.01));
+    scene.node(occluder).casts_shadows = true;
+    scene.node(ground).receives_shadows = false;
+    frame(&scene, &target, px)?;
+    check("a node that does not receive", near(at(px, 1.0, 0.0), lit, 0.01));
+    scene.node(ground).receives_shadows = true;
+
+    // a second shadowed light from +X: its shadow falls on x -1.5 to -0.5
+    SceneLight other = scene_directional(Vec3{-1.0, -1.0, 0.0}, Vec3{1.0, 1.0, 1.0}, 1.0);
+    other.casts_shadows = true;
+    scene.add_light(other);
+    frame(&scene, &target, px)?;
+    printf("  two lights: open %.3f, first shadow %.3f, second shadow %.3f\n", (double)at(px, 0.0, 1.6),
+        (double)at(px, 1.0, 0.0), (double)at(px, -1.0, 0.0));
+    check("two shadowed lights: open ground gets both", near(at(px, 0.0, 1.6), lit * 2.0, 0.02));
+    check("two shadowed lights: each shadow keeps the other light", near(at(px, 1.0, 0.0), lit, 0.02) && near(at(px, -1.0, 0.0), lit, 0.02));
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("shadows: ok\n");
+    return 0;
+}
