@@ -1,0 +1,305 @@
+// geometry.esk: meshes on the CPU, before they go to the GPU (`<scene/geometry>`).
+//
+// A SceneGeometry is an interleaved vertex array and a uint32 index list. The
+// procedural shapes (box, sphere, plane, quad) and glTF primitives come in
+// this form, and Scene_add_geometry uploads one as a mesh:
+//
+//     SceneGeometry g = scene_sphere(1.0, 48, 24);
+//     defer g.free();
+//     int mesh = scene.add_geometry(&g)?;
+//
+// Each vertex is SCENE_VERTEX_FLOATS floats: position (3), normal (3),
+// texture coordinate (2), tangent (4, w the handedness of the bitangent) and
+// color (4, linear RGBA). Front faces wind counterclockwise.
+
+import <mem>;
+import <libc>;
+import <gpu/math>;
+import <gpu/gltf>;
+
+// Floats per vertex: position 0-2, normal 3-5, uv 6-7, tangent 8-11, color 12-15.
+const int SCENE_VERTEX_FLOATS = 16;
+
+// A mesh on the CPU: vertex_count vertices of SCENE_VERTEX_FLOATS floats each, and
+// index_count indices (three per triangle). min and max bound the positions. Free it
+// with free().
+struct SceneGeometry {
+    uint32 vertex_count;
+    *float vertices;
+    uint32 index_count;
+    *uint32 indices;
+    Vec3 min;
+    Vec3 max;
+}
+
+// Room for vertices vertices and indices indices, every vertex white with a +Y normal
+// and the rest zero.
+SceneGeometry scene_geometry(uint32 vertices, uint32 indices) {
+    SceneGeometry g;
+    g.vertex_count = vertices;
+    g.index_count = indices;
+    g.vertices = alloc<float>((int64)vertices * SCENE_VERTEX_FLOATS + 1);
+    g.indices = alloc<uint32>((int64)indices + 1);
+    for (i in 0..vertices) {
+        *float v = g.vertices + (int64)i * SCENE_VERTEX_FLOATS;
+        v[4] = 1.0;
+        for (k in 12..16) v[k] = 1.0;
+    }
+    return g;
+}
+
+// Sets vertex i's position, normal and texture coordinate.
+void SceneGeometry_set(*SceneGeometry self, uint32 i, Vec3 pos, Vec3 normal, Vec2 uv) {
+    *float v = self.vertices + (int64)i * SCENE_VERTEX_FLOATS;
+    v[0] = pos.x;
+    v[1] = pos.y;
+    v[2] = pos.z;
+    v[3] = normal.x;
+    v[4] = normal.y;
+    v[5] = normal.z;
+    v[6] = uv.x;
+    v[7] = uv.y;
+}
+
+// Vertex i's position.
+Vec3 SceneGeometry_position(*SceneGeometry self, uint32 i) {
+    *float v = self.vertices + (int64)i * SCENE_VERTEX_FLOATS;
+    return Vec3{v[0], v[1], v[2]};
+}
+
+// Recomputes min and max from the positions.
+void SceneGeometry_bounds(*SceneGeometry self) {
+    if (self.vertex_count == 0) {
+        self.min = Vec3{0.0, 0.0, 0.0};
+        self.max = Vec3{0.0, 0.0, 0.0};
+        return;
+    }
+    Vec3 lo = self.position(0);
+    Vec3 hi = lo;
+    for (i in 1..self.vertex_count) {
+        Vec3 p = self.position(i);
+        if (p.x < lo.x) lo.x = p.x;
+        if (p.y < lo.y) lo.y = p.y;
+        if (p.z < lo.z) lo.z = p.z;
+        if (p.x > hi.x) hi.x = p.x;
+        if (p.y > hi.y) hi.y = p.y;
+        if (p.z > hi.z) hi.z = p.z;
+    }
+    self.min = lo;
+    self.max = hi;
+}
+
+// Fills the normals with the area-weighted average of the faces around each vertex.
+void SceneGeometry_normals(*SceneGeometry self) {
+    *float acc = alloc<float>((int64)self.vertex_count * 3 + 1);
+    defer free(acc);
+    for (t in 0..self.index_count / 3) {
+        uint32[3] ids = {self.indices[t * 3], self.indices[t * 3 + 1], self.indices[t * 3 + 2]};
+        if (ids[0] >= self.vertex_count || ids[1] >= self.vertex_count || ids[2] >= self.vertex_count) continue;
+        Vec3 a = self.position(ids[0]);
+        Vec3 n = (self.position(ids[1]) - a).cross(self.position(ids[2]) - a);
+        for (k in 0..3) {
+            acc[ids[k] * 3] += n.x;
+            acc[ids[k] * 3 + 1] += n.y;
+            acc[ids[k] * 3 + 2] += n.z;
+        }
+    }
+    for (i in 0..self.vertex_count) {
+        Vec3 n = Vec3{acc[i * 3], acc[i * 3 + 1], acc[i * 3 + 2]}.normalize();
+        *float v = self.vertices + (int64)i * SCENE_VERTEX_FLOATS;
+        v[3] = n.x;
+        v[4] = n.y;
+        v[5] = n.z;
+    }
+}
+
+// Fills the tangents from the texture coordinates (the direction in which u grows,
+// made perpendicular to the normal; w is +1 or -1, the side of the direction in which v
+// grows). A vertex whose triangles have no usable coordinates keeps w = 0, and the shader
+// then derives its frame from screen-space derivatives.
+void SceneGeometry_tangents(*SceneGeometry self) {
+    *float tan1 = alloc<float>((int64)self.vertex_count * 6 + 1);
+    defer free(tan1);
+    for (t in 0..self.index_count / 3) {
+        uint32[3] ids = {self.indices[t * 3], self.indices[t * 3 + 1], self.indices[t * 3 + 2]};
+        if (ids[0] >= self.vertex_count || ids[1] >= self.vertex_count || ids[2] >= self.vertex_count) continue;
+        *float v0 = self.vertices + (int64)ids[0] * SCENE_VERTEX_FLOATS;
+        *float v1 = self.vertices + (int64)ids[1] * SCENE_VERTEX_FLOATS;
+        *float v2 = self.vertices + (int64)ids[2] * SCENE_VERTEX_FLOATS;
+        Vec3 e1 = Vec3{v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
+        Vec3 e2 = Vec3{v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+        float du1 = v1[6] - v0[6];
+        float dv1 = v1[7] - v0[7];
+        float du2 = v2[6] - v0[6];
+        float dv2 = v2[7] - v0[7];
+        float det = du1 * dv2 - du2 * dv1;
+        if (det > -1e-12 && det < 1e-12) continue;
+        float r = 1.0 / det;
+        Vec3 sdir = (e1 * dv2 - e2 * dv1) * r;
+        Vec3 tdir = (e2 * du1 - e1 * du2) * r;
+        for (k in 0..3) {
+            *float a = tan1 + (int64)ids[k] * 6;
+            a[0] += sdir.x;
+            a[1] += sdir.y;
+            a[2] += sdir.z;
+            a[3] += tdir.x;
+            a[4] += tdir.y;
+            a[5] += tdir.z;
+        }
+    }
+    for (i in 0..self.vertex_count) {
+        *float v = self.vertices + (int64)i * SCENE_VERTEX_FLOATS;
+        *float a = tan1 + (int64)i * 6;
+        Vec3 n = Vec3{v[3], v[4], v[5]};
+        Vec3 t = Vec3{a[0], a[1], a[2]};
+        Vec3 b = Vec3{a[3], a[4], a[5]};
+        Vec3 tp = t - n * n.dot(t);
+        if (tp.length() < 1e-8) {
+            for (k in 8..12) v[k] = 0.0;
+            continue;
+        }
+        tp = tp.normalize();
+        v[8] = tp.x;
+        v[9] = tp.y;
+        v[10] = tp.z;
+        v[11] = n.cross(tp).dot(b) < 0.0 ? -1.0 : 1.0;
+    }
+}
+
+// Sets every vertex's color (linear RGBA), which multiplies the material's diffuse color.
+void SceneGeometry_color(*SceneGeometry self, Vec4 c) {
+    for (i in 0..self.vertex_count) {
+        *float v = self.vertices + (int64)i * SCENE_VERTEX_FLOATS;
+        v[12] = c.x;
+        v[13] = c.y;
+        v[14] = c.z;
+        v[15] = c.w;
+    }
+}
+
+// Frees the vertex and index arrays; a second call does nothing.
+void SceneGeometry_free(*SceneGeometry self) {
+    if (self.vertices != null) free(self.vertices);
+    if (self.indices != null) free(self.indices);
+    self.vertices = null;
+    self.indices = null;
+    self.vertex_count = 0;
+    self.index_count = 0;
+}
+
+void _scene_face(*SceneGeometry g, int face, Vec3 n, Vec3 u, Vec3 v, Vec3 half) {
+    uint32 base = (uint32)(face * 4);
+    float[4] su = {-1.0, 1.0, 1.0, -1.0};
+    float[4] sv = {-1.0, -1.0, 1.0, 1.0};
+    float[4] tu = {0.0, 1.0, 1.0, 0.0};
+    float[4] tv = {1.0, 1.0, 0.0, 0.0};
+    for (k in 0..4) {
+        Vec3 p = (n + u * su[k] + v * sv[k]).mul(half);
+        g.set(base + (uint32)k, p, n, Vec2{tu[k], tv[k]});
+    }
+    uint32 at = (uint32)(face * 6);
+    uint32[6] idx = {0, 1, 2, 0, 2, 3};
+    for (k in 0..6) g.indices[at + (uint32)k] = base + idx[k];
+}
+
+// A box of width (x), height (y) and depth (z) centered on the origin: 24 vertices (4 per
+// face, each face mapped to the whole texture) and 12 triangles.
+SceneGeometry scene_box(float width, float height, float depth) {
+    SceneGeometry g = scene_geometry(24, 36);
+    Vec3 half = Vec3{width * 0.5, height * 0.5, depth * 0.5};
+    _scene_face(&g, 0, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 0.0, -1.0}, Vec3{0.0, 1.0, 0.0}, half);
+    _scene_face(&g, 1, Vec3{-1.0, 0.0, 0.0}, Vec3{0.0, 0.0, 1.0}, Vec3{0.0, 1.0, 0.0}, half);
+    _scene_face(&g, 2, Vec3{0.0, 1.0, 0.0}, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 0.0, -1.0}, half);
+    _scene_face(&g, 3, Vec3{0.0, -1.0, 0.0}, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 0.0, 1.0}, half);
+    _scene_face(&g, 4, Vec3{0.0, 0.0, 1.0}, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0}, half);
+    _scene_face(&g, 5, Vec3{0.0, 0.0, -1.0}, Vec3{-1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0}, half);
+    g.tangents();
+    g.bounds();
+    return g;
+}
+
+// A sphere of radius radius centered on the origin, with segments divisions around the
+// Y axis (at least 3) and rings from pole to pole (at least 2). u goes once around, v from
+// the top (0) to the bottom (1).
+SceneGeometry scene_sphere(float radius, int segments, int rings) {
+    if (segments < 3) segments = 3;
+    if (rings < 2) rings = 2;
+    uint32 cols = (uint32)segments + 1;
+    SceneGeometry g = scene_geometry(cols * ((uint32)rings + 1), (uint32)(segments * rings * 6));
+    for (i in 0..rings + 1) {
+        double th = 3.14159265358979 * (double)i / (double)rings;
+        for (j in 0..segments + 1) {
+            double ph = 2.0 * 3.14159265358979 * (double)j / (double)segments;
+            Vec3 n = Vec3{(float)(sin(th) * cos(ph)), (float)cos(th), (float)(-sin(th) * sin(ph))};
+            if (i == 0 || i == rings) n = Vec3{0.0, i == 0 ? 1.0 : -1.0, 0.0};
+            g.set((uint32)i * cols + (uint32)j, n * radius, n, Vec2{(float)j / (float)segments, (float)i / (float)rings});
+        }
+    }
+    uint32 at = 0;
+    for (i in 0..rings) {
+        for (j in 0..segments) {
+            uint32 a = (uint32)i * cols + (uint32)j;
+            uint32 b = a + cols;
+            uint32 c = a + 1;
+            uint32 d = b + 1;
+            uint32[6] tri = {a, b, c, c, b, d};
+            for (k in 0..6) g.indices[at + (uint32)k] = tri[k];
+            at += 6;
+        }
+    }
+    g.tangents();
+    g.bounds();
+    return g;
+}
+
+// A flat rectangle in the XZ plane facing up (+Y), width along x and depth along z,
+// centered on the origin: the ground.
+SceneGeometry scene_plane(float width, float depth) {
+    SceneGeometry g = scene_geometry(4, 6);
+    _scene_face(&g, 0, Vec3{0.0, 1.0, 0.0}, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 0.0, -1.0}, Vec3{width * 0.5, 0.0, depth * 0.5});
+    g.tangents();
+    g.bounds();
+    return g;
+}
+
+// A flat rectangle in the XY plane facing the viewer (+Z), width along x and height along
+// y, centered on the origin: an image or a billboard.
+SceneGeometry scene_quad(float width, float height) {
+    SceneGeometry g = scene_geometry(4, 6);
+    _scene_face(&g, 0, Vec3{0.0, 0.0, 1.0}, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0}, Vec3{width * 0.5, height * 0.5, 0.0});
+    g.tangents();
+    g.bounds();
+    return g;
+}
+
+// A glTF triangle primitive as a SceneGeometry: its positions, normals (averaged from the
+// faces when the file has none), first texture coordinates, tangents (computed when the
+// file has none) and vertex colors; an unindexed primitive gets the indices 0, 1, 2...
+SceneGeometry scene_gltf_geometry(*GltfPrimitive p) {
+    uint32 n = p.vertex_count;
+    uint32 ni = p.index_count;
+    if (p.indices == null) ni = n;
+    SceneGeometry g = scene_geometry(n, ni);
+    for (i in 0..n) {
+        *float v = g.vertices + (int64)i * SCENE_VERTEX_FLOATS;
+        for (k in 0..3) v[k] = p.positions[i * 3 + k];
+        if (p.normals != null) {
+            for (k in 0..3) v[3 + k] = p.normals[i * 3 + k];
+        }
+        if (p.uvs != null) {
+            v[6] = p.uvs[i * 2];
+            v[7] = p.uvs[i * 2 + 1];
+        }
+        if (p.tangents != null) {
+            for (k in 0..4) v[8 + k] = p.tangents[i * 4 + k];
+        }
+        if (p.colors != null) {
+            for (k in 0..4) v[12 + k] = p.colors[i * 4 + k];
+        }
+    }
+    for (i in 0..ni) g.indices[i] = p.indices != null ? p.indices[i] : (uint32)i;
+    if (p.normals == null) g.normals();
+    if (p.tangents == null && p.uvs != null) g.tangents();
+    g.bounds();
+    return g;
+}
