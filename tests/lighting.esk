@@ -1,0 +1,174 @@
+// Each lighting model on a unit sphere, seen through an orthographic camera
+// down -Z into an RGBA16Float target with no tone mapping and no gamma, so the
+// pixels are the shader's linear output. At chosen pixels the surface normal
+// is known, (x, y, sqrt(1 - x^2 - y^2)), and the view direction is +Z; the
+// test computes each model's value on the CPU (ambient + Lambert diffuse,
+// Phong and Blinn highlights, GGX metallic-roughness) and compares.
+// Tolerances cover the sphere's tessellation and half floats.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 64;
+const float VIEW = 2.2;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+Vec3 pixel(*uint16 px, int x, int y) {
+    *uint16 p = px + (y * N + x) * 4;
+    return Vec3{half_to_float(p[0]), half_to_float(p[1]), half_to_float(p[2])};
+}
+
+float world_x(int px) {
+    return ((float)px + 0.5) / (float)N * VIEW - VIEW * 0.5;
+}
+
+float world_y(int py) {
+    return VIEW * 0.5 - ((float)py + 0.5) / (float)N * VIEW;
+}
+
+float maxf(float a, float b) {
+    return a > b ? a : b;
+}
+
+Vec3 base_color() {
+    return Vec3{0.8, 0.5, 0.3};
+}
+
+// The CPU version of each model for normal n, light direction l (toward the light),
+// radiance 1.5, ambient 0.1, view +Z.
+Vec3 expected(int model, Vec3 n, Vec3 l) {
+    Vec3 b = base_color();
+    Vec3 v = Vec3{0.0, 0.0, 1.0};
+    float rad = 1.5;
+    float amb = 0.1;
+    float nl = maxf(n.dot(l), 0.0);
+    if (model == SCENE_CONSTANT) return b;
+    Vec3 c = b * (amb + rad * nl);
+    if (model == SCENE_PHONG && nl > 0.0) {
+        Vec3 r = n * (2.0 * n.dot(l)) - l;
+        float s = (float)pow((double)maxf(v.dot(r), 0.0), 8.0) * rad;
+        c = c + Vec3{s, s, s};
+    }
+    if (model == SCENE_BLINN && nl > 0.0) {
+        float s = (float)pow((double)maxf((v + l).normalize().dot(n), 0.0), 8.0) * rad;
+        c = c + Vec3{s, s, s};
+    }
+    if (model == SCENE_PBR) {
+        float rough = 0.5;
+        float a = rough * rough;
+        float a2 = a * a;
+        Vec3 h = (v + l).normalize();
+        float nv = maxf(n.dot(v), 1e-4);
+        float nh = maxf(n.dot(h), 0.0);
+        float vh = maxf(v.dot(h), 0.0);
+        float fs = 0.04 + 0.96 * (float)pow((double)(1.0 - vh), 5.0);
+        float dn = nh * nh * (a2 - 1.0) + 1.0;
+        float d = a2 / (3.14159265 * dn * dn);
+        float gv = nl * (float)sqrt((double)(nv * nv * (1.0 - a2) + a2));
+        float gl = nv * (float)sqrt((double)(nl * nl * (1.0 - a2) + a2));
+        float vis = 0.5 / maxf(gv + gl, 1e-5);
+        float spec = fs * d * vis * 3.14159265 * rad * nl;
+        float kd = (1.0 - fs) * rad * nl;
+        c = b * (kd + amb) + Vec3{spec, spec, spec};
+    }
+    return c;
+}
+
+bool near_color(Vec3 got, Vec3 want) {
+    float[3] g = {got.x, got.y, got.z};
+    float[3] w = {want.x, want.y, want.z};
+    for (k in 0..3) {
+        float tol = 0.006 + 0.01 * w[k];
+        if (g[k] - w[k] > tol || w[k] - g[k] > tol) return false;
+    }
+    return true;
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    SceneGeometry ball = scene_sphere(1.0, 96, 48);
+    int mesh = scene.add_geometry(&ball)?;
+    ball.free();
+    int node = scene.add_object(0, mesh, 0);
+    Vec3 l = Vec3{1.0, 1.0, 1.0}.normalize();
+    scene.add_light(scene_directional(-l, Vec3{1.0, 1.0, 1.0}, 1.5));
+    scene.add_light(scene_ambient(Vec3{1.0, 1.0, 1.0}, 0.1));
+    int cam = scene.add_camera(0, scene_orthographic(VIEW, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+
+    string[5] names = {"constant", "lambert", "phong", "blinn", "pbr"};
+    int[10] xs = {32, 40, 24, 46, 20, 36, 28, 50, 14, 33};
+    int[10] ys = {32, 24, 40, 30, 22, 46, 12, 40, 30, 52};
+    for (model in 0..5) {
+        SceneMaterial m = scene_material(model);
+        Vec3 b = base_color();
+        m.diffuse = Vec4{b.x, b.y, b.z, 1.0};
+        m.shininess = 8.0;
+        m.roughness = 0.5;
+        scene.node(node).material = scene.add_material(m);
+        scene.render_to(&target)?;
+        target.read(px)?;
+        int bad = 0;
+        for (k in 0..10) {
+            float x = world_x(xs[k]);
+            float y = world_y(ys[k]);
+            float r2 = x * x + y * y;
+            if (r2 > 0.8) continue;
+            Vec3 n = Vec3{x, y, (float)sqrt((double)(1.0 - r2))};
+            Vec3 got = pixel(px, xs[k], ys[k]);
+            Vec3 want = expected(model, n, l);
+            if (!near_color(got, want)) {
+                printf("  %s at (%d, %d): got %.3f %.3f %.3f, want %.3f %.3f %.3f\n", names[model], xs[k], ys[k],
+                    (double)got.x, (double)got.y, (double)got.z, (double)want.x, (double)want.y, (double)want.z);
+                bad++;
+            }
+        }
+        Vec3 corner = pixel(px, 1, 1);
+        check("background stays black", corner.x == 0.0 && corner.y == 0.0 && corner.z == 0.0);
+        if (bad > 0) {
+            printf("FAIL %s: %d pixels off\n", names[model], bad);
+            fails++;
+        }
+    }
+    check("one pipeline per lighting model", scene.pipeline_count() == 5);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("lighting: ok\n");
+    return 0;
+}
