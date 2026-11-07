@@ -1,0 +1,126 @@
+// sky.esk: the background of a scene (`<scene/sky>`).
+//
+// Behind everything a scene shows a solid color (Scene.background) or a cube
+// map: an environment from `<gpu/ibl>` (GpuIbl.environment, radiance by
+// direction) with Scene_set_skybox, or six images with Scene_set_skybox_faces.
+//
+//     GpuIbl ibl = gpu.ibl(&sky_hdr, null)?;
+//     scene.set_skybox(&ibl.environment);
+//     scene.set_ibl(&ibl);               // PBR materials take their ambient light from it
+//
+// scene_cube_faces makes the cube of six images on its own.
+
+import <mem>;
+import <result>;
+import <gpu/raw>;
+import <gpu/core>;
+import <gpu/render>;
+import <gpu/math>;
+import <gpu/image>;
+
+// A cube texture from six square images of the same size, in the order +X (right), -X
+// (left), +Y (top), -Y (bottom), +Z (front), -Z (back), stored as sRGB with mipmaps made on
+// the GPU. These are the usual skybox image sets (OpenGL's cube map convention): drawn
+// with Scene_set_skybox_faces, the +Z image is what a camera looking down -Z sees.
+Result<GpuTexture, string> scene_cube_faces(*Gpu gpu, *Bitmap faces) {
+    uint32 size = faces[0].width;
+    for (i in 0..6) {
+        if (faces[i].width != size || faces[i].height != size || faces[i].rgba == null) {
+            return Err<GpuTexture, string>("scene: cube faces must be square images of one size");
+        }
+    }
+    GpuTextureDesc d = GpuTextureDesc{width: size, height: size, format: WGPUTextureFormat_RGBA8UnormSrgb,
+        cube: true, mipmaps: true};
+    GpuTexture t = gpu.texture_with(&d)?;
+    for (i in 0..6) {
+        Result<int, string> w = t.write_level((uint32)i, 0, faces[i].rgba);
+        if (!w.ok) {
+            t.release();
+            return Err<GpuTexture, string>(w.error);
+        }
+    }
+    Result<int, string> m = t.generate_mips();
+    if (!m.ok) {
+        t.release();
+        return Err<GpuTexture, string>(m.error);
+    }
+    return Ok<GpuTexture, string>(t);
+}
+
+string _scene_sky_wgsl =
+    "struct Sky { inv_vp: mat4x4<f32>, params: vec4<f32> };\n"
+    "@group(0) @binding(0) var<uniform> sky: Sky;\n"
+    "@group(0) @binding(1) var cube: texture_cube<f32>;\n"
+    "@group(0) @binding(2) var samp: sampler;\n"
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) ndc: vec2<f32> };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;\n"
+    "    var o: V;\n"
+    "    o.pos = vec4<f32>(p, 1.0, 1.0);\n"
+    "    o.ndc = p;\n"
+    "    return o;\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    let far = sky.inv_vp * vec4<f32>(v.ndc, 1.0, 1.0);\n"
+    "    let near = sky.inv_vp * vec4<f32>(v.ndc, 0.0, 1.0);\n"
+    "    var d = normalize(far.xyz / far.w - near.xyz / near.w);\n"
+    "    if (sky.params.y > 0.5) { d.z = -d.z; }\n"
+    "    return vec4<f32>(textureSample(cube, samp, d).rgb * sky.params.x, 1.0);\n"
+    "}\n";
+
+struct _SceneSkyGpu {
+    bool made;
+    GpuBindLayout layout;
+    GpuPipeline pipe;
+    GpuBuffer uniforms;
+    GpuBindGroup group;
+    GpuSampler samp;
+    WGPUTextureView bound;
+}
+
+Result<int, string> _scene_sky_make(*_SceneSkyGpu self, *Gpu gpu) {
+    self.layout = gpu.bind_layout();
+    self.layout.uniform(0, WGPUShaderStage_Fragment);
+    self.layout.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_Cube);
+    self.layout.sampler(2, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+    *GpuBindLayout[1] groups = {&self.layout};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_sky_wgsl, vertex: "vs", fragment: "fs",
+        format: WGPUTextureFormat_RGBA16Float, groups: &groups[0], group_count: 1, depth: true,
+        depth_format: WGPUTextureFormat_Depth32Float, depth_compare: WGPUCompareFunction_LessEqual,
+        depth_read_only: true};
+    self.pipe = gpu.pipeline(&d)?;
+    self.uniforms = gpu.uniform(null, 80)?;
+    GpuSamplerOptions so = GpuSamplerOptions{mipmaps: true, wrap_u: WGPUAddressMode_ClampToEdge,
+        wrap_v: WGPUAddressMode_ClampToEdge};
+    self.samp = gpu.sampler_with(&so)?;
+    self.group = self.layout.group()?;
+    self.group.buffer(0, &self.uniforms);
+    self.group.sampler(2, &self.samp);
+    self.made = true;
+    return Ok<int, string>(0);
+}
+
+void _scene_sky_draw(*_SceneSkyGpu self, *GpuPass pass, *GpuTexture cube, Mat4 view_proj, float intensity, bool flip) {
+    if (self.bound != cube.view) {
+        self.group.texture(1, cube);
+        self.bound = cube.view;
+    }
+    float[20] u;
+    Mat4 inv = view_proj.inverse();
+    for (i in 0..16) u[i] = inv.m[i];
+    u[16] = intensity;
+    u[17] = flip ? 1.0 : 0.0;
+    self.uniforms.write(0, &u, 80);
+    pass.set_group(0, &self.group);
+    pass.draw(&self.pipe, null, 3, 1);
+}
+
+void _scene_sky_release(*_SceneSkyGpu self) {
+    if (!self.made) return;
+    self.group.release();
+    self.uniforms.release();
+    self.samp.release();
+    self.pipe.release();
+    self.layout.release();
+    self.made = false;
+}
