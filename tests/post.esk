@@ -1,0 +1,158 @@
+// Tone mapping and bloom. An unlit quad of an HDR color fills the view; for
+// each operator and a few exposures the output is compared with
+// scene_tone_map on the CPU: linear in an RGBA16Float target with gamma off,
+// sRGB-encoded by the shader in an RGBA8Unorm target, and by the GPU in an
+// RGBA8UnormSrgb one. Then bloom: a small bright square on black spreads light
+// to pixels around it that stay black without bloom, fading with distance; a
+// square below the threshold spreads nothing.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 64;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+float fpix(*uint16 px, int x, int y, int c) {
+    return half_to_float(px[(y * N + x) * 4 + c]);
+}
+
+int to_byte(float v) {
+    return (int)(scene_srgb(v) * 255.0 + 0.5);
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    SceneGeometry q = scene_quad(2.0, 2.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    int cam = scene.add_camera(0, scene_orthographic(2.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    GpuTexture ft = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer ft.release();
+    GpuTexture bt = gpu.target((uint32)N, (uint32)N)?;
+    defer bt.release();
+    GpuTexture st = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA8UnormSrgb)?;
+    defer st.release();
+    *uint16 fp = alloc<uint16>(N * N * 4);
+    defer free(fp);
+    *uint8 bp = alloc<uint8>(N * N * 4);
+    defer free(bp);
+
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    int mat = scene.add_material(m);
+    int node = scene.add_object(0, quad, mat);
+    Vec3[2] colors = {Vec3{0.25, 1.0, 3.0}, Vec3{8.0, 0.05, 0.6}};
+    float[3] exposures = {0.0, 1.0, -1.5};
+    string[4] names = {"none", "reinhard", "exposure", "hable"};
+    for (op in 0..4) {
+        for (e in 0..3) {
+            for (c in 0..2) {
+                scene.material(mat).diffuse = Vec4{colors[c].x, colors[c].y, colors[c].z, 1.0};
+                scene.post = ScenePost{tone_mapping: op, exposure: exposures[e], white_point: op == SCENE_TONE_HABLE && e == 1 ? 6.0 : 0.0};
+                Vec3 want = scene_tone_map(colors[c], &scene.post);
+                float[3] w = {want.x, want.y, want.z};
+                scene.render_to(&ft)?;
+                ft.read(fp)?;
+                int bad = 0;
+                for (k in 0..3) {
+                    float got = fpix(fp, 20, 30, k);
+                    float tol = 0.004 + 0.002 * w[k];
+                    if (got - w[k] > tol || w[k] - got > tol) bad++;
+                }
+                if (bad > 0) {
+                    printf("FAIL %s exposure %.1f color %d: got %.4f %.4f %.4f, want %.4f %.4f %.4f\n", names[op],
+                        (double)exposures[e], c, (double)fpix(fp, 20, 30, 0), (double)fpix(fp, 20, 30, 1),
+                        (double)fpix(fp, 20, 30, 2), (double)w[0], (double)w[1], (double)w[2]);
+                    fails++;
+                }
+            }
+        }
+    }
+    // gamma: the shader's sRGB encoding (RGBA8Unorm) and the GPU's (RGBA8UnormSrgb) agree with the curve
+    scene.material(mat).diffuse = Vec4{0.05, 0.4, 2.0, 1.0};
+    scene.post = ScenePost{tone_mapping: SCENE_TONE_REINHARD, gamma: true};
+    Vec3 want = scene_tone_map(Vec3{0.05, 0.4, 2.0}, &scene.post);
+    int[3] wb = {to_byte(want.x), to_byte(want.y), to_byte(want.z)};
+    scene.render_to(&bt)?;
+    bt.read(bp)?;
+    *uint8 sp = alloc<uint8>(N * N * 4);
+    defer free(sp);
+    scene.render_to(&st)?;
+    st.read(sp)?;
+    for (k in 0..3) {
+        int a = (int)bp[(30 * N + 20) * 4 + k];
+        int b = (int)sp[(30 * N + 20) * 4 + k];
+        check("shader sRGB encoding", a - wb[k] <= 2 && wb[k] - a <= 2);
+        check("sRGB target encoding", b - wb[k] <= 2 && wb[k] - b <= 2);
+    }
+
+    // bloom: a 4x4-pixel square of 20 on black
+    scene.post = ScenePost{};
+    scene.material(mat).diffuse = Vec4{20.0, 20.0, 20.0, 1.0};
+    scene.node(node).scale = Vec3{2.0 / 32.0, 2.0 / 32.0, 1.0};
+    scene.render_to(&ft)?;
+    ft.read(fp)?;
+    float center = fpix(fp, 32, 32, 0);
+    float off = fpix(fp, 32 + 6, 32, 0);
+    printf("  no bloom: center %.2f, 6 px away %.4f\n", (double)center, (double)off);
+    check("without bloom the square stays sharp", center > 19.5 && off == 0.0);
+    scene.post.bloom = true;
+    scene.render_to(&ft)?;
+    ft.read(fp)?;
+    float b0 = fpix(fp, 32, 32, 0);
+    float b4 = fpix(fp, 32 + 4, 32, 0);
+    float b8 = fpix(fp, 32 + 8, 32, 0);
+    float b14 = fpix(fp, 32, 32 + 14, 0);
+    float corner = fpix(fp, 2, 2, 0);
+    printf("  bloom: center %.2f, 4 px %.4f, 8 px %.4f, 14 px %.4f, corner %.5f\n", (double)b0, (double)b4, (double)b8,
+        (double)b14, (double)corner);
+    check("bloom keeps the square bright", b0 > center);
+    check("bloom spreads light beyond the square", b4 > 0.05 && b8 > 0.005);
+    check("bloom fades with distance", b4 > b8 && b8 > b14);
+    check("bloom stays local", corner < 0.001);
+    scene.post.bloom_strength = 2.0;
+    scene.render_to(&ft)?;
+    ft.read(fp)?;
+    float s8 = fpix(fp, 32 + 8, 32, 0);
+    check("bloom strength scales the glow", s8 > b8 * 1.9 && s8 < b8 * 2.1);
+    scene.post.bloom_strength = 0.0;
+    scene.material(mat).diffuse = Vec4{0.8, 0.8, 0.8, 1.0};
+    scene.render_to(&ft)?;
+    ft.read(fp)?;
+    check("below the threshold nothing glows", fpix(fp, 32 + 6, 32, 0) == 0.0);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("post: ok\n");
+    return 0;
+}
