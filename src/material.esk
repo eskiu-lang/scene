@@ -338,9 +338,7 @@ void scene_material_shader(int key, *String out) {
     String_append(out, "    return vec4<f32>(color, alpha);\n}\n");
 }
 
-// The depth-only shader of shadow maps: vs places a node's vertices with the light's
-// view and projection (group 0) and the node's model matrix (group 1).
-string scene_shadow_shader =
+string _scene_shadow_wgsl =
     "struct Pass { vp: mat4x4<f32> };\n"
     "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32> };\n"
     "@group(0) @binding(0) var<uniform> sp: Pass;\n"

@@ -322,7 +322,7 @@ Result<int, string> _scene_renderer_make(*Scene s) {
     defer layout.release();
     _scene_vertex_layout(&layout);
     *GpuBindLayout[2] sg = {&r.shadow_layout, &r.draw_layout};
-    GpuPipelineDesc d = GpuPipelineDesc{wgsl: scene_shadow_shader, vertex: "vs", fragment: null, layout: &layout,
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_shadow_wgsl, vertex: "vs", fragment: null, layout: &layout,
         groups: &sg[0], group_count: 2, depth: true, depth_format: WGPUTextureFormat_Depth32Float,
         depth_bias: 2, depth_bias_slope: 1.5};
     r.shadow_pipe = g.pipeline(&d)?;
