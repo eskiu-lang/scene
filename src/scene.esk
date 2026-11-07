@@ -1,0 +1,1349 @@
+// scene.esk: a scene graph and its renderer over `<gpu>`.
+//
+// A Scene holds nodes in a tree (each with a position, a rotation and a scale,
+// and optionally a mesh with a material, or a camera), lights, textures and
+// the settings of the final image. Scene_render draws it: shadow maps, the
+// opaque surfaces front to back, the sky, the transparent surfaces back to
+// front, all in linear HDR, then bloom, tone mapping and gamma into the
+// target (a window frame or a texture).
+//
+//     Scene scene = gpu.scene()?;
+//     defer scene.release();
+//     SceneGeometry ball = scene_sphere(1.0, 48, 24);
+//     int mesh = scene.add_geometry(&ball)?;
+//     ball.free();
+//     SceneMaterial m = scene_material(SCENE_PBR);
+//     m.diffuse = Vec4{0.9, 0.2, 0.1, 1.0};
+//     int node = scene.add_object(0, mesh, scene.add_material(m));
+//     scene.add_light(scene_directional(Vec3{-0.5, -1.0, -0.3}, Vec3{1.0, 1.0, 1.0}, 2.0));
+//     int cam = scene.add_camera(0, scene_perspective(0.9, 0.1, 100.0));
+//     scene.node(cam).position = Vec3{0.0, 1.0, 4.0};
+//     scene.look_at(cam, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0});
+//     scene.set_camera(cam);
+//     ...each frame:
+//     scene.render(frame.view, surface.width, surface.height, surface.format)?;
+//
+// Ids: node 0 is the root, and every node descends from it. Meshes, materials
+// and textures are numbered from 1; 0 in a node's mesh is no mesh, in its
+// material the scene's default material (white Blinn), and in a material's
+// texture field no texture. Lights are numbered from 0. Pointers from node(),
+// material() and light() are good until the next node, material or light is
+// added.
+
+import <io>;
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <libc>;
+import <sort>;
+import <gpu/raw>;
+import <gpu/core>;
+import <gpu/render>;
+import <gpu/math>;
+import <gpu/gltf>;
+import <gpu/image>;
+import <gpu/ibl>;
+import <scene/geometry>;
+import <scene/material>;
+import <scene/light>;
+import <scene/post>;
+import <scene/sky>;
+
+// Camera projections (SceneCamera.projection).
+const int SCENE_PERSPECTIVE = 0;
+const int SCENE_ORTHOGRAPHIC = 1;
+
+// A camera, attached to a node: it sits at the node's origin and looks down the node's -Z
+// axis with +Y up. fov is the vertical field of view in radians (perspective), height the
+// visible height in world units (orthographic), near and far the clipping distances, and
+// aspect the width over height (0 takes the target's).
+struct SceneCamera {
+    int projection;
+    float fov;
+    float near;
+    float far;
+    float height;
+    float aspect;
+}
+
+// A perspective camera with a vertical field of view of fov radians.
+SceneCamera scene_perspective(float fov, float near, float far) {
+    return SceneCamera{SCENE_PERSPECTIVE, fov, near, far, 0.0, 0.0};
+}
+
+// An orthographic camera that sees height world units from the bottom of the image to the
+// top.
+SceneCamera scene_orthographic(float height, float near, float far) {
+    return SceneCamera{SCENE_ORTHOGRAPHIC, 0.0, near, far, height, 0.0};
+}
+
+// A node. position, rotation and scale place it in its parent's space (the local matrix is
+// translation * rotation * scale); world is its world matrix after the last
+// Scene_update or render. A node that is not visible hides its whole subtree. mesh,
+// material and camera are ids (0, 0 and -1 when it has none); casts_shadows and
+// receives_shadows choose its part in shadows, and light_mask the lights that reach it
+// (SceneLight.influence). alive is false once the node is removed. Change parent and
+// children through Scene_set_parent and Scene_remove, not by hand.
+struct SceneNode {
+    String name;
+    int parent;
+    List<int> children;
+    Vec3 position;
+    Quat rotation;
+    Vec3 scale;
+    bool visible;
+    bool alive;
+    int mesh;
+    int material;
+    int camera;
+    bool casts_shadows;
+    bool receives_shadows;
+    uint32 light_mask;
+    Mat4 world;
+}
+
+// A mesh on the GPU: its vertex and index buffers, the index count and the bounds of its
+// positions.
+struct SceneMesh {
+    GpuBuffer vertices;
+    GpuBuffer indices;
+    uint32 index_count;
+    Vec3 min;
+    Vec3 max;
+}
+
+// A glTF model added with Scene_add_gltf: root is the node holding it; nodes maps each glTF
+// node to its scene node (0 when it is outside the scene); meshes holds the scene mesh of
+// each glTF primitive, mesh by mesh (prim_start[m] is mesh m's first); materials and
+// textures the ids made for the file's materials and images.
+struct SceneGltf {
+    int root;
+    List<int> nodes;
+    List<int> meshes;
+    List<int> prim_start;
+    List<int> materials;
+    List<int> textures;
+}
+
+struct _SceneNodeGpu {
+    bool made;
+    GpuBuffer uniforms;
+    GpuBindGroup group;
+}
+
+struct _SceneMatGpu {
+    bool made;
+    GpuBuffer uniforms;
+    GpuBindGroup group;
+    int[6] bound;
+}
+
+struct _ScenePipe {
+    int key;
+    GpuPipeline pipe;
+}
+
+struct _SceneDraw {
+    int node;
+    int mesh;
+    int material;
+    int key;
+    bool blend;
+    float depth;
+    Vec3 center;
+    float radius;
+}
+
+struct _SceneLightRec {
+    int light;
+    int type;
+    Vec3 pos;
+    Vec3 dir;
+    float end;
+    uint32 mask;
+    int layer;
+}
+
+struct _SceneDrawU {
+    Mat4 model;
+    Mat4 normal;
+    uint32[8] lights;
+    float[4] info;
+}
+
+struct _SceneRenderer {
+    GpuBindLayout frame_layout;
+    GpuBindLayout draw_layout;
+    GpuBindLayout mat_layout;
+    GpuBindLayout shadow_layout;
+    GpuBuffer frame;
+    GpuBuffer lights;
+    GpuBindGroup frame_group;
+    GpuSampler samp;
+    GpuSampler shadow_samp;
+    GpuSampler ibl_samp;
+    GpuTexture white;
+    GpuTexture black_cube;
+    GpuTexture no_shadow;
+    GpuTexture shadow_maps;
+    uint32 shadow_size;
+    uint32 shadow_layers;
+    List<GpuTextureView> shadow_views;
+    List<GpuBuffer> shadow_bufs;
+    List<GpuBindGroup> shadow_groups;
+    GpuPipeline shadow_pipe;
+    List<_ScenePipe> pipes;
+    GpuTexture hdr;
+    GpuTexture depth;
+    uint32 w;
+    uint32 h;
+    List<_SceneNodeGpu> nodes;
+    List<_SceneMatGpu> mats;
+    List<_SceneDraw> draws;
+    List<_SceneLightRec> recs;
+    _ScenePostGpu post;
+    _SceneSkyGpu sky;
+    WGPUTextureView bound_shadow;
+    WGPUTextureView bound_irr;
+    Mat4 view_proj;
+    Vec3 eye;
+    Vec3 forward;
+    bool ortho;
+    bool made;
+}
+
+// A scene and its renderer. background is the linear color behind everything when there
+// is no skybox; skybox (with sky_intensity, and sky_flip for a cube of six images) is
+// set by Scene_set_skybox or Scene_set_skybox_faces; ibl by Scene_set_ibl; post holds
+// the tone mapping, gamma and bloom settings; shadow_size is the width and height of each
+// shadow map (2048). camera is the node of the camera that renders (-1 is a default camera
+// at the origin looking down -Z). The lists are the scene's objects by id.
+struct Scene {
+    Gpu gpu;
+    List<SceneNode> nodes;
+    List<SceneCamera> cameras;
+    List<SceneMesh> meshes;
+    List<SceneMaterial> materials;
+    List<GpuTexture> textures;
+    List<SceneLight> lights;
+    int camera;
+    Vec4 background;
+    *GpuTexture skybox;
+    float sky_intensity;
+    bool sky_flip;
+    GpuTexture sky_faces;
+    *GpuIbl ibl;
+    ScenePost post;
+    uint32 shadow_size;
+    _SceneRenderer _r;
+}
+
+void _scene_vertex_layout(*GpuVertexLayout l) {
+    l.add(WGPUVertexFormat_Float32x3, 0);
+    l.add(WGPUVertexFormat_Float32x3, 12);
+    l.add(WGPUVertexFormat_Float32x2, 24);
+    l.add(WGPUVertexFormat_Float32x4, 32);
+    l.add(WGPUVertexFormat_Float32x4, 48);
+}
+
+int _scene_new_node(*Scene self, int parent, string name) {
+    SceneNode n;
+    if (name != null) String_from(&n.name, name);
+    n.parent = parent;
+    n.rotation = quat_identity();
+    n.scale = Vec3{1.0, 1.0, 1.0};
+    n.visible = true;
+    n.alive = true;
+    n.camera = -1;
+    n.casts_shadows = true;
+    n.receives_shadows = true;
+    n.light_mask = 1;
+    n.world = mat4_identity();
+    List_push(&self.nodes, n);
+    _SceneNodeGpu g;
+    List_push(&self._r.nodes, g);
+    int id = self.nodes.size - 1;
+    if (parent >= 0) List_push(&self.nodes.data[parent].children, id);
+    return id;
+}
+
+Result<int, string> _scene_renderer_make(*Scene s) {
+    *_SceneRenderer r = &s._r;
+    *Gpu g = &s.gpu;
+    r.frame_layout = g.bind_layout();
+    r.frame_layout.uniform(0, 0);
+    r.frame_layout.storage(1, WGPUShaderStage_Fragment, true);
+    r.frame_layout.texture(2, WGPUShaderStage_Fragment, WGPUTextureSampleType_Depth, WGPUTextureViewDimension_2DArray);
+    r.frame_layout.sampler(3, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Comparison);
+    r.frame_layout.texture(4, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_Cube);
+    r.frame_layout.texture(5, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_Cube);
+    r.frame_layout.texture(6, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    r.frame_layout.sampler(7, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+    r.draw_layout = g.bind_layout();
+    r.draw_layout.uniform(0, 0);
+    r.mat_layout = g.bind_layout();
+    r.mat_layout.uniform(0, WGPUShaderStage_Fragment);
+    r.mat_layout.sampler(1, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+    for (i in 2..8) r.mat_layout.texture((uint32)i, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    r.shadow_layout = g.bind_layout();
+    r.shadow_layout.uniform(0, WGPUShaderStage_Vertex);
+
+    r.frame = g.uniform(null, 144)?;
+    r.lights = g.buffer((uint64)SCENE_MAX_LIGHTS * 144, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    GpuSamplerOptions so = GpuSamplerOptions{mipmaps: true, anisotropy: 8};
+    r.samp = g.sampler_with(&so)?;
+    GpuSamplerOptions cso = GpuSamplerOptions{wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge,
+        compare: WGPUCompareFunction_LessEqual};
+    r.shadow_samp = g.sampler_with(&cso)?;
+    GpuSamplerOptions iso = GpuSamplerOptions{mipmaps: true, wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge};
+    r.ibl_samp = g.sampler_with(&iso)?;
+    uint8[4] white = {255, 255, 255, 255};
+    r.white = g.image(1, 1, &white)?;
+    GpuTextureDesc cd = GpuTextureDesc{width: 1, height: 1, cube: true};
+    r.black_cube = g.texture_with(&cd)?;
+    uint8[4] black = {0, 0, 0, 255};
+    for (f in 0..6) r.black_cube.write_level((uint32)f, 0, &black)?;
+    GpuTextureDesc sd = GpuTextureDesc{width: 1, height: 1, format: WGPUTextureFormat_Depth32Float, array: true};
+    r.no_shadow = g.texture_with(&sd)?;
+
+    r.frame_group = r.frame_layout.group()?;
+    r.frame_group.buffer(0, &r.frame);
+    r.frame_group.buffer(1, &r.lights);
+    r.frame_group.texture(2, &r.no_shadow);
+    r.bound_shadow = r.no_shadow.view;
+    r.frame_group.sampler(3, &r.shadow_samp);
+    r.frame_group.texture(4, &r.black_cube);
+    r.frame_group.texture(5, &r.black_cube);
+    r.frame_group.texture(6, &r.white);
+    r.frame_group.sampler(7, &r.ibl_samp);
+
+    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)SCENE_VERTEX_FLOATS * 4};
+    defer layout.release();
+    _scene_vertex_layout(&layout);
+    *GpuBindLayout[2] sg = {&r.shadow_layout, &r.draw_layout};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: scene_shadow_shader, vertex: "vs", fragment: null, layout: &layout,
+        groups: &sg[0], group_count: 2, depth: true, depth_format: WGPUTextureFormat_Depth32Float,
+        depth_bias: 2, depth_bias_slope: 1.5};
+    r.shadow_pipe = g.pipeline(&d)?;
+    _scene_post_make(&r.post, g)?;
+    _scene_sky_make(&r.sky, g)?;
+    r.made = true;
+    return Ok<int, string>(0);
+}
+
+// A new, empty scene on gpu: the root node, the default material, black background, gamma
+// encoding on, no tone mapping and 2048-texel shadow maps. Fails when the GPU refuses a
+// pipeline or buffer.
+Result<Scene, string> Gpu_scene(*Gpu self) {
+    Scene s;
+    s.gpu = *self;
+    s.camera = -1;
+    s.background = Vec4{0.0, 0.0, 0.0, 1.0};
+    s.sky_intensity = 1.0;
+    s.post.gamma = true;
+    s.shadow_size = 2048;
+    _scene_new_node(&s, -1, "root");
+    SceneMesh none;
+    List_push(&s.meshes, none);
+    List_push(&s.materials, scene_material(SCENE_BLINN));
+    _SceneMatGpu mg;
+    List_push(&s._r.mats, mg);
+    GpuTexture nt;
+    List_push(&s.textures, nt);
+    Result<int, string> made = _scene_renderer_make(&s);
+    if (!made.ok) {
+        Scene_release(&s);
+        return Err<Scene, string>(made.error);
+    }
+    return Ok<Scene, string>(s);
+}
+
+// Releases everything the scene made on the GPU (meshes, textures it owns, pipelines,
+// targets) and frees its lists. A GpuIbl or skybox texture set from outside is not
+// released.
+void Scene_release(*Scene self) {
+    *_SceneRenderer r = &self._r;
+    for (i in 0..r.nodes.size) {
+        if (r.nodes.data[i].made) {
+            r.nodes.data[i].group.release();
+            r.nodes.data[i].uniforms.release();
+        }
+    }
+    for (i in 0..r.mats.size) {
+        if (r.mats.data[i].made) {
+            r.mats.data[i].group.release();
+            r.mats.data[i].uniforms.release();
+        }
+    }
+    for (i in 0..r.pipes.size) r.pipes.data[i].pipe.release();
+    for (i in 0..r.shadow_views.size) r.shadow_views.data[i].release();
+    for (i in 0..r.shadow_groups.size) r.shadow_groups.data[i].release();
+    for (i in 0..r.shadow_bufs.size) r.shadow_bufs.data[i].release();
+    List_free(&r.nodes);
+    List_free(&r.mats);
+    List_free(&r.pipes);
+    List_free(&r.shadow_views);
+    List_free(&r.shadow_groups);
+    List_free(&r.shadow_bufs);
+    List_free(&r.draws);
+    List_free(&r.recs);
+    if (r.made) {
+        _scene_post_release(&r.post);
+        _scene_sky_release(&r.sky);
+        r.shadow_pipe.release();
+        r.frame_group.release();
+        r.frame.release();
+        r.lights.release();
+        r.samp.release();
+        r.shadow_samp.release();
+        r.ibl_samp.release();
+    }
+    r.white.release();
+    r.black_cube.release();
+    r.no_shadow.release();
+    r.shadow_maps.release();
+    r.hdr.release();
+    r.depth.release();
+    r.frame_layout.release();
+    r.draw_layout.release();
+    r.mat_layout.release();
+    r.shadow_layout.release();
+    r.made = false;
+    for (i in 0..self.meshes.size) {
+        self.meshes.data[i].vertices.release();
+        self.meshes.data[i].indices.release();
+    }
+    for (i in 0..self.textures.size) self.textures.data[i].release();
+    self.sky_faces.release();
+    for (i in 0..self.nodes.size) {
+        String_free(&self.nodes.data[i].name);
+        List_free(&self.nodes.data[i].children);
+    }
+    List_free(&self.nodes);
+    List_free(&self.cameras);
+    List_free(&self.meshes);
+    List_free(&self.materials);
+    List_free(&self.textures);
+    List_free(&self.lights);
+}
+
+bool _scene_valid(*Scene self, int node) {
+    return node >= 0 && node < self.nodes.size && self.nodes.data[node].alive;
+}
+
+// Adds an empty node under parent (0 for the root; a removed or unknown parent is the
+// root) named name (null for none), at the parent's origin, and returns its id.
+int Scene_add_node(*Scene self, int parent, string name) {
+    if (!_scene_valid(self, parent)) parent = 0;
+    return _scene_new_node(self, parent, name);
+}
+
+// Adds a node under parent that draws mesh with material, and returns its id.
+int Scene_add_object(*Scene self, int parent, int mesh, int material) {
+    int id = Scene_add_node(self, parent, null);
+    self.nodes.data[id].mesh = mesh;
+    self.nodes.data[id].material = material;
+    return id;
+}
+
+// Adds a node under parent holding camera, and returns its id (make it the scene's view
+// with Scene_set_camera).
+int Scene_add_camera(*Scene self, int parent, SceneCamera camera) {
+    int id = Scene_add_node(self, parent, null);
+    List_push(&self.cameras, camera);
+    self.nodes.data[id].camera = self.cameras.size - 1;
+    return id;
+}
+
+// Renders through the camera of node (a node made by Scene_add_camera).
+void Scene_set_camera(*Scene self, int node) {
+    self.camera = node;
+}
+
+// The node with id node (the root for an unknown id).
+*SceneNode Scene_node(*Scene self, int node) {
+    if (node < 0 || node >= self.nodes.size) node = 0;
+    return &self.nodes.data[node];
+}
+
+// The camera settings of a camera node, or null when the node holds no camera.
+*SceneCamera Scene_camera(*Scene self, int node) {
+    if (node < 0 || node >= self.nodes.size) return null;
+    int c = self.nodes.data[node].camera;
+    if (c < 0 || c >= self.cameras.size) return null;
+    return &self.cameras.data[c];
+}
+
+// The first live node named name, or -1.
+int Scene_find(*Scene self, string name) {
+    for (i in 0..self.nodes.size) {
+        if (self.nodes.data[i].alive && self.nodes.data[i].name.data != null && String_eq_cstr(&self.nodes.data[i].name, name) != 0) return i;
+    }
+    return -1;
+}
+
+void _scene_detach(*Scene self, int node) {
+    int p = self.nodes.data[node].parent;
+    if (p < 0) return;
+    *List<int> ch = &self.nodes.data[p].children;
+    for (i in 0..ch.size) {
+        if (ch.data[i] == node) {
+            List_remove(ch, i);
+            break;
+        }
+    }
+}
+
+// Moves node (and its subtree) under parent, keeping its local position, rotation and
+// scale. Returns false, changing nothing, for the root, a removed node or a parent inside
+// the node's own subtree.
+bool Scene_set_parent(*Scene self, int node, int parent) {
+    if (node <= 0 || !_scene_valid(self, node) || !_scene_valid(self, parent)) return false;
+    int p = parent;
+    while (p >= 0) {
+        if (p == node) return false;
+        p = self.nodes.data[p].parent;
+    }
+    _scene_detach(self, node);
+    self.nodes.data[node].parent = parent;
+    List_push(&self.nodes.data[parent].children, node);
+    return true;
+}
+
+void _scene_kill(*Scene self, int node) {
+    *SceneNode n = &self.nodes.data[node];
+    n.alive = false;
+    *_SceneNodeGpu g = &self._r.nodes.data[node];
+    if (g.made) {
+        g.group.release();
+        g.uniforms.release();
+        g.made = false;
+    }
+    for (i in 0..n.children.size) _scene_kill(self, n.children.data[i]);
+}
+
+// Removes node and its subtree from the scene (their ids are not reused). The root cannot
+// be removed. Meshes, materials and textures stay in the scene.
+void Scene_remove(*Scene self, int node) {
+    if (node <= 0 || !_scene_valid(self, node)) return;
+    _scene_detach(self, node);
+    _scene_kill(self, node);
+    if (self.camera == node) self.camera = -1;
+}
+
+// The local matrix of node: translation * rotation * scale.
+Mat4 Scene_local(*Scene self, int node) {
+    *SceneNode n = Scene_node(self, node);
+    return mat4_trs(n.position, n.rotation, n.scale);
+}
+
+// The world matrix of node, computed now from its ancestors' current transforms.
+Mat4 Scene_world(*Scene self, int node) {
+    if (node < 0 || node >= self.nodes.size) return mat4_identity();
+    Mat4 m = Scene_local(self, node);
+    int p = self.nodes.data[node].parent;
+    while (p >= 0) {
+        m = Scene_local(self, p) * m;
+        p = self.nodes.data[p].parent;
+    }
+    return m;
+}
+
+void _scene_update_node(*Scene self, int node, Mat4 parent) {
+    *SceneNode n = &self.nodes.data[node];
+    n.world = parent * mat4_trs(n.position, n.rotation, n.scale);
+    for (i in 0..n.children.size) _scene_update_node(self, n.children.data[i], n.world);
+}
+
+// Recomputes every node's world matrix (SceneNode.world) from the tree. Scene_render does
+// it first; call it to read world matrices in between.
+void Scene_update(*Scene self) {
+    _scene_update_node(self, 0, mat4_identity());
+}
+
+// The rotation of a matrix's upper 3x3 part, with its scale divided out.
+Quat scene_matrix_rotation(Mat4 m) {
+    Vec3 c0 = Vec3{m.m[0], m.m[1], m.m[2]}.normalize();
+    Vec3 c1 = Vec3{m.m[4], m.m[5], m.m[6]}.normalize();
+    Vec3 c2 = Vec3{m.m[8], m.m[9], m.m[10]}.normalize();
+    if (c0.cross(c1).dot(c2) < 0.0) c0 = -c0;
+    float r00 = c0.x;
+    float r10 = c0.y;
+    float r20 = c0.z;
+    float r01 = c1.x;
+    float r11 = c1.y;
+    float r21 = c1.z;
+    float r02 = c2.x;
+    float r12 = c2.y;
+    float r22 = c2.z;
+    float tr = r00 + r11 + r22;
+    Quat q;
+    if (tr > 0.0) {
+        float s = (float)sqrt((double)(tr + 1.0)) * 2.0;
+        q = Quat{(r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s, 0.25 * s};
+    } else if (r00 > r11 && r00 > r22) {
+        float s = (float)sqrt((double)(1.0 + r00 - r11 - r22)) * 2.0;
+        q = Quat{0.25 * s, (r01 + r10) / s, (r02 + r20) / s, (r21 - r12) / s};
+    } else if (r11 > r22) {
+        float s = (float)sqrt((double)(1.0 + r11 - r00 - r22)) * 2.0;
+        q = Quat{(r01 + r10) / s, 0.25 * s, (r12 + r21) / s, (r02 - r20) / s};
+    } else {
+        float s = (float)sqrt((double)(1.0 + r22 - r00 - r11)) * 2.0;
+        q = Quat{(r02 + r20) / s, (r12 + r21) / s, 0.25 * s, (r10 - r01) / s};
+    }
+    return q.normalize();
+}
+
+// Splits a matrix made of a translation, a rotation and a scale into the three (a
+// negative determinant flips the x scale).
+void scene_decompose(Mat4 m, *Vec3 translation, *Quat rotation, *Vec3 scale) {
+    *translation = Vec3{m.m[12], m.m[13], m.m[14]};
+    Vec3 c0 = Vec3{m.m[0], m.m[1], m.m[2]};
+    Vec3 c1 = Vec3{m.m[4], m.m[5], m.m[6]};
+    Vec3 c2 = Vec3{m.m[8], m.m[9], m.m[10]};
+    float sx = c0.length();
+    if (c0.cross(c1).dot(c2) < 0.0) sx = -sx;
+    *scale = Vec3{sx, c1.length(), c2.length()};
+    *rotation = scene_matrix_rotation(m);
+}
+
+// Turns node so that its -Z axis points at target (a point in world space) with its +Y
+// axis toward up: how cameras, spot lights and directional lights on a node are aimed.
+void Scene_look_at(*Scene self, int node, Vec3 target, Vec3 up) {
+    if (!_scene_valid(self, node)) return;
+    Mat4 world = Scene_world(self, node);
+    Vec3 eye = Vec3{world.m[12], world.m[13], world.m[14]};
+    Vec3 z = (eye - target).normalize();
+    if (z.length() < 0.5) return;
+    Vec3 x = up.cross(z).normalize();
+    if (x.length() < 0.5) x = Vec3{0.0, 0.0, 1.0}.cross(z).normalize();
+    if (x.length() < 0.5) x = Vec3{1.0, 0.0, 0.0};
+    Vec3 y = z.cross(x);
+    Mat4 r = mat4_identity();
+    r.m[0] = x.x;
+    r.m[1] = x.y;
+    r.m[2] = x.z;
+    r.m[4] = y.x;
+    r.m[5] = y.y;
+    r.m[6] = y.z;
+    r.m[8] = z.x;
+    r.m[9] = z.y;
+    r.m[10] = z.z;
+    Quat qw = scene_matrix_rotation(r);
+    int p = self.nodes.data[node].parent;
+    Quat local = qw;
+    if (p >= 0) {
+        Quat pr = scene_matrix_rotation(Scene_world(self, p));
+        local = pr.conjugate() * qw;
+    }
+    self.nodes.data[node].rotation = local.normalize();
+}
+
+// Uploads geometry as a mesh and returns its id. The geometry can be freed afterwards.
+Result<int, string> Scene_add_geometry(*Scene self, *SceneGeometry geometry) {
+    if (geometry.vertex_count == 0 || geometry.index_count < 3) return Err<int, string>("scene: empty geometry");
+    SceneMesh m;
+    m.vertices = self.gpu.vertices(geometry.vertices, (uint64)geometry.vertex_count * SCENE_VERTEX_FLOATS * 4)?;
+    Result<GpuBuffer, string> ib = self.gpu.indices(geometry.indices, (uint64)geometry.index_count);
+    if (!ib.ok) {
+        m.vertices.release();
+        return Err<int, string>(ib.error);
+    }
+    m.indices = ib.value;
+    m.index_count = geometry.index_count;
+    m.min = geometry.min;
+    m.max = geometry.max;
+    List_push(&self.meshes, m);
+    return Ok<int, string>(self.meshes.size - 1);
+}
+
+// Adds a material and returns its id.
+int Scene_add_material(*Scene self, SceneMaterial material) {
+    List_push(&self.materials, material);
+    _SceneMatGpu g;
+    List_push(&self._r.mats, g);
+    return self.materials.size - 1;
+}
+
+// The material with id material (the default material, id 0, for an unknown id). Changes
+// show at the next render.
+*SceneMaterial Scene_material(*Scene self, int material) {
+    if (material < 0 || material >= self.materials.size) material = 0;
+    return &self.materials.data[material];
+}
+
+// Adds a texture the scene takes over (it is released with the scene) and returns its id.
+// Color textures (diffuse, specular, emissive) should be in an sRGB format; normal,
+// metal-roughness and occlusion maps in a linear one.
+int Scene_add_texture(*Scene self, GpuTexture texture) {
+    List_push(&self.textures, texture);
+    return self.textures.size - 1;
+}
+
+// A texture from decoded pixels, stored as sRGB when srgb (color data) or linear (normal,
+// metal-roughness and occlusion maps), with mipmaps; returns its id.
+Result<int, string> Scene_image_texture(*Scene self, *Bitmap image, bool srgb) {
+    GpuImageOptions o = GpuImageOptions{srgb: srgb, mipmaps: true};
+    GpuTexture t = self.gpu.image_with(image.width, image.height, image.rgba, &o)?;
+    return Ok<int, string>(Scene_add_texture(self, t));
+}
+
+// A texture from a PNG or JPEG file (see Scene_image_texture); returns its id.
+Result<int, string> Scene_load_texture(*Scene self, string path, bool srgb) {
+    Bitmap img = image_load(path)?;
+    defer img.free();
+    return Scene_image_texture(self, &img, srgb);
+}
+
+// The texture with id texture, or null for 0 or an unknown id.
+*GpuTexture Scene_texture(*Scene self, int texture) {
+    if (texture <= 0 || texture >= self.textures.size) return null;
+    return &self.textures.data[texture];
+}
+
+// Adds a light and returns its id (from 0).
+int Scene_add_light(*Scene self, SceneLight light) {
+    List_push(&self.lights, light);
+    return self.lights.size - 1;
+}
+
+// The light with id light, or null for an unknown id. Changes show at the next render.
+*SceneLight Scene_light(*Scene self, int light) {
+    if (light < 0 || light >= self.lights.size) return null;
+    return &self.lights.data[light];
+}
+
+// Draws cube (a cube texture: an environment from `<gpu/ibl>` or Gpu_texture_with with
+// cube) behind the scene, sampled by world direction, scaled by sky_intensity. The texture
+// is not owned and must outlive its use; null goes back to the background color.
+void Scene_set_skybox(*Scene self, *GpuTexture cube) {
+    self.skybox = cube;
+    self.sky_flip = false;
+}
+
+// Makes a cube from six square images (+X, -X, +Y, -Y, +Z, -Z, see scene_cube_faces) and
+// draws it behind the scene, owned by the scene.
+Result<int, string> Scene_set_skybox_faces(*Scene self, *Bitmap faces) {
+    GpuTexture t = scene_cube_faces(&self.gpu, faces)?;
+    self.sky_faces.release();
+    self.sky_faces = t;
+    self.skybox = &self.sky_faces;
+    self.sky_flip = true;
+    return Ok<int, string>(0);
+}
+
+// Lights PBR materials with an environment from `<gpu/ibl>` (its irradiance, specular cube
+// and BRDF table, times ibl.intensity) in place of the ambient lights; null goes back to
+// them. The GpuIbl is not owned and must outlive its use.
+void Scene_set_ibl(*Scene self, *GpuIbl ibl) {
+    self.ibl = ibl;
+}
+
+// The number of material pipelines made so far (one per variant drawn).
+int Scene_pipeline_count(*Scene self) {
+    return self._r.pipes.size;
+}
+
+int _scene_gltf_texture(*Scene self, *Gltf g, *SceneGltf out, int ref, bool srgb) {
+    if (ref < 0 || ref >= g.textures.size) return 0;
+    int image = g.textures.data[ref].image;
+    if (image < 0 || image >= g.images.size) return 0;
+    int slot = image * 2 + (srgb ? 1 : 0);
+    if (out.textures.data[slot] != 0) return out.textures.data[slot];
+    *GltfImage img = &g.images.data[image];
+    if (img.data == null || img.len == 0) return 0;
+    Result<Bitmap, string> dec = image_decode(img.data, img.len);
+    if (!dec.ok) return 0;
+    Bitmap pic = dec.value;
+    Result<int, string> t = Scene_image_texture(self, &pic, srgb);
+    Bitmap_free(&pic);
+    if (!t.ok) return 0;
+    out.textures.data[slot] = t.value;
+    return t.value;
+}
+
+void _scene_gltf_node(*Scene self, *Gltf g, *SceneGltf out, int gi, int parent, int default_mat) {
+    if (gi < 0 || gi >= g.nodes.size || out.nodes.data[gi] != 0) return;
+    *GltfNode gn = &g.nodes.data[gi];
+    int id = Scene_add_node(self, parent, gn.name.data != null ? (string)gn.name.data : null);
+    out.nodes.data[gi] = id;
+    *SceneNode n = &self.nodes.data[id];
+    if (gn.has_matrix) {
+        scene_decompose(gn.matrix, &n.position, &n.rotation, &n.scale);
+    } else {
+        n.position = gn.translation;
+        n.rotation = gn.rotation;
+        n.scale = gn.scale;
+    }
+    if (gn.mesh >= 0 && gn.mesh < g.meshes.size) {
+        *GltfMesh mesh = &g.meshes.data[gn.mesh];
+        for (p in 0..mesh.primitives.size) {
+            int sm = out.meshes.data[out.prim_start.data[gn.mesh] + p];
+            if (sm == 0) continue;
+            int gm = mesh.primitives.data[p].material;
+            int mat = gm >= 0 && gm < out.materials.size ? out.materials.data[gm] : default_mat;
+            Scene_add_object(self, id, sm, mat);
+        }
+    }
+    for (c in 0..gn.children.size) _scene_gltf_node(self, g, out, gn.children.data[c], id, default_mat);
+}
+
+// Adds a glTF model (from gltf_load, `<gpu/gltf>`, or obj_load) under parent: its images
+// as textures, its materials as PBR materials (CONSTANT for KHR_materials_unlit), its
+// triangle primitives as meshes, and its scene's node tree, each primitive a child node of
+// its glTF node. The Gltf can be freed afterwards unless the model is animated with
+// SceneGltf_pose. Free the result with SceneGltf_free.
+Result<SceneGltf, string> Scene_add_gltf(*Scene self, *Gltf g, int parent) {
+    SceneGltf out;
+    out.root = Scene_add_node(self, parent, "gltf");
+    for (i in 0..g.images.size * 2) List_push(&out.textures, 0);
+    for (i in 0..g.nodes.size) List_push(&out.nodes, 0);
+    for (i in 0..g.materials.size) {
+        GltfMaterial* gm = &g.materials.data[i];
+        SceneMaterial m = scene_material(gm.unlit ? SCENE_CONSTANT : SCENE_PBR);
+        m.diffuse = gm.base_color;
+        m.metalness = gm.metallic;
+        m.roughness = gm.roughness;
+        m.emissive = gm.emissive;
+        m.alpha_mode = gm.alpha_mode;
+        m.alpha_cutoff = gm.alpha_cutoff;
+        m.double_sided = gm.double_sided;
+        m.diffuse_texture = _scene_gltf_texture(self, g, &out, gm.base_color_texture.texture, true);
+        m.metal_rough_texture = _scene_gltf_texture(self, g, &out, gm.metallic_roughness_texture.texture, false);
+        m.normal_texture = _scene_gltf_texture(self, g, &out, gm.normal_texture.texture, false);
+        m.normal_scale = gm.normal_texture.scale;
+        m.occlusion_texture = _scene_gltf_texture(self, g, &out, gm.occlusion_texture.texture, false);
+        m.occlusion_strength = gm.occlusion_texture.scale;
+        m.emissive_texture = _scene_gltf_texture(self, g, &out, gm.emissive_texture.texture, true);
+        List_push(&out.materials, Scene_add_material(self, m));
+    }
+    SceneMaterial dm = scene_material(SCENE_PBR);
+    dm.roughness = 1.0;
+    int default_mat = Scene_add_material(self, dm);
+    for (i in 0..g.meshes.size) {
+        List_push(&out.prim_start, out.meshes.size);
+        *GltfMesh mesh = &g.meshes.data[i];
+        for (p in 0..mesh.primitives.size) {
+            *GltfPrimitive gp = &mesh.primitives.data[p];
+            int id = 0;
+            if (gp.mode == GLTF_TRIANGLES && gp.vertex_count > 0 && gp.positions != null) {
+                SceneGeometry geo = scene_gltf_geometry(gp);
+                Result<int, string> made = Scene_add_geometry(self, &geo);
+                geo.free();
+                if (made.ok) id = made.value;
+            }
+            List_push(&out.meshes, id);
+        }
+    }
+    for (i in 0..g.roots.size) _scene_gltf_node(self, g, &out, g.roots.data[i], out.root, default_mat);
+    return Ok<SceneGltf, string>(out);
+}
+
+// Copies the glTF nodes' current transforms (after Gltf_animate) to their scene nodes.
+void SceneGltf_pose(*SceneGltf self, *Scene scene, *Gltf g) {
+    for (i in 0..self.nodes.size) {
+        int id = self.nodes.data[i];
+        if (id <= 0 || i >= g.nodes.size || !_scene_valid(scene, id)) continue;
+        *GltfNode gn = &g.nodes.data[i];
+        *SceneNode n = &scene.nodes.data[id];
+        if (gn.has_matrix) {
+            scene_decompose(gn.matrix, &n.position, &n.rotation, &n.scale);
+        } else {
+            n.position = gn.translation;
+            n.rotation = gn.rotation;
+            n.scale = gn.scale;
+        }
+    }
+}
+
+// Frees the id lists (the nodes, meshes, materials and textures stay in the scene).
+void SceneGltf_free(*SceneGltf self) {
+    List_free(&self.nodes);
+    List_free(&self.meshes);
+    List_free(&self.prim_start);
+    List_free(&self.materials);
+    List_free(&self.textures);
+}
+
+WGPUBlendState _scene_blend_state(int mode) {
+    WGPUBlendComponent keep = WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_Zero, WGPUBlendFactor_One};
+    WGPUBlendComponent over = WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_OneMinusSrcAlpha};
+    if (mode == SCENE_BLEND_ADD) {
+        return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_One}, keep};
+    }
+    if (mode == SCENE_BLEND_MULTIPLY) {
+        return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_Dst, WGPUBlendFactor_Zero}, keep};
+    }
+    if (mode == SCENE_BLEND_SUBTRACT) {
+        return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_ReverseSubtract, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_One}, keep};
+    }
+    if (mode == SCENE_BLEND_SCREEN) {
+        return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_OneMinusDst, WGPUBlendFactor_One}, keep};
+    }
+    if (mode == SCENE_BLEND_PREMULTIPLIED) return WGPUBlendState{over, over};
+    return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha}, over};
+}
+
+Result<*GpuPipeline, string> _scene_pipeline(*Scene self, int key) {
+    *_SceneRenderer r = &self._r;
+    for (i in 0..r.pipes.size) {
+        if (r.pipes.data[i].key == key) return Ok<*GpuPipeline, string>(&r.pipes.data[i].pipe);
+    }
+    String src;
+    defer String_free(&src);
+    scene_material_shader(key, &src);
+    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)SCENE_VERTEX_FLOATS * 4};
+    defer layout.release();
+    _scene_vertex_layout(&layout);
+    *GpuBindLayout[3] groups = {&r.frame_layout, &r.draw_layout, &r.mat_layout};
+    bool blend = scene_key_alpha(key) == SCENE_ALPHA_BLEND;
+    WGPUBlendState bs = _scene_blend_state(scene_key_blend(key));
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: "fs",
+        format: WGPUTextureFormat_RGBA16Float, layout: &layout, groups: &groups[0], group_count: 3,
+        depth: true, depth_format: WGPUTextureFormat_Depth32Float, depth_read_only: blend,
+        cull: scene_key_double_sided(key) ? WGPUCullMode_None : WGPUCullMode_Back};
+    if (blend) d.blend_state = &bs;
+    GpuPipeline p = self.gpu.pipeline(&d)?;
+    List_push(&r.pipes, _ScenePipe{key, p});
+    return Ok<*GpuPipeline, string>(&r.pipes.data[r.pipes.size - 1].pipe);
+}
+
+*GpuTexture _scene_tex(*Scene self, int id) {
+    if (id <= 0 || id >= self.textures.size || self.textures.data[id].handle == null) return &self._r.white;
+    return &self.textures.data[id];
+}
+
+Result<int, string> _scene_material_gpu(*Scene self, int id) {
+    *_SceneMatGpu g = &self._r.mats.data[id];
+    *SceneMaterial m = &self.materials.data[id];
+    if (!g.made) {
+        g.uniforms = self.gpu.uniform(null, 80)?;
+        Result<GpuBindGroup, string> bg = self._r.mat_layout.group();
+        if (!bg.ok) {
+            g.uniforms.release();
+            return Err<int, string>(bg.error);
+        }
+        g.group = bg.value;
+        g.group.buffer(0, &g.uniforms);
+        g.group.sampler(1, &self._r.samp);
+        for (k in 0..6) g.bound[k] = -1;
+        g.made = true;
+    }
+    int[6] ids = {m.diffuse_texture, m.specular_texture, m.normal_texture, m.emissive_texture,
+        m.metal_rough_texture, m.occlusion_texture};
+    for (k in 0..6) {
+        if (g.bound[k] != ids[k]) {
+            g.group.texture((uint32)(k + 2), _scene_tex(self, ids[k]));
+            g.bound[k] = ids[k];
+        }
+    }
+    bool has_normal = m.normal_texture > 0 && m.lighting != SCENE_CONSTANT;
+    bool has_occ = m.occlusion_texture > 0;
+    float[20] u = {m.diffuse.x, m.diffuse.y, m.diffuse.z, m.diffuse.w,
+        m.specular.x, m.specular.y, m.specular.z, m.shininess,
+        m.emissive.x, m.emissive.y, m.emissive.z, m.alpha_cutoff,
+        m.metalness, m.roughness, has_normal ? m.normal_scale : 0.0, has_occ ? m.occlusion_strength : 0.0,
+        m.diffuse_intensity, 0.0, 0.0, 0.0};
+    g.uniforms.write(0, &u, 80);
+    return Ok<int, string>(0);
+}
+
+Result<int, string> _scene_node_gpu(*Scene self, int id) {
+    *_SceneNodeGpu g = &self._r.nodes.data[id];
+    if (g.made) return Ok<int, string>(0);
+    g.uniforms = self.gpu.uniform(null, sizeof(_SceneDrawU))?;
+    Result<GpuBindGroup, string> bg = self._r.draw_layout.group();
+    if (!bg.ok) {
+        g.uniforms.release();
+        return Err<int, string>(bg.error);
+    }
+    g.group = bg.value;
+    g.group.buffer(0, &g.uniforms);
+    g.made = true;
+    return Ok<int, string>(0);
+}
+
+float _scene_max_scale(Mat4 m) {
+    float sx = Vec3{m.m[0], m.m[1], m.m[2]}.length();
+    float sy = Vec3{m.m[4], m.m[5], m.m[6]}.length();
+    float sz = Vec3{m.m[8], m.m[9], m.m[10]}.length();
+    float s = sx > sy ? sx : sy;
+    return s > sz ? s : sz;
+}
+
+void _scene_collect(*Scene self, int id) {
+    *SceneNode n = &self.nodes.data[id];
+    if (!n.alive || !n.visible) return;
+    if (n.mesh > 0 && n.mesh < self.meshes.size && self.meshes.data[n.mesh].index_count > 0) {
+        *SceneMesh mesh = &self.meshes.data[n.mesh];
+        _SceneDraw d;
+        d.node = id;
+        d.mesh = n.mesh;
+        d.material = n.material > 0 && n.material < self.materials.size ? n.material : 0;
+        d.key = scene_material_key(&self.materials.data[d.material]);
+        d.blend = scene_key_alpha(d.key) == SCENE_ALPHA_BLEND;
+        Vec3 mid = (mesh.min + mesh.max) * 0.5;
+        d.center = n.world.point(mid);
+        d.radius = ((mesh.max - mesh.min) * 0.5).length() * _scene_max_scale(n.world);
+        d.depth = (d.center - self._r.eye).dot(self._r.forward);
+        List_push(&self._r.draws, d);
+    }
+    for (i in 0..n.children.size) _scene_collect(self, n.children.data[i]);
+}
+
+int _scene_draw_order(*_SceneDraw a, *_SceneDraw b) {
+    if (a.blend != b.blend) return a.blend ? 1 : -1;
+    if (a.depth != b.depth) {
+        bool closer = a.depth < b.depth;
+        if (a.blend) return closer ? 1 : -1;
+        return closer ? -1 : 1;
+    }
+    return a.node - b.node;
+}
+
+void _scene_camera(*Scene self, uint32 width, uint32 height) {
+    *_SceneRenderer r = &self._r;
+    SceneCamera cam = scene_perspective(1.0, 0.1, 100.0);
+    Mat4 world = mat4_identity();
+    *SceneCamera c = Scene_camera(self, self.camera);
+    if (c != null && _scene_valid(self, self.camera)) {
+        cam = *c;
+        world = self.nodes.data[self.camera].world;
+    }
+    float aspect = cam.aspect > 0.0 ? cam.aspect : (float)width / (float)(height > 0 ? height : (uint32)1);
+    float near = cam.near > 0.0 ? cam.near : 0.1;
+    float far = cam.far > near ? cam.far : near * 1000.0;
+    Mat4 proj;
+    r.ortho = cam.projection == SCENE_ORTHOGRAPHIC;
+    if (r.ortho) {
+        float h = cam.height > 0.0 ? cam.height * 0.5 : 1.0;
+        proj = mat4_ortho(-h * aspect, h * aspect, -h, h, near, far);
+    } else {
+        proj = mat4_perspective(cam.fov > 0.0 ? cam.fov : 1.0, aspect, near, far);
+    }
+    r.view_proj = proj * world.inverse();
+    r.eye = Vec3{world.m[12], world.m[13], world.m[14]};
+    r.forward = (Vec3{-world.m[8], -world.m[9], -world.m[10]}).normalize();
+}
+
+Result<int, string> _scene_lights(*Scene self, *Vec3 ambient) {
+    *_SceneRenderer r = &self._r;
+    List_clear(&r.recs);
+    Vec3 amb = Vec3{0.0, 0.0, 0.0};
+    int shadows = 0;
+    for (i in 0..self.lights.size) {
+        *SceneLight l = &self.lights.data[i];
+        if (!l.enabled) continue;
+        if (l.type == SCENE_LIGHT_AMBIENT) {
+            amb = amb + l.color * l.intensity;
+            continue;
+        }
+        if (r.recs.size >= SCENE_MAX_LIGHTS) continue;
+        _SceneLightRec rec;
+        rec.light = i;
+        rec.type = l.type;
+        rec.pos = l.position;
+        rec.dir = l.direction.normalize();
+        if (l.node >= 0 && _scene_valid(self, l.node)) {
+            Mat4 w = self.nodes.data[l.node].world;
+            rec.pos = w.point(l.position);
+            Vec4 d4 = w * Vec4{l.direction.x, l.direction.y, l.direction.z, 0.0};
+            rec.dir = Vec3{d4.x, d4.y, d4.z}.normalize();
+        }
+        rec.end = l.attenuation_end;
+        rec.mask = l.influence;
+        rec.layer = -1;
+        if (l.type == SCENE_LIGHT_DIRECTIONAL && l.casts_shadows && shadows < SCENE_MAX_SHADOWS) {
+            rec.layer = shadows;
+            shadows++;
+        }
+        List_push(&r.recs, rec);
+    }
+    *ambient = amb;
+    return Ok<int, string>(shadows);
+}
+
+Mat4 _scene_shadow_matrix(*Scene self, *_SceneLightRec rec, *float texel_world) {
+    *SceneLight l = &self.lights.data[rec.light];
+    Vec3 c = l.shadow_center;
+    float radius = l.shadow_radius;
+    if (radius <= 0.0) {
+        *_SceneRenderer r = &self._r;
+        Vec3 lo = Vec3{1e30, 1e30, 1e30};
+        Vec3 hi = Vec3{-1e30, -1e30, -1e30};
+        for (i in 0..r.draws.size) {
+            *_SceneDraw d = &r.draws.data[i];
+            Vec3 e = Vec3{d.radius, d.radius, d.radius};
+            Vec3 a = d.center - e;
+            Vec3 b = d.center + e;
+            if (a.x < lo.x) lo.x = a.x;
+            if (a.y < lo.y) lo.y = a.y;
+            if (a.z < lo.z) lo.z = a.z;
+            if (b.x > hi.x) hi.x = b.x;
+            if (b.y > hi.y) hi.y = b.y;
+            if (b.z > hi.z) hi.z = b.z;
+        }
+        if (r.draws.size == 0) {
+            lo = Vec3{-1.0, -1.0, -1.0};
+            hi = Vec3{1.0, 1.0, 1.0};
+        }
+        c = (lo + hi) * 0.5;
+        radius = ((hi - lo) * 0.5).length();
+        if (radius < 1e-3) radius = 1e-3;
+    }
+    Vec3 d = rec.dir;
+    Vec3 up = d.y > 0.99 || d.y < -0.99 ? Vec3{0.0, 0.0, 1.0} : Vec3{0.0, 1.0, 0.0};
+    Mat4 view = mat4_look_at(c - d * (radius * 2.0), c, up);
+    Mat4 proj = mat4_ortho(-radius, radius, -radius, radius, 0.0, radius * 4.0);
+    uint32 size = self.shadow_size > 0 ? self.shadow_size : (uint32)2048;
+    *texel_world = radius * 2.0 / (float)size;
+    return proj * view;
+}
+
+Result<int, string> _scene_shadow_targets(*Scene self, int layers) {
+    *_SceneRenderer r = &self._r;
+    uint32 size = self.shadow_size > 0 ? self.shadow_size : (uint32)2048;
+    if (r.shadow_size != size || r.shadow_layers < (uint32)layers) {
+        for (i in 0..r.shadow_views.size) r.shadow_views.data[i].release();
+        List_clear(&r.shadow_views);
+        r.shadow_maps.release();
+        GpuTextureDesc d = GpuTextureDesc{width: size, height: size, format: WGPUTextureFormat_Depth32Float,
+            layers: (uint32)layers, array: true};
+        r.shadow_maps = self.gpu.texture_with(&d)?;
+        r.shadow_size = size;
+        r.shadow_layers = (uint32)layers;
+        for (i in 0..layers) {
+            GpuTextureView v = r.shadow_maps.view_level((uint32)i, 0)?;
+            List_push(&r.shadow_views, v);
+        }
+    }
+    while (r.shadow_bufs.size < layers) {
+        GpuBuffer b = self.gpu.uniform(null, 64)?;
+        List_push(&r.shadow_bufs, b);
+        GpuBindGroup g = r.shadow_layout.group()?;
+        List_push(&r.shadow_groups, g);
+        r.shadow_groups.data[r.shadow_groups.size - 1].buffer(0, &r.shadow_bufs.data[r.shadow_bufs.size - 1]);
+    }
+    return Ok<int, string>(0);
+}
+
+void _scene_bind_frame(*Scene self, bool shadows) {
+    *_SceneRenderer r = &self._r;
+    *GpuTexture st = shadows ? &r.shadow_maps : &r.no_shadow;
+    if (r.bound_shadow != st.view) {
+        r.frame_group.texture(2, st);
+        r.bound_shadow = st.view;
+    }
+    WGPUTextureView irr = self.ibl != null ? self.ibl.irradiance.view : r.black_cube.view;
+    if (r.bound_irr != irr) {
+        if (self.ibl != null) {
+            r.frame_group.texture(4, &self.ibl.irradiance);
+            r.frame_group.texture(5, &self.ibl.specular);
+            r.frame_group.texture(6, &self.ibl.brdf);
+        } else {
+            r.frame_group.texture(4, &r.black_cube);
+            r.frame_group.texture(5, &r.black_cube);
+            r.frame_group.texture(6, &r.white);
+        }
+        r.bound_irr = irr;
+    }
+}
+
+void _scene_draw_lights(*Scene self, *_SceneDraw d, *_SceneDrawU u) {
+    *_SceneRenderer r = &self._r;
+    uint32 mask = self.nodes.data[d.node].light_mask;
+    float[8] score;
+    int count = 0;
+    for (j in 0..r.recs.size) {
+        *_SceneLightRec rec = &r.recs.data[j];
+        if ((rec.mask & mask) == 0) continue;
+        float sc = 0.0;
+        if (rec.type != SCENE_LIGHT_DIRECTIONAL) {
+            float dist = (rec.pos - d.center).length() - d.radius;
+            if (dist > rec.end) continue;
+            sc = 1.0 + (dist > 0.0 ? dist : 0.0);
+        }
+        int at = count;
+        if (count == SCENE_LIGHTS_PER_DRAW) {
+            if (sc >= score[count - 1]) continue;
+            at = count - 1;
+        } else {
+            count++;
+        }
+        while (at > 0 && score[at - 1] > sc) {
+            score[at] = score[at - 1];
+            u.lights[at] = u.lights[at - 1];
+            at--;
+        }
+        score[at] = sc;
+        u.lights[at] = (uint32)j;
+    }
+    u.info[0] = (float)count;
+}
+
+void _scene_draw(*Scene self, *GpuPass pass, *_SceneDraw d, *GpuPipeline pipe) {
+    *_SceneRenderer r = &self._r;
+    *SceneMesh mesh = &self.meshes.data[d.mesh];
+    pass.set_group(0, &r.frame_group);
+    pass.set_group(1, &r.nodes.data[d.node].group);
+    pass.set_group(2, &r.mats.data[d.material].group);
+    pass.draw_indexed(pipe, &mesh.vertices, &mesh.indices, mesh.index_count, 1);
+}
+
+// Records the scene into enc: shadow maps, the scene in HDR, then bloom and tone mapping
+// into view, a width x height target in format (a window frame's view with the surface's
+// size and format, or a texture's). Passes recorded into enc afterwards (an interface)
+// draw over the result. Fails with the GPU's message (a shader or pipeline error).
+Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureView view, uint32 width, uint32 height,
+                                    WGPUTextureFormat format) {
+    *_SceneRenderer r = &self._r;
+    if (width == 0 || height == 0) return Err<int, string>("scene: empty target");
+    if (r.w != width || r.h != height) {
+        r.hdr.release();
+        r.depth.release();
+        r.hdr = self.gpu.target_with(width, height, WGPUTextureFormat_RGBA16Float)?;
+        r.depth = self.gpu.texture(width, height, WGPUTextureFormat_Depth32Float, WGPUTextureUsage_RenderAttachment)?;
+        r.w = width;
+        r.h = height;
+    }
+    Scene_update(self);
+    _scene_camera(self, width, height);
+    List_clear(&r.draws);
+    _scene_collect(self, 0);
+    if (r.draws.size > 1) sort<_SceneDraw>(r.draws.data, r.draws.size, _scene_draw_order);
+
+    Vec3 ambient;
+    int shadows = _scene_lights(self, &ambient)?;
+    bool any_caster = false;
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        if (!d.blend && self.nodes.data[d.node].casts_shadows) any_caster = true;
+    }
+    if (!any_caster) shadows = 0;
+    if (shadows > 0) _scene_shadow_targets(self, shadows)?;
+
+    float[2304] lb;
+    for (j in 0..r.recs.size) {
+        *_SceneLightRec rec = &r.recs.data[j];
+        *SceneLight l = &self.lights.data[rec.light];
+        *float o = &lb[j * 36];
+        o[0] = l.color.x;
+        o[1] = l.color.y;
+        o[2] = l.color.z;
+        o[3] = l.intensity;
+        o[4] = rec.pos.x;
+        o[5] = rec.pos.y;
+        o[6] = rec.pos.z;
+        o[7] = (float)rec.type;
+        o[8] = rec.dir.x;
+        o[9] = rec.dir.y;
+        o[10] = rec.dir.z;
+        o[11] = shadows > 0 ? (float)rec.layer : -1.0;
+        o[12] = l.attenuation_start;
+        o[13] = l.attenuation_end;
+        o[14] = l.falloff > 0.0 ? l.falloff : 2.0;
+        o[15] = l.shadow_bias;
+        o[16] = (float)cos((double)l.inner_angle);
+        o[17] = (float)cos((double)l.outer_angle);
+        o[18] = l.shadow_opacity;
+        o[19] = 0.0;
+        for (k in 20..36) o[k] = 0.0;
+        if (shadows > 0 && rec.layer >= 0) {
+            float texel = 0.0;
+            Mat4 vp = _scene_shadow_matrix(self, rec, &texel);
+            o[19] = l.shadow_normal_bias * texel;
+            for (k in 0..16) o[20 + k] = vp.m[k];
+            r.shadow_bufs.data[rec.layer].write(0, &vp, 64);
+        }
+    }
+    if (r.recs.size > 0) r.lights.write(0, &lb, (uint64)r.recs.size * 144);
+
+    uint32 ssize = self.shadow_size > 0 ? self.shadow_size : (uint32)2048;
+    float[36] fu;
+    for (k in 0..16) fu[k] = r.view_proj.m[k];
+    fu[16] = r.eye.x;
+    fu[17] = r.eye.y;
+    fu[18] = r.eye.z;
+    fu[19] = r.ortho ? 1.0 : 0.0;
+    fu[20] = r.forward.x;
+    fu[21] = r.forward.y;
+    fu[22] = r.forward.z;
+    fu[23] = 0.0;
+    fu[24] = ambient.x;
+    fu[25] = ambient.y;
+    fu[26] = ambient.z;
+    fu[27] = 0.0;
+    fu[28] = self.ibl != null ? 1.0 : 0.0;
+    fu[29] = self.ibl != null ? self.ibl.intensity : 0.0;
+    fu[30] = self.ibl != null ? self.ibl.max_lod() : 0.0;
+    fu[31] = 0.0;
+    fu[32] = 1.0 / (float)ssize;
+    fu[33] = 0.0;
+    fu[34] = 0.0;
+    fu[35] = 0.0;
+    r.frame.write(0, &fu, 144);
+    _scene_bind_frame(self, shadows > 0);
+
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        _scene_node_gpu(self, d.node)?;
+        *SceneNode n = &self.nodes.data[d.node];
+        _SceneDrawU u;
+        u.model = n.world;
+        Mat4 inv = n.world.inverse();
+        u.normal = inv.transpose();
+        _scene_draw_lights(self, d, &u);
+        u.info[1] = n.receives_shadows ? 1.0 : 0.0;
+        r.nodes.data[d.node].uniforms.write(0, &u, sizeof(_SceneDrawU));
+    }
+    for (i in 0..self.materials.size) {
+        _scene_material_gpu(self, i)?;
+    }
+    for (i in 0..r.draws.size) {
+        _scene_pipeline(self, r.draws.data[i].key)?;
+    }
+
+    for (k in 0..shadows) {
+        GpuPassOptions so = GpuPassOptions{depth_view: &r.shadow_views.data[k]};
+        GpuPass sp = enc.pass_with(null, &so);
+        for (i in 0..r.draws.size) {
+            *_SceneDraw d = &r.draws.data[i];
+            if (d.blend || !self.nodes.data[d.node].casts_shadows) continue;
+            *SceneMesh mesh = &self.meshes.data[d.mesh];
+            sp.set_group(0, &r.shadow_groups.data[k]);
+            sp.set_group(1, &r.nodes.data[d.node].group);
+            sp.draw_indexed(&r.shadow_pipe, &mesh.vertices, &mesh.indices, mesh.index_count, 1);
+        }
+        sp.end()?;
+    }
+
+    GpuPassOptions mo = GpuPassOptions{clear: GpuColor{(double)self.background.x, (double)self.background.y,
+        (double)self.background.z, (double)self.background.w}, depth: &r.depth};
+    GpuPass pass = enc.pass_with(r.hdr.view, &mo);
+    bool sky_drawn = false;
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        if (d.blend && !sky_drawn) {
+            if (self.skybox != null) _scene_sky_draw(&r.sky, &pass, self.skybox, r.view_proj, self.sky_intensity, self.sky_flip);
+            sky_drawn = true;
+        }
+        *GpuPipeline p = _scene_pipeline(self, d.key)?;
+        _scene_draw(self, &pass, d, p);
+    }
+    if (!sky_drawn && self.skybox != null) _scene_sky_draw(&r.sky, &pass, self.skybox, r.view_proj, self.sky_intensity, self.sky_flip);
+    pass.end()?;
+    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post);
+}
+
+// Scene_render_in with an encoder of its own, submitted at the end.
+Result<int, string> Scene_render(*Scene self, WGPUTextureView view, uint32 width, uint32 height, WGPUTextureFormat format) {
+    GpuEncoder enc = self.gpu.encoder();
+    Scene_render_in(self, &enc, view, width, height, format)?;
+    return enc.submit();
+}
+
+// Renders into a texture (Gpu_target, Gpu_target_with), to read back or sample.
+Result<int, string> Scene_render_to(*Scene self, *GpuTexture target) {
+    return Scene_render(self, target.view, target.width, target.height, target.format);
+}
