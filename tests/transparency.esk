@@ -1,0 +1,161 @@
+// Transparency and blending, unlit (CONSTANT) quads seen straight on, linear
+// float output:
+// - two half-transparent quads, red in front of blue, added front first: they
+//   must still blend back to front; moving red behind blue flips the result;
+//   an opaque quad between them hides the far one.
+// - each blend mode over a gray background against its formula.
+// - a texture with a cut-out quadrant under the MASK alpha mode.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 32;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+Vec3 pixel(*uint16 px, int x, int y) {
+    *uint16 p = px + (y * N + x) * 4;
+    return Vec3{half_to_float(p[0]), half_to_float(p[1]), half_to_float(p[2])};
+}
+
+bool near3(Vec3 a, Vec3 b) {
+    Vec3 d = a - b;
+    return d.x < 0.006 && d.x > -0.006 && d.y < 0.006 && d.y > -0.006 && d.z < 0.006 && d.z > -0.006;
+}
+
+void expect(string what, Vec3 got, Vec3 want) {
+    if (!near3(got, want)) {
+        printf("FAIL %s: got %.3f %.3f %.3f, want %.3f %.3f %.3f\n", what, (double)got.x, (double)got.y, (double)got.z,
+            (double)want.x, (double)want.y, (double)want.z);
+        fails++;
+    }
+}
+
+int flat(*Scene scene, Vec4 color, int alpha_mode, int blend) {
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = color;
+    m.alpha_mode = alpha_mode;
+    m.blend_mode = blend;
+    return scene.add_material(m);
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    SceneGeometry q = scene_quad(2.0, 2.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    int cam = scene.add_camera(0, scene_orthographic(2.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+
+    int red = scene.add_object(0, quad, flat(&scene, Vec4{1.0, 0.0, 0.0, 0.5}, SCENE_ALPHA_BLEND, SCENE_BLEND_ALPHA));
+    int blue = scene.add_object(0, quad, flat(&scene, Vec4{0.0, 0.0, 1.0, 0.5}, SCENE_ALPHA_BLEND, SCENE_BLEND_ALPHA));
+    scene.node(blue).position = Vec3{0.0, 0.0, -1.0};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("red over blue, back to front", pixel(px, 16, 16), Vec3{0.5, 0.0, 0.25});
+    scene.node(red).position = Vec3{0.0, 0.0, -2.0};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("blue over red after moving red back", pixel(px, 16, 16), Vec3{0.25, 0.0, 0.5});
+    scene.node(red).position = Vec3{0.0, 0.0, 0.0};
+    int green = scene.add_object(0, quad, flat(&scene, Vec4{0.0, 1.0, 0.0, 1.0}, SCENE_ALPHA_OPAQUE, 0));
+    scene.node(green).position = Vec3{0.0, 0.0, -0.5};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("an opaque quad hides the far one", pixel(px, 16, 16), Vec3{0.5, 0.5, 0.0});
+    scene.remove(red);
+    scene.remove(blue);
+    scene.remove(green);
+
+    scene.background = Vec4{0.5, 0.5, 0.5, 1.0};
+    Vec3 s = Vec3{0.4, 0.2, 0.8};
+    float a = 0.5;
+    float d = 0.5;
+    string[6] names = {"alpha", "add", "multiply", "subtract", "screen", "premultiplied"};
+    for (mode in 0..6) {
+        int n = scene.add_object(0, quad, flat(&scene, Vec4{s.x, s.y, s.z, a}, SCENE_ALPHA_BLEND, mode));
+        scene.node(n).scale = Vec3{0.5, 0.5, 1.0};
+        scene.render_to(&target)?;
+        target.read(px)?;
+        float[3] sc = {s.x, s.y, s.z};
+        float[3] w;
+        for (k in 0..3) {
+            float c = sc[k];
+            if (mode == SCENE_BLEND_ALPHA) w[k] = c * a + d * (1.0 - a);
+            if (mode == SCENE_BLEND_ADD) w[k] = d + c * a;
+            if (mode == SCENE_BLEND_MULTIPLY) w[k] = d * (1.0 + (c - 1.0) * a);
+            if (mode == SCENE_BLEND_SUBTRACT) w[k] = d - c * a;
+            if (mode == SCENE_BLEND_SCREEN) w[k] = d + c * a * (1.0 - d);
+            if (mode == SCENE_BLEND_PREMULTIPLIED) w[k] = c + d * (1.0 - a);
+        }
+        expect(names[mode], pixel(px, 16, 16), Vec3{w[0], w[1], w[2]});
+        expect("background around the quad", pixel(px, 2, 2), Vec3{0.5, 0.5, 0.5});
+        scene.remove(n);
+    }
+
+    // an 8x8 texture in quadrants: red, cut out (alpha 0), blue, white
+    uint8[256] texels;
+    for (y in 0..8) {
+        for (x in 0..8) {
+            *uint8 t = &texels[(y * 8 + x) * 4];
+            bool right = x >= 4;
+            bool bottom = y >= 4;
+            t[0] = !bottom && !right ? 255 : (bottom && right ? 255 : 0);
+            t[1] = bottom && right ? 255 : 0;
+            t[2] = bottom ? 255 : 0;
+            t[3] = !bottom && right ? 0 : 255;
+        }
+    }
+    GpuImageOptions io = GpuImageOptions{srgb: true};
+    GpuTexture tex = gpu.image_with(8, 8, &texels[0], &io)?;
+    SceneMaterial tm = scene_material(SCENE_CONSTANT);
+    tm.diffuse_texture = scene.add_texture(tex);
+    tm.alpha_mode = SCENE_ALPHA_MASK;
+    scene.add_object(0, quad, scene.add_material(tm));
+    scene.background = Vec4{0.0, 0.3, 0.0, 1.0};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("texture: top left red", pixel(px, 8, 8), Vec3{1.0, 0.0, 0.0});
+    expect("texture: top right cut out", pixel(px, 24, 8), Vec3{0.0, 0.3, 0.0});
+    expect("texture: bottom left blue", pixel(px, 8, 24), Vec3{0.0, 0.0, 1.0});
+    expect("texture: bottom right white", pixel(px, 24, 24), Vec3{1.0, 1.0, 1.0});
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("transparency: ok\n");
+    return 0;
+}
