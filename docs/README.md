@@ -68,8 +68,7 @@ These ViroReact renderer features are planned for later versions:
 - Post effects beyond bloom (color grading, vignette, depth of field, SSAO).
 - Shader modifiers (user WGSL inserted into the generated shaders).
 - Shadows from spot and point lights, and cascaded shadow maps for large scenes.
-- Skinning and morph targets on glTF models in the scene (`<gpu/model>` has them).
-- Several texture coordinate sets, glTF samplers, per-texture transforms.
+- glTF samplers (the scene's sampler is used: linear, mipmapped, repeating).
 - Node opacity, render order overrides, instanced drawing, frustum culling.
 - Hit testing and bounding-box queries.
 

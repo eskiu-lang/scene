@@ -8,6 +8,14 @@ All notable changes to this package are documented here. The format follows
 
 ### Added
 
+- glTF in the scene as in `<gpu/model>`: skinning (joint matrices per skinned primitive,
+  recomputed by `SceneGltf_pose`), morph targets (`Scene_set_morph_targets`,
+  `Scene_set_weights`), the second texture coordinate set, `KHR_texture_transform` per
+  texture (`SceneMaterial.uv`, `SceneUv`), `KHR_node_visibility`, and the material factors
+  and texture transforms that `KHR_animation_pointer` channels animate. Shadows follow
+  skinning and morphs. `Scene_set_joints`, `Scene_set_weights` and `Scene_set_morph_targets`
+  work on any mesh; a vertex is now 26 floats (second uv, joints, weights).
+
 - `<scene>`: `Scene` (`Gpu_scene`), a node tree with position, rotation, scale, visibility,
   reparenting and removal, `look_at`, perspective and orthographic cameras, meshes,
   textures, glTF and OBJ import (`Scene_add_gltf`, `SceneGltf_pose`), and rendering into a

@@ -100,8 +100,19 @@ scene.node(helmet.root).position = Vec3{0.0, 1.0, 0.0};
 linear for the others), its materials as `SCENE_PBR` materials (`SCENE_CONSTANT` for
 `KHR_materials_unlit`), its triangle primitives as meshes, and its node tree under a new
 node, `SceneGltf.root`. Each primitive becomes a child node of its glTF node, so a node with
-three primitives has three children. `SceneGltf.nodes[i]` is the scene node of glTF node
-`i`.
+three primitives has three children; a skinned primitive hangs from `SceneGltf.root`
+instead, since its joints place its vertices in the model's space. `SceneGltf.nodes[i]` is
+the scene node of glTF node `i`, and `SceneGltf.prim_nodes` the node of each primitive.
+
+What the import keeps:
+
+- Both texture coordinate sets, and for each texture its set and its
+  `KHR_texture_transform` (in `SceneMaterial.uv`).
+- `KHR_node_visibility`: a hidden node is not visible (`SceneNode.visible`), and so is its
+  subtree.
+- Skins: each skinned primitive gets its joint matrices (`Scene_set_joints`).
+- Morph targets: each mesh's targets (`Scene_set_morph_targets`) and its node's weights
+  (`Scene_set_weights`).
 
 To play an animation, keep the `Gltf` and copy its pose each frame:
 
@@ -110,6 +121,18 @@ g.animate(0, seconds);
 helmet.pose(&scene, &g);
 ```
 
-Skins and morph targets are not applied (the mesh is drawn in its bind pose); use
-`<gpu/model>` for those for now. Only the first texture coordinate set is read, and the
-glTF samplers are replaced by the scene's sampler (linear, mipmapped, repeating).
+`SceneGltf_pose` copies node transforms and visibility, recomputes the joint matrices of
+skinned meshes, copies the morph target weights, and copies what `KHR_animation_pointer`
+channels changed in materials (base color, emissive, metallic, roughness, alpha cutoff and
+texture transforms). The glTF samplers are replaced by the scene's sampler (linear,
+mipmapped, repeating).
+
+### Skinning and morph targets on your own meshes
+
+A vertex has a second texture coordinate (floats 16 and 17) and, for skinning, four joint
+indices and four weights (floats 18 to 25). `Scene_set_joints(node, joints, count)` skins
+the node's mesh with `count` joint matrices in the space of the node's transform;
+`Scene_set_morph_targets(mesh, positions, normals, targets)` gives a mesh targets
+(`targets * vertex_count * 3` floats each, the delta of target `t` for vertex `v` at
+`(t * vertex_count + v) * 3`), and `Scene_set_weights(node, weights, count)` blends them for
+a node. Shadows follow both.

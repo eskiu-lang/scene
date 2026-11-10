@@ -19,6 +19,16 @@ picks up. Texture fields hold texture ids (0 is none); color textures (diffuse, 
 emissive) belong in an sRGB format and data textures (normal, metal-roughness, occlusion)
 in a linear one, as `Scene_load_texture`'s `srgb` argument chooses.
 
+`m.uv[k]` (a `SceneUv`) says how texture slot `k` (`SCENE_TEX_DIFFUSE`,
+`SCENE_TEX_SPECULAR`, `SCENE_TEX_NORMAL`, `SCENE_TEX_EMISSIVE`, `SCENE_TEX_METAL_ROUGH`,
+`SCENE_TEX_OCCLUSION`) reads its coordinates: `set` 0 or 1 picks the vertex's first or
+second texture coordinate, and with `transform` they are scaled, turned and moved
+(`scale`, `rotation` in radians, `offset`) first, as glTF's `KHR_texture_transform` does:
+
+```eskiu
+m.uv[SCENE_TEX_DIFFUSE] = SceneUv{transform: true, offset: Vec2{0.5, 0.0}, scale: Vec2{1.0, 1.0}};
+```
+
 ## Lighting models
 
 Below, `base` is `diffuse * diffuse_texture * vertex color`, `n` the surface normal (after

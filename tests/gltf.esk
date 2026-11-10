@@ -115,6 +115,12 @@ Result<int, string> run() {
     scene.render_to(&target)?;
     target.read(px)?;
     check("pose moves the scene node", near3(pixel(px, 22, 16), color) && near3(pixel(px, 10, 16), Vec3{0.0, 0.0, 0.0}));
+    // KHR_node_visibility: hiding the parent hides the quad under it.
+    g.nodes.data[0].hidden = true;
+    model.pose(&scene, &g);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("a hidden node hides its subtree", near3(pixel(px, 22, 16), Vec3{0.0, 0.0, 0.0}));
     return Ok<int, string>(0);
 }
 

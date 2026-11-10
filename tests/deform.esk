@@ -1,0 +1,134 @@
+// Morph targets, skinning and texture coordinates: a 2 x 2 quad seen through an orthographic
+// camera (8 pixels per unit, the quad over pixels 8 to 24) moves right by its morph target's
+// weight, moves left by its joint, and reads a red-and-green texture through the second
+// texture coordinate and a KHR_texture_transform offset.
+import <io>;
+import <mem>;
+import <string>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 32;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+Vec3 pixel(*uint16 px, int x, int y) {
+    *uint16 p = px + (y * N + x) * 4;
+    return Vec3{half_to_float(p[0]), half_to_float(p[1]), half_to_float(p[2])};
+}
+
+bool lit(Vec3 c) { return c.x + c.y + c.z > 0.5; }
+bool red(Vec3 c) { return c.x > 0.6 && c.y < 0.3; }
+bool green(Vec3 c) { return c.y > 0.6 && c.x < 0.3; }
+
+// The quad facing +Z, its second texture coordinate the first one, every vertex on joint 0.
+SceneGeometry quad() {
+    SceneGeometry g = scene_geometry(4, 6);
+    float[8] xy = {-1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0};
+    float[8] uv = {0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0};
+    for (i in 0..4) {
+        g.set((uint32)i, Vec3{xy[i * 2], xy[i * 2 + 1], 0.0}, Vec3{0.0, 0.0, 1.0}, Vec2{uv[i * 2], uv[i * 2 + 1]});
+        *float v = g.vertices + i * SCENE_VERTEX_FLOATS;
+        v[16] = uv[i * 2];
+        v[17] = uv[i * 2 + 1];
+        v[18] = 0.0;
+        v[22] = 1.0;
+    }
+    uint32[6] idx = {0, 1, 2, 0, 2, 3};
+    for (i in 0..6) g.indices[i] = idx[i];
+    g.bounds();
+    return g;
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    SceneGeometry geo = quad();
+    int mesh = scene.add_geometry(&geo)?;
+    geo.free();
+    SceneMaterial mat = scene_material(SCENE_CONSTANT);
+    int m = scene.add_material(mat);
+    int node = scene.add_object(0, mesh, m);
+    int cam = scene.add_camera(0, scene_orthographic(4.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("the quad in the middle", lit(pixel(px, 12, 16)) && lit(pixel(px, 20, 16)) && !lit(pixel(px, 28, 16)));
+
+    // One target moving every vertex 2 units right.
+    float[12] dpos = {2.0, 0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 0.0};
+    scene.set_morph_targets(mesh, &dpos[0], null, 1)?;
+    float[1] w0 = {0.0};
+    scene.set_weights(node, &w0[0], 1);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("weight 0 leaves it", lit(pixel(px, 12, 16)) && !lit(pixel(px, 28, 16)));
+    float[1] w1 = {1.0};
+    scene.set_weights(node, &w1[0], 1);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("weight 1 moves it right", !lit(pixel(px, 12, 16)) && lit(pixel(px, 28, 16)));
+    scene.set_weights(node, &w0[0], 1);
+
+    // Joint 0 moves it 2 units left.
+    Mat4[1] joints = {mat4_translate(Vec3{-2.0, 0.0, 0.0})};
+    scene.set_joints(node, &joints[0], 1);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("the joint moves it left", lit(pixel(px, 4, 16)) && !lit(pixel(px, 12, 16)) && !lit(pixel(px, 20, 16)));
+    scene.set_joints(node, null, 0);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("no joints, back in place", lit(pixel(px, 12, 16)) && !lit(pixel(px, 4, 16)));
+
+    // A 4 x 1 texture, red then green: the left of the quad reads red, then green once its
+    // coordinates move half the texture across.
+    uint8[16] rg = {255, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255};
+    int tex = scene.add_texture(gpu.image(4, 1, &rg[0])?);
+    scene.material(m).diffuse_texture = tex;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("left reads red", red(pixel(px, 10, 16)) && green(pixel(px, 22, 16)));
+    scene.material(m).uv[SCENE_TEX_DIFFUSE] = SceneUv{set: 1, transform: true, offset: Vec2{0.5, 0.0}, scale: Vec2{1.0, 1.0}};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("the second coordinates, offset by a half, read green", green(pixel(px, 10, 16)));
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("deform: ok\n");
+    return 0;
+}

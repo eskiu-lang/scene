@@ -109,6 +109,8 @@ struct SceneNode {
     bool receives_shadows;
     uint32 light_mask;
     Mat4 world;
+    List<Mat4> joints;
+    List<float> weights;
 }
 ```
 
@@ -129,6 +131,9 @@ struct SceneMesh {
     uint32 index_count;
     Vec3 min;
     Vec3 max;
+    uint32 vertex_count;
+    int targets;
+    GpuBuffer morph;
 }
 ```
 
@@ -145,6 +150,10 @@ struct SceneGltf {
     List<int> prim_start;
     List<int> materials;
     List<int> textures;
+    List<int> prim_nodes;
+    List<int> prim_src;
+    List<int> prim_skin;
+    int material_version;
 }
 ```
 
@@ -339,6 +348,35 @@ Result<int, string> Scene_add_geometry(*Scene self, *SceneGeometry geometry)
 
 Uploads geometry as a mesh and returns its id. The geometry can be freed afterwards.
 
+### Scene_set_morph_targets
+
+```eskiu
+Result<int, string> Scene_set_morph_targets(*Scene self, int mesh, *float positions, *float normals, int targets)
+```
+
+Gives mesh targets morph targets: positions and normals (normals may be null) hold
+targets * vertex_count * 3 floats each, the delta of target t for vertex v at
+(t * vertex_count + v) * 3. A node drawing the mesh blends them by its weights
+(Scene_set_weights).
+
+### Scene_set_joints
+
+```eskiu
+void Scene_set_joints(*Scene self, int node, *Mat4 joints, int count)
+```
+
+Skins node's mesh with count joint matrices, each a joint's transform times its inverse
+bind matrix in the space of node's own transform (glTF's joint matrices). The vertex
+joints index them and the vertex weights blend them. count 0 stops skinning.
+
+### Scene_set_weights
+
+```eskiu
+void Scene_set_weights(*Scene self, int node, *float weights, int count)
+```
+
+Sets node's morph target weights, one per target of its mesh.
+
 ### Scene_add_material
 
 ```eskiu
@@ -462,7 +500,10 @@ SceneGltf_pose. Free the result with SceneGltf_free.
 void SceneGltf_pose(*SceneGltf self, *Scene scene, *Gltf g)
 ```
 
-Copies the glTF nodes' current transforms (after Gltf_animate) to their scene nodes.
+Copies the glTF model's current state (after Gltf_animate) to the scene: the nodes'
+transforms and visibility (KHR_node_visibility), the joint matrices of skinned meshes,
+morph target weights, and the material factors and texture transforms animation
+pointers changed (KHR_animation_pointer).
 
 ### SceneGltf_free
 
@@ -515,16 +556,19 @@ int mesh = scene.add_geometry(&g)?;
 ```
 
 Each vertex is SCENE_VERTEX_FLOATS floats: position (3), normal (3),
-texture coordinate (2), tangent (4, w the handedness of the bitangent) and
-color (4, linear RGBA). Front faces wind counterclockwise.
+texture coordinate (2), tangent (4, w the handedness of the bitangent),
+color (4, linear RGBA), a second texture coordinate (2), and for skinning
+four joint indices (as floats) and their four weights. Front faces wind
+counterclockwise.
 
 ### SCENE_VERTEX_FLOATS
 
 ```eskiu
-const int SCENE_VERTEX_FLOATS = 16;
+const int SCENE_VERTEX_FLOATS = 26;
 ```
 
-Floats per vertex: position 0-2, normal 3-5, uv 6-7, tangent 8-11, color 12-15.
+Floats per vertex: position 0-2, normal 3-5, uv 6-7, tangent 8-11, color 12-15,
+second uv 16-17, joints 18-21, weights 22-25.
 
 ### SceneGeometry
 
@@ -872,6 +916,35 @@ ADD is d + s * a; MULTIPLY is d * mix(1, s, a); SUBTRACT is d - s * a; SCREEN is
 d + s * a * (1 - d); PREMULTIPLIED is s + d * (1 - a), for colors already multiplied
 by their alpha.
 
+### SceneUv
+
+```eskiu
+struct SceneUv {
+    int set;
+    bool transform;
+    Vec2 offset;
+    float rotation;
+    Vec2 scale;
+}
+```
+
+How a texture of a material reads its coordinates: set picks the vertex's first (0) or
+second (1) texture coordinate; with transform (glTF's KHR_texture_transform) they are
+scaled by scale, turned by rotation (radians) and moved by offset first.
+
+### SCENE_TEX_DIFFUSE, SCENE_TEX_SPECULAR, SCENE_TEX_NORMAL, SCENE_TEX_EMISSIVE, SCENE_TEX_METAL_ROUGH, SCENE_TEX_OCCLUSION
+
+```eskiu
+const int SCENE_TEX_DIFFUSE = 0;
+const int SCENE_TEX_SPECULAR = 1;
+const int SCENE_TEX_NORMAL = 2;
+const int SCENE_TEX_EMISSIVE = 3;
+const int SCENE_TEX_METAL_ROUGH = 4;
+const int SCENE_TEX_OCCLUSION = 5;
+```
+
+The texture slots of SceneMaterial.uv.
+
 ### SceneMaterial
 
 ```eskiu
@@ -896,6 +969,7 @@ struct SceneMaterial {
     float alpha_cutoff;
     int blend_mode;
     bool double_sided;
+    SceneUv[6] uv;
 }
 ```
 
@@ -909,7 +983,9 @@ A material. Fields by lighting model:
 - PBR: metalness and roughness (times the blue and green channels of
   metal_rough_texture, as glTF stores them) and occlusion_texture (red channel,
   strength occlusion_strength) on the ambient term.
-Texture ids come from the Scene that draws the material (0 is none).
+Texture ids come from the Scene that draws the material (0 is none). uv holds how each
+texture reads its coordinates, in the order diffuse, specular, normal, emissive,
+metal-roughness, occlusion (SCENE_TEX_DIFFUSE and the others).
 
 ### scene_material
 
