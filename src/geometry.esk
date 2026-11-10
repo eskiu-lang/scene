@@ -9,16 +9,19 @@
 //     int mesh = scene.add_geometry(&g)?;
 //
 // Each vertex is SCENE_VERTEX_FLOATS floats: position (3), normal (3),
-// texture coordinate (2), tangent (4, w the handedness of the bitangent) and
-// color (4, linear RGBA). Front faces wind counterclockwise.
+// texture coordinate (2), tangent (4, w the handedness of the bitangent),
+// color (4, linear RGBA), a second texture coordinate (2), and for skinning
+// four joint indices (as floats) and their four weights. Front faces wind
+// counterclockwise.
 
 import <mem>;
 import <libc>;
 import <gpu/math>;
 import <gpu/gltf>;
 
-// Floats per vertex: position 0-2, normal 3-5, uv 6-7, tangent 8-11, color 12-15.
-const int SCENE_VERTEX_FLOATS = 16;
+// Floats per vertex: position 0-2, normal 3-5, uv 6-7, tangent 8-11, color 12-15,
+// second uv 16-17, joints 18-21, weights 22-25.
+const int SCENE_VERTEX_FLOATS = 26;
 
 // A mesh on the CPU: vertex_count vertices of SCENE_VERTEX_FLOATS floats each, and
 // index_count indices (three per triangle). min and max bound the positions. Free it
@@ -295,6 +298,16 @@ SceneGeometry scene_gltf_geometry(*GltfPrimitive p) {
         }
         if (p.colors != null) {
             for (k in 0..4) v[12 + k] = p.colors[i * 4 + k];
+        }
+        if (p.uvs1 != null) {
+            v[16] = p.uvs1[i * 2];
+            v[17] = p.uvs1[i * 2 + 1];
+        }
+        if (p.joints != null && p.weights != null) {
+            for (k in 0..4) {
+                v[18 + k] = (float)p.joints[i * 4 + k];
+                v[22 + k] = p.weights[i * 4 + k];
+            }
         }
     }
     for (i in 0..ni) g.indices[i] = p.indices != null ? p.indices[i] : (uint32)i;

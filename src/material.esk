@@ -50,6 +50,25 @@ const int SCENE_BLEND_SUBTRACT = 3;
 const int SCENE_BLEND_SCREEN = 4;
 const int SCENE_BLEND_PREMULTIPLIED = 5;
 
+// How a texture of a material reads its coordinates: set picks the vertex's first (0) or
+// second (1) texture coordinate; with transform (glTF's KHR_texture_transform) they are
+// scaled by scale, turned by rotation (radians) and moved by offset first.
+struct SceneUv {
+    int set;
+    bool transform;
+    Vec2 offset;
+    float rotation;
+    Vec2 scale;
+}
+
+// The texture slots of SceneMaterial.uv.
+const int SCENE_TEX_DIFFUSE = 0;
+const int SCENE_TEX_SPECULAR = 1;
+const int SCENE_TEX_NORMAL = 2;
+const int SCENE_TEX_EMISSIVE = 3;
+const int SCENE_TEX_METAL_ROUGH = 4;
+const int SCENE_TEX_OCCLUSION = 5;
+
 // A material. Fields by lighting model:
 // - every model: diffuse (linear RGBA, multiplied by diffuse_texture and the vertex
 //   color), emissive (added after lighting, times emissive_texture), alpha_mode,
@@ -60,7 +79,9 @@ const int SCENE_BLEND_PREMULTIPLIED = 5;
 // - PBR: metalness and roughness (times the blue and green channels of
 //   metal_rough_texture, as glTF stores them) and occlusion_texture (red channel,
 //   strength occlusion_strength) on the ambient term.
-// Texture ids come from the Scene that draws the material (0 is none).
+// Texture ids come from the Scene that draws the material (0 is none). uv holds how each
+// texture reads its coordinates, in the order diffuse, specular, normal, emissive,
+// metal-roughness, occlusion (SCENE_TEX_DIFFUSE and the others).
 struct SceneMaterial {
     int lighting;
     Vec4 diffuse;
@@ -82,6 +103,7 @@ struct SceneMaterial {
     float alpha_cutoff;
     int blend_mode;
     bool double_sided;
+    SceneUv[6] uv;
 }
 
 // A material of lighting model lighting with the defaults: white diffuse at intensity 1,
@@ -126,13 +148,35 @@ bool scene_key_double_sided(int key) {
     return key >= 256;
 }
 
+// Morph targets and skinning, shared by the scene and shadow vertex shaders: draw.morph is
+// (vertex count, target count); morph holds two vec4s per target and vertex (position and
+// normal deltas, at (t * count + v) * 2); draw.info.z > 0.5 skins with joints.
+#define SCENE_DEFORM_WGSL \
+    "fn morph_apply(vi: u32, p: ptr<function, vec3<f32>>, n: ptr<function, vec3<f32>>) {\n" \
+    "    let count = u32(draw.morph.x);\n" \
+    "    let targets = u32(draw.morph.y);\n" \
+    "    for (var t = 0u; t < targets; t++) {\n" \
+    "        let w = weights[t];\n" \
+    "        if (w == 0.0) { continue; }\n" \
+    "        let at = (t * count + vi) * 2u;\n" \
+    "        *p = *p + morph[at].xyz * w;\n" \
+    "        *n = *n + morph[at + 1u].xyz * w;\n" \
+    "    }\n" \
+    "}\n" \
+    "fn skin_matrix(j: vec4<f32>, w: vec4<f32>) -> mat4x4<f32> {\n" \
+    "    if (draw.info.z < 0.5) { return mat4x4<f32>(vec4(1.0, 0.0, 0.0, 0.0), vec4(0.0, 1.0, 0.0, 0.0),\n" \
+    "        vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, 0.0, 0.0, 1.0)); }\n" \
+    "    return joints[u32(j.x)] * w.x + joints[u32(j.y)] * w.y + joints[u32(j.z)] * w.z + joints[u32(j.w)] * w.w;\n" \
+    "}\n"
+
 string _scene_common_wgsl =
     "struct Frame { view_proj: mat4x4<f32>, eye: vec4<f32>, forward: vec4<f32>, ambient: vec4<f32>,\n"
     "    ibl: vec4<f32>, shadow: vec4<f32> };\n"
     "struct Light { color: vec4<f32>, position: vec4<f32>, direction: vec4<f32>, atten: vec4<f32>,\n"
     "    spot: vec4<f32>, shadow_vp: mat4x4<f32> };\n"
-    "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32> };\n"
-    "struct Material { diffuse: vec4<f32>, specular: vec4<f32>, emissive: vec4<f32>, pbr: vec4<f32>, extra: vec4<f32> };\n"
+    "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32>, morph: vec4<f32> };\n"
+    "struct Material { diffuse: vec4<f32>, specular: vec4<f32>, emissive: vec4<f32>, pbr: vec4<f32>, extra: vec4<f32>,\n"
+    "    tf: array<vec4<f32>, 12> };\n"
     "@group(0) @binding(0) var<uniform> frame: Frame;\n"
     "@group(0) @binding(1) var<storage, read> lights: array<Light>;\n"
     "@group(0) @binding(2) var shadow_maps: texture_depth_2d_array;\n"
@@ -142,6 +186,9 @@ string _scene_common_wgsl =
     "@group(0) @binding(6) var brdf_tex: texture_2d<f32>;\n"
     "@group(0) @binding(7) var ibl_samp: sampler;\n"
     "@group(1) @binding(0) var<uniform> draw: Draw;\n"
+    "@group(1) @binding(1) var<storage, read> joints: array<mat4x4<f32>>;\n"
+    "@group(1) @binding(2) var<storage, read> morph: array<vec4<f32>>;\n"
+    "@group(1) @binding(3) var<storage, read> weights: array<f32>;\n"
     "@group(2) @binding(0) var<uniform> mat: Material;\n"
     "@group(2) @binding(1) var mat_samp: sampler;\n"
     "@group(2) @binding(2) var diffuse_tex: texture_2d<f32>;\n"
@@ -150,22 +197,37 @@ string _scene_common_wgsl =
     "@group(2) @binding(5) var emissive_tex: texture_2d<f32>;\n"
     "@group(2) @binding(6) var mr_tex: texture_2d<f32>;\n"
     "@group(2) @binding(7) var occ_tex: texture_2d<f32>;\n"
-    "struct In { @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv: vec2<f32>,\n"
-    "    @location(3) tangent: vec4<f32>, @location(4) color: vec4<f32> };\n"
+    "struct In { @builtin(vertex_index) vi: u32, @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>,\n"
+    "    @location(2) uv: vec2<f32>, @location(3) tangent: vec4<f32>, @location(4) color: vec4<f32>,\n"
+    "    @location(5) uv1: vec2<f32>, @location(6) joint: vec4<f32>, @location(7) weight: vec4<f32> };\n"
     "struct V { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>,\n"
-    "    @location(2) uv: vec2<f32>, @location(3) tangent: vec4<f32>, @location(4) color: vec4<f32> };\n"
+    "    @location(2) uv: vec2<f32>, @location(3) tangent: vec4<f32>, @location(4) color: vec4<f32>,\n"
+    "    @location(5) uv1: vec2<f32> };\n"
+    SCENE_DEFORM_WGSL
     "@vertex fn vs(v: In) -> V {\n"
-    "    let world = draw.model * vec4<f32>(v.pos, 1.0);\n"
+    "    var p = v.pos;\n"
+    "    var nrm = v.normal;\n"
+    "    morph_apply(v.vi, &p, &nrm);\n"
+    "    let sk = skin_matrix(v.joint, v.weight);\n"
+    "    let world = draw.model * (sk * vec4<f32>(p, 1.0));\n"
     "    var o: V;\n"
     "    o.clip = frame.view_proj * world;\n"
     "    o.world = world.xyz;\n"
+    "    let s3 = mat3x3<f32>(sk[0].xyz, sk[1].xyz, sk[2].xyz);\n"
     "    let nm = mat3x3<f32>(draw.normal[0].xyz, draw.normal[1].xyz, draw.normal[2].xyz);\n"
-    "    o.normal = nm * v.normal;\n"
+    "    o.normal = nm * (s3 * nrm);\n"
     "    let mm = mat3x3<f32>(draw.model[0].xyz, draw.model[1].xyz, draw.model[2].xyz);\n"
-    "    o.tangent = vec4<f32>(mm * v.tangent.xyz, v.tangent.w);\n"
+    "    o.tangent = vec4<f32>(mm * (s3 * v.tangent.xyz), v.tangent.w);\n"
     "    o.uv = v.uv;\n"
+    "    o.uv1 = v.uv1;\n"
     "    o.color = v.color;\n"
     "    return o;\n"
+    "}\n"
+    "fn tuv(v: V, k: u32) -> vec2<f32> {\n"
+    "    let m = mat.tf[k * 2u];\n"
+    "    let o = mat.tf[k * 2u + 1u];\n"
+    "    let uv = select(v.uv, v.uv1, o.z > 0.5);\n"
+    "    return vec2<f32>(m.x * uv.x + m.y * uv.y + o.x, m.z * uv.x + m.w * uv.y + o.y);\n"
     "}\n"
     "const PI = 3.14159265358979;\n"
     "fn draw_light(k: u32) -> u32 { return draw.lights[k / 4u][k % 4u]; }\n"
@@ -270,16 +332,17 @@ string _scene_pbr_wgsl =
 
 string _scene_fs_head =
     "@fragment fn fs(v: V, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {\n"
-    "    let d_s = textureSample(diffuse_tex, mat_samp, v.uv);\n"
-    "    let s_s = textureSample(specular_tex, mat_samp, v.uv);\n"
-    "    let n_s = textureSample(normal_tex, mat_samp, v.uv).xyz;\n"
-    "    let e_s = textureSample(emissive_tex, mat_samp, v.uv).rgb;\n"
-    "    let mr_s = textureSample(mr_tex, mat_samp, v.uv);\n"
-    "    let o_s = textureSample(occ_tex, mat_samp, v.uv).r;\n"
+    "    let d_s = textureSample(diffuse_tex, mat_samp, tuv(v, 0u));\n"
+    "    let s_s = textureSample(specular_tex, mat_samp, tuv(v, 1u));\n"
+    "    let nuv = tuv(v, 2u);\n"
+    "    let n_s = textureSample(normal_tex, mat_samp, nuv).xyz;\n"
+    "    let e_s = textureSample(emissive_tex, mat_samp, tuv(v, 3u)).rgb;\n"
+    "    let mr_s = textureSample(mr_tex, mat_samp, tuv(v, 4u));\n"
+    "    let o_s = textureSample(occ_tex, mat_samp, tuv(v, 5u)).r;\n"
     "    let dp1 = dpdx(v.world);\n"
     "    let dp2 = dpdy(v.world);\n"
-    "    let duv1 = dpdx(v.uv);\n"
-    "    let duv2 = dpdy(v.uv);\n"
+    "    let duv1 = dpdx(nuv);\n"
+    "    let duv2 = dpdy(nuv);\n"
     "    var n = normalize(v.normal);\n"
     "    if (!front) { n = -n; }\n"
     "    var s: Surf;\n"
@@ -340,9 +403,17 @@ void scene_material_shader(int key, *String out) {
 
 string _scene_shadow_wgsl =
     "struct Pass { vp: mat4x4<f32> };\n"
-    "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32> };\n"
+    "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32>, morph: vec4<f32> };\n"
     "@group(0) @binding(0) var<uniform> sp: Pass;\n"
     "@group(1) @binding(0) var<uniform> draw: Draw;\n"
-    "@vertex fn vs(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {\n"
-    "    return sp.vp * (draw.model * vec4<f32>(pos, 1.0));\n"
+    "@group(1) @binding(1) var<storage, read> joints: array<mat4x4<f32>>;\n"
+    "@group(1) @binding(2) var<storage, read> morph: array<vec4<f32>>;\n"
+    "@group(1) @binding(3) var<storage, read> weights: array<f32>;\n"
+    SCENE_DEFORM_WGSL
+    "@vertex fn vs(@builtin(vertex_index) vi: u32, @location(0) pos: vec3<f32>, @location(6) joint: vec4<f32>,\n"
+    "              @location(7) weight: vec4<f32>) -> @builtin(position) vec4<f32> {\n"
+    "    var p = pos;\n"
+    "    var nrm = vec3<f32>(0.0, 0.0, 1.0);\n"
+    "    morph_apply(vi, &p, &nrm);\n"
+    "    return sp.vp * (draw.model * (skin_matrix(joint, weight) * vec4<f32>(p, 1.0)));\n"
     "}\n";
