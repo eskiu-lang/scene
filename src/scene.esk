@@ -101,6 +101,8 @@ struct SceneNode {
     bool receives_shadows;
     uint32 light_mask;
     Mat4 world;
+    List<Mat4> joints;
+    List<float> weights;
 }
 
 // A mesh on the GPU: its vertex and index buffers, the index count and the bounds of its
@@ -111,6 +113,9 @@ struct SceneMesh {
     uint32 index_count;
     Vec3 min;
     Vec3 max;
+    uint32 vertex_count;
+    int targets;
+    GpuBuffer morph;
 }
 
 // A glTF model added with Scene_add_gltf: root is the node holding it; nodes maps each glTF
@@ -124,12 +129,19 @@ struct SceneGltf {
     List<int> prim_start;
     List<int> materials;
     List<int> textures;
+    List<int> prim_nodes;
+    List<int> prim_src;
+    List<int> prim_skin;
+    int material_version;
 }
 
 struct _SceneNodeGpu {
     bool made;
     GpuBuffer uniforms;
     GpuBindGroup group;
+    GpuBuffer joints;
+    GpuBuffer weights;
+    int bound_mesh;
 }
 
 struct _SceneMatGpu {
@@ -170,6 +182,7 @@ struct _SceneDrawU {
     Mat4 normal;
     uint32[8] lights;
     float[4] info;
+    float[4] morph;
 }
 
 struct _SceneRenderer {
@@ -181,6 +194,7 @@ struct _SceneRenderer {
     GpuBuffer lights;
     GpuBindGroup frame_group;
     GpuSampler samp;
+    GpuBuffer no_storage;
     GpuSampler shadow_samp;
     GpuSampler ibl_samp;
     GpuTexture white;
@@ -245,6 +259,9 @@ void _scene_vertex_layout(*GpuVertexLayout l) {
     l.add(WGPUVertexFormat_Float32x2, 24);
     l.add(WGPUVertexFormat_Float32x4, 32);
     l.add(WGPUVertexFormat_Float32x4, 48);
+    l.add(WGPUVertexFormat_Float32x2, 64);
+    l.add(WGPUVertexFormat_Float32x4, 72);
+    l.add(WGPUVertexFormat_Float32x4, 88);
 }
 
 int _scene_new_node(*Scene self, int parent, string name) {
@@ -282,6 +299,7 @@ Result<int, string> _scene_renderer_make(*Scene s) {
     r.frame_layout.sampler(7, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
     r.draw_layout = g.bind_layout();
     r.draw_layout.uniform(0, 0);
+    for (b in 1..4) r.draw_layout.storage((uint32)b, WGPUShaderStage_Vertex, true);
     r.mat_layout = g.bind_layout();
     r.mat_layout.uniform(0, WGPUShaderStage_Fragment);
     r.mat_layout.sampler(1, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
@@ -290,6 +308,7 @@ Result<int, string> _scene_renderer_make(*Scene s) {
     r.shadow_layout.uniform(0, WGPUShaderStage_Vertex);
 
     r.frame = g.uniform(null, 144)?;
+    r.no_storage = g.buffer(64, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
     r.lights = g.buffer((uint64)SCENE_MAX_LIGHTS * 144, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
     GpuSamplerOptions so = GpuSamplerOptions{mipmaps: true, anisotropy: 8};
     r.samp = g.sampler_with(&so)?;
@@ -369,6 +388,8 @@ void Scene_release(*Scene self) {
             r.nodes.data[i].group.release();
             r.nodes.data[i].uniforms.release();
         }
+        r.nodes.data[i].joints.release();
+        r.nodes.data[i].weights.release();
     }
     for (i in 0..r.mats.size) {
         if (r.mats.data[i].made) {
@@ -396,6 +417,7 @@ void Scene_release(*Scene self) {
         r.frame.release();
         r.lights.release();
         r.samp.release();
+        r.no_storage.release();
         r.shadow_samp.release();
         r.ibl_samp.release();
     }
@@ -413,12 +435,15 @@ void Scene_release(*Scene self) {
     for (i in 0..self.meshes.size) {
         self.meshes.data[i].vertices.release();
         self.meshes.data[i].indices.release();
+        self.meshes.data[i].morph.release();
     }
     for (i in 0..self.textures.size) self.textures.data[i].release();
     self.sky_faces.release();
     for (i in 0..self.nodes.size) {
         String_free(&self.nodes.data[i].name);
         List_free(&self.nodes.data[i].children);
+        List_free(&self.nodes.data[i].joints);
+        List_free(&self.nodes.data[i].weights);
     }
     List_free(&self.nodes);
     List_free(&self.cameras);
@@ -520,6 +545,8 @@ void _scene_kill(*Scene self, int node) {
         g.uniforms.release();
         g.made = false;
     }
+    g.joints.release();
+    g.weights.release();
     for (i in 0..n.children.size) _scene_kill(self, n.children.data[i]);
 }
 
@@ -652,10 +679,53 @@ Result<int, string> Scene_add_geometry(*Scene self, *SceneGeometry geometry) {
     }
     m.indices = ib.value;
     m.index_count = geometry.index_count;
+    m.vertex_count = geometry.vertex_count;
     m.min = geometry.min;
     m.max = geometry.max;
     List_push(&self.meshes, m);
     return Ok<int, string>(self.meshes.size - 1);
+}
+
+// Gives mesh targets morph targets: positions and normals (normals may be null) hold
+// targets * vertex_count * 3 floats each, the delta of target t for vertex v at
+// (t * vertex_count + v) * 3. A node drawing the mesh blends them by its weights
+// (Scene_set_weights).
+Result<int, string> Scene_set_morph_targets(*Scene self, int mesh, *float positions, *float normals, int targets) {
+    if (mesh <= 0 || mesh >= self.meshes.size || positions == null || targets <= 0) return Err<int, string>("scene: bad morph targets");
+    *SceneMesh m = &self.meshes.data[mesh];
+    int64 n = (int64)targets * m.vertex_count;
+    *float d = alloc<float>(n * 8 + 4);
+    defer free(d);
+    for (i in 0..n) {
+        for (k in 0..3) {
+            d[i * 8 + k] = positions[i * 3 + k];
+            d[i * 8 + 4 + k] = normals != null ? normals[i * 3 + k] : 0.0;
+        }
+    }
+    m.morph.release();
+    m.morph = self.gpu.buffer((uint64)(n * 32), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    m.morph.write(0, d, (uint64)(n * 32));
+    m.targets = targets;
+    for (i in 0..self._r.nodes.size) self._r.nodes.data[i].bound_mesh = -1;
+    return Ok<int, string>(0);
+}
+
+// Skins node's mesh with count joint matrices, each a joint's transform times its inverse
+// bind matrix in the space of node's own transform (glTF's joint matrices). The vertex
+// joints index them and the vertex weights blend them. count 0 stops skinning.
+void Scene_set_joints(*Scene self, int node, *Mat4 joints, int count) {
+    if (!_scene_valid(self, node)) return;
+    *SceneNode n = &self.nodes.data[node];
+    List_clear(&n.joints);
+    for (i in 0..count) List_push(&n.joints, joints[i]);
+}
+
+// Sets node's morph target weights, one per target of its mesh.
+void Scene_set_weights(*Scene self, int node, *float weights, int count) {
+    if (!_scene_valid(self, node)) return;
+    *SceneNode n = &self.nodes.data[node];
+    List_clear(&n.weights);
+    for (i in 0..count) List_push(&n.weights, weights[i]);
 }
 
 // Adds a material and returns its id.
@@ -763,6 +833,38 @@ int _scene_gltf_texture(*Scene self, *Gltf g, *SceneGltf out, int ref, bool srgb
     return t.value;
 }
 
+// A glTF texture reference's coordinates as a SceneUv.
+SceneUv _scene_gltf_uv(GltfTextureRef r) {
+    return SceneUv{set: r.texcoord == 1 ? 1 : 0, transform: r.has_transform, offset: r.offset, rotation: r.rotation,
+                   scale: r.tscale};
+}
+
+// Copies what an animation can change in a glTF material (factors and texture transforms)
+// to its scene material.
+void _scene_gltf_material_sync(*SceneMaterial m, *GltfMaterial gm) {
+    m.diffuse = gm.base_color;
+    m.metalness = gm.metallic;
+    m.roughness = gm.roughness;
+    m.emissive = gm.emissive;
+    m.alpha_cutoff = gm.alpha_cutoff;
+    m.uv[SCENE_TEX_DIFFUSE] = _scene_gltf_uv(gm.base_color_texture);
+    m.uv[SCENE_TEX_NORMAL] = _scene_gltf_uv(gm.normal_texture);
+    m.uv[SCENE_TEX_EMISSIVE] = _scene_gltf_uv(gm.emissive_texture);
+    m.uv[SCENE_TEX_METAL_ROUGH] = _scene_gltf_uv(gm.metallic_roughness_texture);
+    m.uv[SCENE_TEX_OCCLUSION] = _scene_gltf_uv(gm.occlusion_texture);
+}
+
+// Whether glTF node gi and its ancestors are all visible (KHR_node_visibility).
+bool _scene_gltf_shown(*Gltf g, int gi) {
+    int guard = 0;
+    while (gi >= 0 && gi < g.nodes.size && guard < 4096) {
+        if (g.nodes.data[gi].hidden) return false;
+        gi = g.nodes.data[gi].parent;
+        guard++;
+    }
+    return true;
+}
+
 void _scene_gltf_node(*Scene self, *Gltf g, *SceneGltf out, int gi, int parent, int default_mat) {
     if (gi < 0 || gi >= g.nodes.size || out.nodes.data[gi] != 0) return;
     *GltfNode gn = &g.nodes.data[gi];
@@ -783,7 +885,13 @@ void _scene_gltf_node(*Scene self, *Gltf g, *SceneGltf out, int gi, int parent, 
             if (sm == 0) continue;
             int gm = mesh.primitives.data[p].material;
             int mat = gm >= 0 && gm < out.materials.size ? out.materials.data[gm] : default_mat;
-            Scene_add_object(self, id, sm, mat);
+            // A skinned primitive's vertices end up in the model's space through its joints,
+            // so it hangs from the model's root rather than from its node.
+            bool skinned = gn.skin >= 0 && gn.skin < g.skins.size && mesh.primitives.data[p].joints != null;
+            int obj = Scene_add_object(self, skinned ? out.root : id, sm, mat);
+            List_push(&out.prim_nodes, obj);
+            List_push(&out.prim_src, gi);
+            List_push(&out.prim_skin, skinned ? gn.skin : -1);
         }
     }
     for (c in 0..gn.children.size) _scene_gltf_node(self, g, out, gn.children.data[c], id, default_mat);
@@ -816,6 +924,7 @@ Result<SceneGltf, string> Scene_add_gltf(*Scene self, *Gltf g, int parent) {
         m.occlusion_texture = _scene_gltf_texture(self, g, &out, gm.occlusion_texture.texture, false);
         m.occlusion_strength = gm.occlusion_texture.scale;
         m.emissive_texture = _scene_gltf_texture(self, g, &out, gm.emissive_texture.texture, true);
+        _scene_gltf_material_sync(&m, gm);
         List_push(&out.materials, Scene_add_material(self, m));
     }
     SceneMaterial dm = scene_material(SCENE_PBR);
@@ -831,16 +940,26 @@ Result<SceneGltf, string> Scene_add_gltf(*Scene self, *Gltf g, int parent) {
                 SceneGeometry geo = scene_gltf_geometry(gp);
                 Result<int, string> made = Scene_add_geometry(self, &geo);
                 geo.free();
-                if (made.ok) id = made.value;
+                if (made.ok) {
+                    id = made.value;
+                    if (gp.target_count > 0 && gp.target_positions != null) {
+                        (void)Scene_set_morph_targets(self, id, gp.target_positions, gp.target_normals, gp.target_count);
+                    }
+                }
             }
             List_push(&out.meshes, id);
         }
     }
     for (i in 0..g.roots.size) _scene_gltf_node(self, g, &out, g.roots.data[i], out.root, default_mat);
+    out.material_version = g.material_version;
+    SceneGltf_pose(&out, self, g);
     return Ok<SceneGltf, string>(out);
 }
 
-// Copies the glTF nodes' current transforms (after Gltf_animate) to their scene nodes.
+// Copies the glTF model's current state (after Gltf_animate) to the scene: the nodes'
+// transforms and visibility (KHR_node_visibility), the joint matrices of skinned meshes,
+// morph target weights, and the material factors and texture transforms animation
+// pointers changed (KHR_animation_pointer).
 void SceneGltf_pose(*SceneGltf self, *Scene scene, *Gltf g) {
     for (i in 0..self.nodes.size) {
         int id = self.nodes.data[i];
@@ -854,6 +973,39 @@ void SceneGltf_pose(*SceneGltf self, *Scene scene, *Gltf g) {
             n.rotation = gn.rotation;
             n.scale = gn.scale;
         }
+        n.visible = !gn.hidden;
+    }
+    *Mat4 world = alloc<Mat4>(g.nodes.size + 1);
+    defer free(world);
+    Gltf_world(g, world);
+    *Mat4 jm = null;
+    int jcap = 0;
+    for (i in 0..self.prim_nodes.size) {
+        int id = self.prim_nodes.data[i];
+        int src = self.prim_src.data[i];
+        int skin = self.prim_skin.data[i];
+        if (!_scene_valid(scene, id) || src < 0 || src >= g.nodes.size) continue;
+        if (skin >= 0) {
+            scene.nodes.data[id].visible = _scene_gltf_shown(g, src);
+            int nj = g.skins.data[skin].joints.size;
+            if (nj > jcap) {
+                if (jm != null) free(jm);
+                jm = alloc<Mat4>(nj);
+                jcap = nj;
+            }
+            Gltf_joint_matrices(g, skin, world, jm);
+            Scene_set_joints(scene, id, jm, nj);
+        }
+        List<float>* w = &g.nodes.data[src].weights;
+        if (w.size > 0) Scene_set_weights(scene, id, w.data, w.size);
+    }
+    if (jm != null) free(jm);
+    if (self.material_version != g.material_version) {
+        self.material_version = g.material_version;
+        for (i in 0..self.materials.size) {
+            if (i >= g.materials.size) break;
+            _scene_gltf_material_sync(Scene_material(scene, self.materials.data[i]), &g.materials.data[i]);
+        }
     }
 }
 
@@ -864,6 +1016,9 @@ void SceneGltf_free(*SceneGltf self) {
     List_free(&self.prim_start);
     List_free(&self.materials);
     List_free(&self.textures);
+    List_free(&self.prim_nodes);
+    List_free(&self.prim_src);
+    List_free(&self.prim_skin);
 }
 
 WGPUBlendState _scene_blend_state(int mode) {
@@ -918,7 +1073,7 @@ Result<int, string> _scene_material_gpu(*Scene self, int id) {
     *_SceneMatGpu g = &self._r.mats.data[id];
     *SceneMaterial m = &self.materials.data[id];
     if (!g.made) {
-        g.uniforms = self.gpu.uniform(null, 80)?;
+        g.uniforms = self.gpu.uniform(null, 272)?;
         Result<GpuBindGroup, string> bg = self._r.mat_layout.group();
         if (!bg.ok) {
             g.uniforms.release();
@@ -940,12 +1095,35 @@ Result<int, string> _scene_material_gpu(*Scene self, int id) {
     }
     bool has_normal = m.normal_texture > 0 && m.lighting != SCENE_CONSTANT;
     bool has_occ = m.occlusion_texture > 0;
-    float[20] u = {m.diffuse.x, m.diffuse.y, m.diffuse.z, m.diffuse.w,
+    float[68] u = {m.diffuse.x, m.diffuse.y, m.diffuse.z, m.diffuse.w,
         m.specular.x, m.specular.y, m.specular.z, m.shininess,
         m.emissive.x, m.emissive.y, m.emissive.z, m.alpha_cutoff,
         m.metalness, m.roughness, has_normal ? m.normal_scale : 0.0, has_occ ? m.occlusion_strength : 0.0,
         m.diffuse_intensity, 0.0, 0.0, 0.0};
-    g.uniforms.write(0, &u, 80);
+    // Each texture's coordinates: (a, b, c, d) and (tx, ty, set), u' = a u + b v + tx,
+    // v' = c u + d v + ty, as KHR_texture_transform's T * R * S.
+    for (k in 0..6) {
+        *float f = &u[20 + k * 8];
+        SceneUv t = m.uv[k];
+        float c = 1.0;
+        float sn = 0.0;
+        float sx = 1.0;
+        float sy = 1.0;
+        if (t.transform) {
+            c = (float)cos((double)t.rotation);
+            sn = (float)sin((double)t.rotation);
+            sx = t.scale.x;
+            sy = t.scale.y;
+            f[4] = t.offset.x;
+            f[5] = t.offset.y;
+        }
+        f[0] = c * sx;
+        f[1] = sn * sy;
+        f[2] = -sn * sx;
+        f[3] = c * sy;
+        f[6] = t.set == 1 ? 1.0 : 0.0;
+    }
+    g.uniforms.write(0, &u, 272);
     return Ok<int, string>(0);
 }
 
@@ -960,8 +1138,44 @@ Result<int, string> _scene_node_gpu(*Scene self, int id) {
     }
     g.group = bg.value;
     g.group.buffer(0, &g.uniforms);
+    for (b in 1..4) g.group.buffer((uint32)b, &self._r.no_storage);
+    g.bound_mesh = -1;
     g.made = true;
     return Ok<int, string>(0);
+}
+
+// Uploads node's joints and weights and binds its mesh's morph targets; returns whether
+// it skins and how many targets it blends.
+Result<int, string> _scene_node_deform(*Scene self, int id, int mesh, *bool skinned) {
+    *_SceneNodeGpu g = &self._r.nodes.data[id];
+    *SceneNode n = &self.nodes.data[id];
+    *SceneMesh m = &self.meshes.data[mesh];
+    *skinned = n.joints.size > 0;
+    if (n.joints.size > 0) {
+        uint64 bytes = (uint64)n.joints.size * 64;
+        if (g.joints.handle == null || g.joints.size < bytes) {
+            g.joints.release();
+            g.joints = self.gpu.buffer(bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+            g.group.buffer(1, &g.joints);
+        }
+        g.joints.write(0, n.joints.data, bytes);
+    }
+    int targets = m.targets < n.weights.size ? m.targets : n.weights.size;
+    if (targets > 0) {
+        uint64 bytes = (uint64)n.weights.size * 4;
+        if (bytes < 16) bytes = 16;
+        if (g.weights.handle == null || g.weights.size < bytes) {
+            g.weights.release();
+            g.weights = self.gpu.buffer(bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+            g.group.buffer(3, &g.weights);
+        }
+        g.weights.write(0, n.weights.data, (uint64)n.weights.size * 4);
+    }
+    if (g.bound_mesh != mesh) {
+        g.group.buffer(2, m.targets > 0 ? &m.morph : &self._r.no_storage);
+        g.bound_mesh = mesh;
+    }
+    return Ok<int, string>(targets);
 }
 
 float _scene_max_scale(Mat4 m) {
@@ -1295,6 +1509,11 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
         u.normal = inv.transpose();
         _scene_draw_lights(self, d, &u);
         u.info[1] = n.receives_shadows ? 1.0 : 0.0;
+        bool skinned = false;
+        int targets = _scene_node_deform(self, d.node, d.mesh, &skinned)?;
+        u.info[2] = skinned ? 1.0 : 0.0;
+        u.morph[0] = (float)self.meshes.data[d.mesh].vertex_count;
+        u.morph[1] = (float)targets;
         r.nodes.data[d.node].uniforms.write(0, &u, sizeof(_SceneDrawU));
     }
     for (i in 0..self.materials.size) {
