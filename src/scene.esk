@@ -83,8 +83,9 @@ SceneCamera scene_orthographic(float height, float near, float far) {
 // Scene_update or render. A node that is not visible hides its whole subtree. mesh,
 // material and camera are ids (0, 0 and -1 when it has none); casts_shadows and
 // receives_shadows choose its part in shadows, and light_mask the lights that reach it
-// (SceneLight.influence). alive is false once the node is removed. Change parent and
-// children through Scene_set_parent and Scene_remove, not by hand.
+// (SceneLight.influence). ignore_events keeps the node's mesh out of hit tests
+// (<scene/input>): rays pass through it. alive is false once the node is removed. Change
+// parent and children through Scene_set_parent and Scene_remove, not by hand.
 struct SceneNode {
     String name;
     int parent;
@@ -100,6 +101,7 @@ struct SceneNode {
     bool casts_shadows;
     bool receives_shadows;
     uint32 light_mask;
+    bool ignore_events;
     Mat4 world;
     List<Mat4> joints;
     List<float> weights;
@@ -1216,8 +1218,10 @@ int _scene_draw_order(*_SceneDraw a, *_SceneDraw b) {
     return a.node - b.node;
 }
 
-void _scene_camera(*Scene self, uint32 width, uint32 height) {
-    *_SceneRenderer r = &self._r;
+// The matrices the scene's camera renders a width x height target with: view (world to
+// camera), proj (camera to clip space) and the camera node's world matrix (the
+// identity for the default camera). Read after Scene_update or a render.
+void Scene_camera_matrices(*Scene self, uint32 width, uint32 height, *Mat4 view, *Mat4 proj, *Mat4 camera_world) {
     SceneCamera cam = scene_perspective(1.0, 0.1, 100.0);
     Mat4 world = mat4_identity();
     *SceneCamera c = Scene_camera(self, self.camera);
@@ -1228,15 +1232,30 @@ void _scene_camera(*Scene self, uint32 width, uint32 height) {
     float aspect = cam.aspect > 0.0 ? cam.aspect : (float)width / (float)(height > 0 ? height : (uint32)1);
     float near = cam.near > 0.0 ? cam.near : 0.1;
     float far = cam.far > near ? cam.far : near * 1000.0;
-    Mat4 proj;
-    r.ortho = cam.projection == SCENE_ORTHOGRAPHIC;
-    if (r.ortho) {
+    if (cam.projection == SCENE_ORTHOGRAPHIC) {
         float h = cam.height > 0.0 ? cam.height * 0.5 : 1.0;
-        proj = mat4_ortho(-h * aspect, h * aspect, -h, h, near, far);
+        *proj = mat4_ortho(-h * aspect, h * aspect, -h, h, near, far);
     } else {
-        proj = mat4_perspective(cam.fov > 0.0 ? cam.fov : 1.0, aspect, near, far);
+        *proj = mat4_perspective(cam.fov > 0.0 ? cam.fov : 1.0, aspect, near, far);
     }
-    r.view_proj = proj * world.inverse();
+    *view = world.inverse();
+    *camera_world = world;
+}
+
+// True when the scene's camera is orthographic.
+bool Scene_camera_is_ortho(*Scene self) {
+    *SceneCamera c = Scene_camera(self, self.camera);
+    return c != null && _scene_valid(self, self.camera) && c.projection == SCENE_ORTHOGRAPHIC;
+}
+
+void _scene_camera(*Scene self, uint32 width, uint32 height) {
+    *_SceneRenderer r = &self._r;
+    Mat4 view;
+    Mat4 proj;
+    Mat4 world;
+    Scene_camera_matrices(self, width, height, &view, &proj, &world);
+    r.ortho = Scene_camera_is_ortho(self);
+    r.view_proj = proj * view;
     r.eye = Vec3{world.m[12], world.m[13], world.m[14]};
     r.forward = (Vec3{-world.m[8], -world.m[9], -world.m[10]}).normalize();
 }
