@@ -5,7 +5,7 @@
 // light, that ground is dark while open ground keeps cos(45) of the light;
 // half opacity leaves half the light; a node that does not cast (or a ground
 // that does not receive) brings the light back; a second shadowed light uses
-// the second layer of the map array.
+// the second layer of the map array; a spot light's shadow (perspective, as wide as its cone).
 import <io>;
 import <mem>;
 import <libc>;
@@ -117,6 +117,24 @@ Result<int, string> run() {
         (double)at(px, 1.0, 0.0), (double)at(px, -1.0, 0.0));
     check("two shadowed lights: open ground gets both", near(at(px, 0.0, 1.6), lit * 2.0, 0.02));
     check("two shadowed lights: each shadow keeps the other light", near(at(px, 1.0, 0.0), lit, 0.02) && near(at(px, -1.0, 0.0), lit, 0.02));
+
+    // a spot light 3 above the ground pointing down (ViroReact's spot shadows): the box's
+    // shadow spreads to x 0.79 around it; the rest of the cone, out to its edge, stays lit
+    for (i in 0..scene.lights.size) scene.light(i).enabled = false;
+    SceneLight spot = scene_spot(Vec3{0.0, 3.0, 0.0}, Vec3{0.0, -1.0, 0.0}, Vec3{1.0, 1.0, 1.0}, 1.0, 0.5, 0.6, 0.0, 10.0);
+    int sp = scene.add_light(spot);
+    frame(&scene, &target, px)?;
+    float near_off = at(px, 0.65, 0.0);
+    float mid_off = at(px, 1.2, 0.0);
+    float edge_off = at(px, 1.8, 0.0);
+    scene.light(sp).casts_shadows = true;
+    frame(&scene, &target, px)?;
+    printf("  spot: beside the box %.3f -> %.3f, open %.3f -> %.3f, cone edge %.3f -> %.3f\n", (double)near_off,
+        (double)at(px, 0.65, 0.0), (double)mid_off, (double)at(px, 1.2, 0.0), (double)edge_off, (double)at(px, 1.8, 0.0));
+    check("spot: lit before the shadow", near_off > 0.1);
+    check("spot: the box's shadow", at(px, 0.65, 0.0) < 0.02 && at(px, -0.65, 0.3) < 0.02);
+    check("spot: open ground keeps its light", near(at(px, 1.2, 0.0), mid_off, 0.01));
+    check("spot: the shadow frustum covers the cone", edge_off > 0.01 && near(at(px, 1.8, 0.0), edge_off, 0.01));
     return Ok<int, string>(0);
 }
 
