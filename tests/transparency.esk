@@ -6,6 +6,7 @@
 // - each blend mode over a gray background against its formula.
 // - node opacity on opaque and blended materials, multiplied down the tree.
 // - rendering order with and without the depth test.
+// - texture wrap and filter settings.
 // - a texture with a cut-out quadrant under the MASK alpha mode.
 import <io>;
 import <mem>;
@@ -194,6 +195,32 @@ Result<int, string> run() {
     expect("texture: top right cut out", pixel(px, 24, 8), Vec3{0.0, 0.3, 0.0});
     expect("texture: bottom left blue", pixel(px, 8, 24), Vec3{0.0, 0.0, 1.0});
     expect("texture: bottom right white", pixel(px, 24, 24), Vec3{1.0, 1.0, 1.0});
+
+    // sampler settings: a 2x1 texture, red then blue, repeated twice across the quad
+    uint8[8] two = {255, 0, 0, 255, 0, 0, 255, 255};
+    GpuImageOptions lin = GpuImageOptions{srgb: false};
+    GpuTexture tex2 = gpu.image_with(2, 1, &two[0], &lin)?;
+    SceneMaterial wm = scene_material(SCENE_CONSTANT);
+    wm.diffuse_texture = scene.add_texture(tex2);
+    wm.uv[SCENE_TEX_DIFFUSE].transform = true;
+    wm.uv[SCENE_TEX_DIFFUSE].scale = Vec2{2.0, 1.0};
+    wm.filter = SCENE_FILTER_NEAREST;
+    scene.background = Vec4{0.0, 0.0, 0.0, 1.0};
+    int wq = scene.add_object(0, quad, scene.add_material(wm));
+    scene.node(wq).position = Vec3{0.0, 0.0, 1.0};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("repeat: third quarter red again", pixel(px, 20, 16), Vec3{1.0, 0.0, 0.0});
+    expect("nearest: no blend inside the first texel", pixel(px, 6, 16), Vec3{1.0, 0.0, 0.0});
+    scene.material(scene.node(wq).material).wrap_s = SCENE_WRAP_CLAMP;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("clamp: the right half stays blue", pixel(px, 20, 16), Vec3{0.0, 0.0, 1.0});
+    scene.material(scene.node(wq).material).wrap_s = SCENE_WRAP_MIRROR;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("mirror: the third quarter is blue", pixel(px, 20, 16), Vec3{0.0, 0.0, 1.0});
+    expect("mirror: the last quarter is red", pixel(px, 28, 16), Vec3{1.0, 0.0, 0.0});
     return Ok<int, string>(0);
 }
 
