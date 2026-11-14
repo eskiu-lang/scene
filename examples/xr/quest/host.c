@@ -6,7 +6,6 @@
 #include <android/asset_manager.h>
 #include <android/log.h>
 #include <fcntl.h>
-#include <media/NdkImageReader.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaExtractor.h>
 #include <pthread.h>
@@ -17,6 +16,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <vulkan/vulkan.h>
@@ -119,12 +119,16 @@ static void xr_copy_assets(struct android_app *app, char *dir, size_t cap) {
 // xr_scene.esk's video scene
 #define XR_VIDEO_SCENE 4
 
-// The video scene's player: video.mp4 decoded by MediaCodec into an ImageReader as RGBA,
-// looping, on a thread of its own that runs only while the video scene is shown; the frame
-// loop hands the latest image to the scene.
-static AImageReader *xr_vreader;
+// The video scene's player: video.mp4 decoded by MediaCodec into buffers (YUV 4:2:0, which
+// devices hand over as NV12 or I420; a Quest's decoder writes a tiled format a surface reader
+// cannot take), converted to RGBA on a thread of its own that runs only while the video scene
+// is shown; the frame loop hands the latest frame to the scene.
 static AMediaCodec *xr_vcodec;
 static AMediaExtractor *xr_vext;
+static pthread_mutex_t xr_vlock = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *xr_vrgba;
+static int32_t xr_vw, xr_vh;
+static bool xr_vnew;
 
 static double xr_now(void) {
     struct timespec t;
@@ -132,10 +136,32 @@ static double xr_now(void) {
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }
 
+static uint8_t clamp8(int v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+
+// BT.601 limited range, as decoders give it.
+static void yuv_to_rgba(const uint8_t *y, int ys, const uint8_t *u, const uint8_t *v, int cs, int step,
+                        int w, int h, uint8_t *out) {
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            int Y = y[j * ys + i] - 16;
+            int U = u[(j / 2) * cs + (i / 2) * step] - 128;
+            int V = v[(j / 2) * cs + (i / 2) * step] - 128;
+            int c = 298 * Y;
+            uint8_t *p = out + ((size_t)j * w + i) * 4;
+            p[0] = clamp8((c + 409 * V + 128) >> 8);
+            p[1] = clamp8((c - 100 * U - 208 * V + 128) >> 8);
+            p[2] = clamp8((c + 516 * U + 128) >> 8);
+            p[3] = 255;
+        }
+    }
+}
+
 static void *xr_video_thread(void *arg) {
     (void)arg;
     double start = xr_now(), paused_at = 0;
     bool input_done = false;
+    int32_t w = 0, h = 0, stride = 0, slice = 0, color = 21;
+    uint8_t *rgba = NULL;
     for (;;) {
         if (xr_scene_current() != XR_VIDEO_SCENE) {
             if (paused_at == 0) paused_at = xr_now();
@@ -163,11 +189,53 @@ static void *xr_video_thread(void *arg) {
         }
         AMediaCodecBufferInfo info;
         ssize_t out = AMediaCodec_dequeueOutputBuffer(xr_vcodec, &info, 2000);
-        if (out >= 0) {
+        if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+            AMediaFormat *f = AMediaCodec_getOutputFormat(xr_vcodec);
+            AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_WIDTH, &w);
+            AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_HEIGHT, &h);
+            if (!AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_STRIDE, &stride)) stride = w;
+            if (!AMediaFormat_getInt32(f, "slice-height", &slice)) slice = h;
+            AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_COLOR_FORMAT, &color);
+            int32_t l = 0, t = 0, r = 0, b = 0;
+            if (AMediaFormat_getRect(f, "crop", &l, &t, &r, &b)) {
+                w = r - l + 1;
+                h = b - t + 1;
+            }
+            if (stride < w) stride = w;
+            if (slice < h) slice = h;
+            AMediaFormat_delete(f);
+            free(rgba);
+            rgba = malloc((size_t)w * h * 4);
+            LOG("video: decoding %dx%d, stride %d, slice %d, color %d", w, h, stride, slice, color);
+        } else if (out >= 0) {
             double due = start + (double)info.presentationTimeUs * 1e-6;
             double wait = due - xr_now();
             if (wait > 0 && wait < 1.0) usleep((useconds_t)(wait * 1e6));
-            AMediaCodec_releaseOutputBuffer(xr_vcodec, (size_t)out, info.size > 0);
+            size_t size;
+            uint8_t *data = AMediaCodec_getOutputBuffer(xr_vcodec, (size_t)out, &size);
+            if (data && rgba && info.size > 0 && (size_t)stride * slice * 3 / 2 <= size) {
+                const uint8_t *y = data + info.offset;
+                const uint8_t *c = y + (size_t)stride * slice;
+                if (color == 19) {
+                    // I420: U then V, each a quarter
+                    const uint8_t *v = c + (size_t)(stride / 2) * (slice / 2);
+                    yuv_to_rgba(y, stride, c, v, stride / 2, 1, w, h, rgba);
+                } else {
+                    // NV12: U and V interleaved
+                    yuv_to_rgba(y, stride, c, c + 1, stride, 2, w, h, rgba);
+                }
+                pthread_mutex_lock(&xr_vlock);
+                if (xr_vrgba == NULL || xr_vw != w || xr_vh != h) {
+                    free(xr_vrgba);
+                    xr_vrgba = malloc((size_t)w * h * 4);
+                    xr_vw = w;
+                    xr_vh = h;
+                }
+                memcpy(xr_vrgba, rgba, (size_t)w * h * 4);
+                xr_vnew = true;
+                pthread_mutex_unlock(&xr_vlock);
+            }
+            AMediaCodec_releaseOutputBuffer(xr_vcodec, (size_t)out, false);
             if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
                 // loop
                 AMediaCodec_flush(xr_vcodec);
@@ -197,15 +265,11 @@ static void xr_video_start(const char *dir) {
             AMediaFormat_delete(fmt);
             continue;
         }
-        int32_t w = 0, h = 0;
-        AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, &w);
-        AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, &h);
         AMediaExtractor_selectTrack(xr_vext, i);
-        if (AImageReader_new(w, h, AIMAGE_FORMAT_RGBA_8888, 3, &xr_vreader) != AMEDIA_OK) return;
-        ANativeWindow *win = NULL;
-        AImageReader_getWindow(xr_vreader, &win);
+        // COLOR_FormatYUV420Flexible: buffers in a YUV 4:2:0 layout the CPU can read
+        AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, 0x7F420888);
         xr_vcodec = AMediaCodec_createDecoderByType(mime);
-        if (xr_vcodec == NULL || AMediaCodec_configure(xr_vcodec, fmt, win, NULL, 0) != AMEDIA_OK
+        if (xr_vcodec == NULL || AMediaCodec_configure(xr_vcodec, fmt, NULL, NULL, 0) != AMEDIA_OK
                 || AMediaCodec_start(xr_vcodec) != AMEDIA_OK) {
             LOG("video: no decoder for %s", mime);
             return;
@@ -213,24 +277,19 @@ static void xr_video_start(const char *dir) {
         AMediaFormat_delete(fmt);
         pthread_t t;
         pthread_create(&t, NULL, xr_video_thread, NULL);
-        LOG("video: %s %dx%d", mime, w, h);
+        LOG("video: %s", mime);
         return;
     }
 }
 
 static void xr_video_frame(void) {
-    if (xr_vreader == NULL || xr_scene_current() != XR_VIDEO_SCENE) return;
-    AImage *img = NULL;
-    if (AImageReader_acquireLatestImage(xr_vreader, &img) != AMEDIA_OK || img == NULL) return;
-    uint8_t *data = NULL;
-    int len = 0, stride = 0;
-    int32_t w = 0, h = 0;
-    AImage_getPlaneData(img, 0, &data, &len);
-    AImage_getPlaneRowStride(img, 0, &stride);
-    AImage_getWidth(img, &w);
-    AImage_getHeight(img, &h);
-    if (data) xr_scene_video_frame(data, (uint32_t)w, (uint32_t)h, (uint32_t)stride, false);
-    AImage_delete(img);
+    if (xr_scene_current() != XR_VIDEO_SCENE) return;
+    pthread_mutex_lock(&xr_vlock);
+    if (xr_vnew && xr_vrgba) {
+        xr_scene_video_frame(xr_vrgba, (uint32_t)xr_vw, (uint32_t)xr_vh, (uint32_t)xr_vw * 4, false);
+        xr_vnew = false;
+    }
+    pthread_mutex_unlock(&xr_vlock);
 }
 
 static XrPath path(Xr *xr, const char *s) {
