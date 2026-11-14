@@ -70,7 +70,7 @@ Each test renders small images and reads them back:
 | `tests/transparency.esk` | back-to-front order of two transparent quads whatever order they were added, an opaque quad between them, each blend mode against its formula, node opacity on opaque and blended materials and down the tree, a texture with a masked quadrant |
 | `tests/post.esk` | each tone mapping operator at three exposures against `scene_tone_map`, sRGB encoding by the shader and by an sRGB target, bloom spreading and fading, its strength and threshold |
 | `tests/sky.esk` | background color, skybox faces by view direction, sky intensity, six-image orientation, image-based lighting from a constant environment against its expected value, a 360 image by direction and turned by `sky_rotation` |
-| `tests/shadows.esk` | a box's shadow on the ground where geometry puts it, opacity, nodes that do not cast or receive, two shadowed lights |
+| `tests/shadows.esk` | a box's shadow on the ground where geometry puts it, opacity, nodes that do not cast or receive, two shadowed lights, a spot light's shadow over its whole cone |
 | `tests/gltf.esk` | a glTF model's node tree, transforms, unlit material and pose updates |
 | `tests/animation.esk` | the easing curves against ViroReact's formulas, Euler order, groups with delays, serial and parallel chains, a skipped frame, ViroReact's property strings, relative values across loops, opacity, color, pause, resume, stop |
 | `tests/input.esk` | screen rays against the camera's field of view, hits on rotated, scaled and nested nodes, hidden and `ignore_events` nodes, bubbling to a handler, click states, fixed-distance and plane drags, pinch, rotation, hover hysteresis, fuse |
@@ -82,7 +82,7 @@ These ViroReact renderer features are planned for later versions:
 - Extruded 3D text, outlined and drop-shadow text strokes, and Knuth-Plass line breaks for justified text.
 - Post effects beyond ViroReact's (color grading, vignette, depth of field, SSAO), and its swirl and zoom distortions.
 - Shader modifiers (user WGSL inserted into the generated shaders).
-- Shadows from spot and point lights, and cascaded shadow maps for large scenes.
+- Cascaded shadow maps for large scenes, and shadows from point lights (ViroReact has neither).
 - Instanced drawing.
 
 ## Contributing

@@ -33,7 +33,7 @@ pipeline.
   masked and blended alpha with six blend modes, double-sided surfaces. One WGSL shader is
   composed and cached per variant.
 - **Lights.** Ambient, directional, point (with start and end distances) and spot (inner
-  and outer cones), up to 8 per draw, and directional shadow maps with soft edges.
+  and outer cones), up to 8 per draw, and directional and spot shadow maps with soft edges.
 - **HDR.** Linear RGBA16Float rendering, transparent surfaces sorted back to front,
   Reinhard, exposure and Hable tone mapping, bloom, ViroReact's post effects, and sRGB
   output.

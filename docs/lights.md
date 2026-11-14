@@ -1,6 +1,6 @@
 # Lights and shadows
 
-`<scene/light>`: ambient, directional, point and spot lights, and directional shadow maps.
+`<scene/light>`: ambient, directional, point and spot lights, and directional and spot shadow maps.
 
 API reference: [`<scene/light>`](api.md#scenelight).
 
@@ -67,4 +67,9 @@ texels. `shadow_opacity` (1) blends between no shadow and a black one; ambient l
 shadowed. Nodes with `receives_shadows` false ignore shadows. Points outside the light's box
 are lit.
 
-Point and spot lights do not cast shadows yet.
+Spot lights with `casts_shadows` take a layer too, as in ViroReact: their light sees a
+square perspective view from its position down its direction, as wide as its outer cone,
+from `shadow_near` (0.1) to `shadow_far` (20), ViroReact's `shadowNearZ` and `shadowFarZ`.
+`shadow_bias` is then in that view's depth, which is not linear, and the normal offset is
+sized for a texel halfway down the attenuation range. Point lights cast no shadows, as in
+ViroReact.

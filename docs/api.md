@@ -1560,6 +1560,8 @@ struct SceneLight {
     float shadow_opacity;
     float shadow_radius;
     Vec3 shadow_center;
+    float shadow_near;
+    float shadow_far;
 }
 ```
 
@@ -1574,11 +1576,15 @@ A light:
 - inner_angle and outer_angle (spot): angles from the axis in radians; full strength
   inside the inner one, fading to none at the outer one.
 - influence: a bit mask; the light reaches nodes whose light_mask shares a bit.
-- casts_shadows (directional): the light gets a layer of the scene's shadow map array
+- casts_shadows (directional and spot, as in ViroReact): the light gets a layer of the
+  scene's shadow map array
   (Scene.shadow_size texels square), compared with shadow_bias (in the light box's
   depth units) after moving the point shadow_normal_bias texels along its normal; shadow_opacity 1 is a black
   shadow, 0 none. shadow_radius > 0 sets the cube the light sees (half-size, around
-  shadow_center, in world space); 0 fits the visible nodes.
+  shadow_center, in world space); 0 fits the visible nodes. A spot light's shadow is a
+  perspective view down its direction as wide as its outer cone, from shadow_near (0.1)
+  to shadow_far (20), ViroReact's shadowNearZ and shadowFarZ; shadow_bias is then in
+  that view's (nonlinear) depth.
 
 ### scene_ambient
 
