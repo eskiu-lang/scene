@@ -257,8 +257,9 @@ struct _SceneRenderer {
 }
 
 // A scene and its renderer. background is the linear color behind everything when there
-// is no skybox; skybox (with sky_intensity, and sky_flip for a cube of six images) is
-// set by Scene_set_skybox or Scene_set_skybox_faces; ibl by Scene_set_ibl; post holds
+// is no skybox; skybox (with sky_intensity, and sky_flip for a cube of six images, sky_pano
+// for a 360 image) is set by Scene_set_skybox, Scene_set_skybox_faces, Scene_set_sky_360 or
+// Scene_load_sky_360, and sky_rotation turns it; ibl by Scene_set_ibl; post holds
 // the tone mapping, gamma and bloom settings; shadow_size is the width and height of each
 // shadow map (2048). camera is the node of the camera that renders (-1 is a default camera
 // at the origin looking down -Z). The lists are the scene's objects by id.
@@ -276,6 +277,8 @@ struct Scene {
     float sky_intensity;
     bool sky_flip;
     GpuTexture sky_faces;
+    bool sky_pano;
+    Quat sky_rotation;
     *GpuIbl ibl;
     ScenePost post;
     uint32 shadow_size;
@@ -390,6 +393,7 @@ Result<Scene, string> Gpu_scene(*Gpu self) {
     s.camera = -1;
     s.background = Vec4{0.0, 0.0, 0.0, 1.0};
     s.sky_intensity = 1.0;
+    s.sky_rotation = quat_identity();
     s.post.gamma = true;
     s.shadow_size = 2048;
     _scene_new_node(&s, -1, "root");
@@ -930,6 +934,7 @@ int Scene_add_light(*Scene self, SceneLight light) {
 void Scene_set_skybox(*Scene self, *GpuTexture cube) {
     self.skybox = cube;
     self.sky_flip = false;
+    self.sky_pano = false;
 }
 
 // Makes a cube from six square images (+X, -X, +Y, -Y, +Z, -Z, see scene_cube_faces) and
@@ -940,6 +945,30 @@ Result<int, string> Scene_set_skybox_faces(*Scene self, *Bitmap faces) {
     self.sky_faces = t;
     self.skybox = &self.sky_faces;
     self.sky_flip = true;
+    self.sky_pano = false;
+    return Ok<int, string>(0);
+}
+
+// Shows a 360 image behind the scene (ViroReact's Viro360Image): equirectangular, its
+// center straight ahead down -Z and its top row straight up, scaled by sky_intensity and
+// turned by sky_rotation. The texture stays the caller's (an sRGB image texture with
+// mipmaps, or an HDR one from <gpu/ibl>'s loaders).
+void Scene_set_sky_360(*Scene self, *GpuTexture equirect) {
+    self.skybox = equirect;
+    self.sky_flip = false;
+    self.sky_pano = true;
+}
+
+// Loads a 360 image from a PNG or JPEG file into a texture the scene keeps, and shows it
+// as with Scene_set_sky_360.
+Result<int, string> Scene_load_sky_360(*Scene self, string path) {
+    Bitmap img = image_load(path)?;
+    defer img.free();
+    GpuImageOptions o = GpuImageOptions{srgb: true, mipmaps: true};
+    GpuTexture t = self.gpu.image_with(img.width, img.height, img.rgba, &o)?;
+    self.sky_faces.release();
+    self.sky_faces = t;
+    Scene_set_sky_360(self, &self.sky_faces);
     return Ok<int, string>(0);
 }
 
@@ -1785,14 +1814,14 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     for (i in 0..r.draws.size) {
         *_SceneDraw d = &r.draws.data[i];
         if (d.blend && !sky_drawn) {
-            if (self.skybox != null) _scene_sky_draw(&r.sky, &pass, self.skybox, r.view_proj, self.sky_intensity, self.sky_flip);
+            if (self.skybox != null) _scene_sky_draw(&r.sky, &pass, self.skybox, self.sky_pano, r.view_proj, self.sky_rotation, self.sky_intensity, self.sky_flip);
             sky_drawn = true;
         }
         if (!d.in_view) continue;
         *GpuPipeline p = _scene_pipeline(self, d.key)?;
         _scene_draw(self, &pass, d, p);
     }
-    if (!sky_drawn && self.skybox != null) _scene_sky_draw(&r.sky, &pass, self.skybox, r.view_proj, self.sky_intensity, self.sky_flip);
+    if (!sky_drawn && self.skybox != null) _scene_sky_draw(&r.sky, &pass, self.skybox, self.sky_pano, r.view_proj, self.sky_rotation, self.sky_intensity, self.sky_flip);
     pass.end()?;
     return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post);
 }

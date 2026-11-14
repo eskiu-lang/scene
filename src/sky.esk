@@ -1,8 +1,9 @@
 // sky.esk: the background of a scene (`<scene/sky>`).
 //
-// Behind everything a scene shows a solid color (Scene.background) or a cube
-// map: an environment from `<gpu/ibl>` (GpuIbl.environment, radiance by
-// direction) with Scene_set_skybox, or six images with Scene_set_skybox_faces.
+// Behind everything a scene shows a solid color (Scene.background), a cube
+// map (an environment from `<gpu/ibl>`, GpuIbl.environment, with Scene_set_skybox,
+// or six images with Scene_set_skybox_faces), or a 360 image, equirectangular, with
+// Scene_set_sky_360 (ViroReact's Viro360Image). Scene.sky_rotation turns it.
 //
 //     GpuIbl ibl = gpu.ibl(&sky_hdr, null)?;
 //     scene.set_skybox(&ibl.environment);
@@ -47,10 +48,9 @@ Result<GpuTexture, string> scene_cube_faces(*Gpu gpu, *Bitmap faces) {
     return Ok<GpuTexture, string>(t);
 }
 
-string _scene_sky_wgsl =
-    "struct Sky { inv_vp: mat4x4<f32>, params: vec4<f32> };\n"
+string _scene_sky_head =
+    "struct Sky { inv_vp: mat4x4<f32>, rot: mat4x4<f32>, params: vec4<f32> };\n"
     "@group(0) @binding(0) var<uniform> sky: Sky;\n"
-    "@group(0) @binding(1) var cube: texture_cube<f32>;\n"
     "@group(0) @binding(2) var samp: sampler;\n"
     "struct V { @builtin(position) pos: vec4<f32>, @location(0) ndc: vec2<f32> };\n"
     "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
@@ -60,12 +60,34 @@ string _scene_sky_wgsl =
     "    o.ndc = p;\n"
     "    return o;\n"
     "}\n"
-    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "fn sky_dir(v: V) -> vec3<f32> {\n"
     "    let far = sky.inv_vp * vec4<f32>(v.ndc, 1.0, 1.0);\n"
     "    let near = sky.inv_vp * vec4<f32>(v.ndc, 0.0, 1.0);\n"
-    "    var d = normalize(far.xyz / far.w - near.xyz / near.w);\n"
+    "    return (sky.rot * vec4<f32>(normalize(far.xyz / far.w - near.xyz / near.w), 0.0)).xyz;\n"
+    "}\n";
+
+string _scene_sky_cube_wgsl =
+    "@group(0) @binding(1) var cube: texture_cube<f32>;\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    var d = sky_dir(v);\n"
     "    if (sky.params.y > 0.5) { d.z = -d.z; }\n"
     "    return vec4<f32>(textureSample(cube, samp, d).rgb * sky.params.x, 1.0);\n"
+    "}\n";
+
+// An equirectangular image: longitude across, latitude down, its center straight ahead
+// down -Z, +Y at the top row. The mip level comes from the longitude that is continuous
+// across the pixel, so the seam at the back does not pick the smallest mip.
+string _scene_sky_360_wgsl =
+    "@group(0) @binding(1) var pano: texture_2d<f32>;\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    let d = normalize(sky_dir(v));\n"
+    "    let pi = 3.14159265358979;\n"
+    "    let uv = vec2<f32>(0.5 + atan2(d.x, -d.z) / (2.0 * pi), acos(clamp(d.y, -1.0, 1.0)) / pi);\n"
+    "    let u2 = fract(uv.x + 0.5) - 0.5;\n"
+    "    let wrap = fwidth(u2) < fwidth(uv.x);\n"
+    "    let gx = vec2<f32>(select(dpdx(uv.x), dpdx(u2), wrap), dpdx(uv.y));\n"
+    "    let gy = vec2<f32>(select(dpdy(uv.x), dpdy(u2), wrap), dpdy(uv.y));\n"
+    "    return vec4<f32>(textureSampleGrad(pano, samp, uv, gx, gy).rgb * sky.params.x, 1.0);\n"
     "}\n";
 
 struct _SceneSkyGpu {
@@ -76,6 +98,24 @@ struct _SceneSkyGpu {
     GpuBindGroup group;
     GpuSampler samp;
     WGPUTextureView bound;
+    GpuBindLayout layout360;
+    GpuPipeline pipe360;
+    GpuBindGroup group360;
+    GpuSampler samp360;
+    WGPUTextureView bound360;
+}
+
+Result<GpuPipeline, string> _scene_sky_pipe(*Gpu gpu, *GpuBindLayout layout, string body) {
+    String src;
+    defer src.free();
+    src.append(_scene_sky_head);
+    src.append(body);
+    *GpuBindLayout[1] groups = {layout};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: "fs",
+        format: WGPUTextureFormat_RGBA16Float, groups: &groups[0], group_count: 1, depth: true,
+        depth_format: WGPUTextureFormat_Depth32Float, depth_compare: WGPUCompareFunction_LessEqual,
+        depth_read_only: true};
+    return gpu.pipeline(&d);
 }
 
 Result<int, string> _scene_sky_make(*_SceneSkyGpu self, *Gpu gpu) {
@@ -83,13 +123,19 @@ Result<int, string> _scene_sky_make(*_SceneSkyGpu self, *Gpu gpu) {
     self.layout.uniform(0, WGPUShaderStage_Fragment);
     self.layout.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_Cube);
     self.layout.sampler(2, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
-    *GpuBindLayout[1] groups = {&self.layout};
-    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_sky_wgsl, vertex: "vs", fragment: "fs",
-        format: WGPUTextureFormat_RGBA16Float, groups: &groups[0], group_count: 1, depth: true,
-        depth_format: WGPUTextureFormat_Depth32Float, depth_compare: WGPUCompareFunction_LessEqual,
-        depth_read_only: true};
-    self.pipe = gpu.pipeline(&d)?;
-    self.uniforms = gpu.uniform(null, 80)?;
+    self.pipe = _scene_sky_pipe(gpu, &self.layout, _scene_sky_cube_wgsl)?;
+    self.layout360 = gpu.bind_layout();
+    self.layout360.uniform(0, WGPUShaderStage_Fragment);
+    self.layout360.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_2D);
+    self.layout360.sampler(2, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+    self.pipe360 = _scene_sky_pipe(gpu, &self.layout360, _scene_sky_360_wgsl)?;
+    self.uniforms = gpu.uniform(null, 144)?;
+    GpuSamplerOptions so360 = GpuSamplerOptions{mipmaps: true, wrap_u: WGPUAddressMode_Repeat,
+        wrap_v: WGPUAddressMode_ClampToEdge};
+    self.samp360 = gpu.sampler_with(&so360)?;
+    self.group360 = self.layout360.group()?;
+    self.group360.buffer(0, &self.uniforms);
+    self.group360.sampler(2, &self.samp360);
     GpuSamplerOptions so = GpuSamplerOptions{mipmaps: true, wrap_u: WGPUAddressMode_ClampToEdge,
         wrap_v: WGPUAddressMode_ClampToEdge};
     self.samp = gpu.sampler_with(&so)?;
@@ -100,17 +146,31 @@ Result<int, string> _scene_sky_make(*_SceneSkyGpu self, *Gpu gpu) {
     return Ok<int, string>(0);
 }
 
-void _scene_sky_draw(*_SceneSkyGpu self, *GpuPass pass, *GpuTexture cube, Mat4 view_proj, float intensity, bool flip) {
-    if (self.bound != cube.view) {
-        self.group.texture(1, cube);
-        self.bound = cube.view;
-    }
-    float[20] u;
+// Draws the sky: tex is a cube map, or an equirectangular 2D image when pano. rotation
+// turns the sky in the world.
+void _scene_sky_draw(*_SceneSkyGpu self, *GpuPass pass, *GpuTexture tex, bool pano, Mat4 view_proj, Quat rotation,
+                     float intensity, bool flip) {
+    float[36] u;
     Mat4 inv = view_proj.inverse();
+    Mat4 rot = mat4_trs(Vec3{0.0, 0.0, 0.0}, rotation.conjugate(), Vec3{1.0, 1.0, 1.0});
     for (i in 0..16) u[i] = inv.m[i];
-    u[16] = intensity;
-    u[17] = flip ? 1.0 : 0.0;
-    self.uniforms.write(0, &u, 80);
+    for (i in 0..16) u[16 + i] = rot.m[i];
+    u[32] = intensity;
+    u[33] = flip ? 1.0 : 0.0;
+    self.uniforms.write(0, &u, 144);
+    if (pano) {
+        if (self.bound360 != tex.view) {
+            self.group360.texture(1, tex);
+            self.bound360 = tex.view;
+        }
+        pass.set_group(0, &self.group360);
+        pass.draw(&self.pipe360, null, 3, 1);
+        return;
+    }
+    if (self.bound != tex.view) {
+        self.group.texture(1, tex);
+        self.bound = tex.view;
+    }
     pass.set_group(0, &self.group);
     pass.draw(&self.pipe, null, 3, 1);
 }
@@ -122,5 +182,9 @@ void _scene_sky_release(*_SceneSkyGpu self) {
     self.samp.release();
     self.pipe.release();
     self.layout.release();
+    self.group360.release();
+    self.samp360.release();
+    self.pipe360.release();
+    self.layout360.release();
     self.made = false;
 }
