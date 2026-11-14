@@ -1,0 +1,176 @@
+// VR: eye rendering (each eye sees a box from its side, the camera is left as it was),
+// OpenXR-style projections from field-of-view angles, a Cardboard frame (both halves
+// through the lens), and controllers: the Cardboard gaze with a head-locked reticle at the
+// hit's depth, its fuse arc and burst, a tap that clicks, and a pointer controller whose
+// reticle sits on its hit.
+import <io>;
+import <mem>;
+import <list>;
+import <libc>;
+import <math>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/input>;
+import <scene/vr>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b, float tol) {
+    return a - b < tol && b - a < tol;
+}
+
+List<SceneEvent> got;
+
+void record(*SceneEvent e) {
+    List_push(&got, *e);
+}
+
+int count_kind(int kind, int state) {
+    int n = 0;
+    for (i in 0..got.size) {
+        if (got.data[i].kind == kind && got.data[i].state == state) n++;
+    }
+    return n;
+}
+
+// The mean x of the red pixels of a w x h RGBA8 image, -1 with none.
+float red_x(*uint8 px, int w, int h, int x0, int x1) {
+    float sum = 0.0;
+    int n = 0;
+    for (y in 0..h) {
+        for (x in x0..x1) {
+            *uint8 p = px + (y * w + x) * 4;
+            if (p[0] > 128 && p[1] < 80) {
+                sum += (float)x;
+                n++;
+            }
+        }
+    }
+    return n > 0 ? sum / (float)n : -1.0;
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    SceneGeometry g = scene_box(0.5, 0.5, 0.5);
+    int box_mesh = scene.add_geometry(&g)?;
+    g.free();
+    SceneMaterial red = scene_material(SCENE_CONSTANT);
+    red.diffuse = Vec4{1.0, 0.0, 0.0, 1.0};
+    int box = scene.add_object(0, box_mesh, scene.add_material(red));
+    scene.node(box).position = Vec3{0.0, 0.0, -2.0};
+    int cam = scene.add_camera(0, scene_perspective(1.0, 0.05, 50.0));
+    scene.set_camera(cam);
+
+    // projections from angles: symmetric ones are the plain perspective
+    Mat4 a = scene_fov_projection(-0.5, 0.5, -0.5, 0.5, 0.1, 10.0);
+    Mat4 b = mat4_perspective(1.0, 1.0, 0.1, 10.0);
+    bool same = true;
+    for (i in 0..16) {
+        if (!near(a.m[i], b.m[i], 1e-5)) same = false;
+    }
+    check("fov projection", same);
+    Mat4 skew = scene_fov_projection(-0.7, 0.3, -0.5, 0.5, 0.1, 10.0);
+    check("an asymmetric field of view shifts the center", skew.m[8] < 0.0);
+
+    // each eye sees the box from its side
+    GpuTexture eye_t = gpu.target_with(64, 64, WGPUTextureFormat_RGBA8Unorm)?;
+    defer eye_t.release();
+    *uint8 px = alloc<uint8>(64 * 64 * 4);
+    defer free(px);
+    Scene_render_eye(&scene, &eye_t, scene_eye(-0.3, 1.0, 1.0, 0.05, 50.0))?;
+    eye_t.read(px)?;
+    float lx = red_x(px, 64, 64, 0, 64);
+    Scene_render_eye(&scene, &eye_t, scene_eye(0.3, 1.0, 1.0, 0.05, 50.0))?;
+    eye_t.read(px)?;
+    float rx = red_x(px, 64, 64, 0, 64);
+    printf("left eye box at %.1f, right eye at %.1f\n", (double)lx, (double)rx);
+    check("the left eye sees the box right of center, the right eye left of it", lx > 33.0 && rx > 0.0 && rx < 31.0);
+    check("the eyes are symmetric", near(lx - 31.5, 31.5 - rx, 1.0));
+    check("the camera is left as it was", scene.camera == cam && Scene_camera(&scene, cam).projection == SCENE_PERSPECTIVE);
+
+    // Cardboard: both halves show the box in their middle, the corners outside the lens black
+    SceneCardboard vr = scene_cardboard();
+    defer vr.release();
+    GpuTexture screen = gpu.target_with(128, 64, WGPUTextureFormat_RGBA8Unorm)?;
+    defer screen.release();
+    *uint8 sp = alloc<uint8>(128 * 64 * 4);
+    defer free(sp);
+    vr.render(&scene, &screen)?;
+    screen.read(sp)?;
+    float cl = red_x(sp, 128, 64, 0, 64);
+    float cr = red_x(sp, 128, 64, 64, 128);
+    printf("cardboard: left half box at %.1f, right half at %.1f\n", (double)cl, (double)cr);
+    check("cardboard: the box in each half", cl > 20.0 && cl < 44.0 && cr > 84.0 && cr < 108.0);
+    check("cardboard: parallax between the halves", cl - 31.5 > cr - 95.5);
+
+    // the Cardboard controller: the gaze, a fuse, a tap
+    SceneInput input = scene_input();
+    defer input.free();
+    input.on(box, SCENE_ON_CLICK | SCENE_ON_FUSE, record);
+    input.set_fuse_time(box, 1.0);
+    SceneController c = scene_controller(&scene, SCENE_CONTROLLER_CARDBOARD);
+    defer c.free();
+    c.width = 400;
+    c.height = 400;
+    c.update(&scene, &input, 0.0)?;
+    *SceneNode rn = scene.node(c.reticle.node);
+    check("a head-locked reticle under the camera", rn.parent == cam);
+    check("at the depth of the box's face", near(rn.position.z, -1.75, 1e-3));
+    // three pixels' worth at 1.75 m: tan(0.5) 1.75 / 200 px * 3
+    check("three pixels wide", near(c.reticle.radius, 1.75 * (float)tan(0.5) / 200.0 * 3.0, 1e-4));
+    c.update(&scene, &input, 0.5)?;
+    check("fusing halfway", near(c.reticle.fuse_ratio, 0.5, 1e-3) && scene.node(c.reticle.fuse.node).visible
+        && !scene.node(c.reticle.ring.node).visible);
+    c.update(&scene, &input, 1.2)?;
+    check("fused: the burst", c.reticle.burst_since >= 0.0 && count_kind(SCENE_EVENT_FUSE, 0) >= 2);
+    c.button(&scene, &input, true);
+    c.button(&scene, &input, false);
+    check("a tap clicks the box", count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == 1);
+    check("the tap pulses the reticle", c.reticle.pulse_since >= 0.0);
+    scene.node(cam).rotation = quat_axis_angle(Vec3{0.0, 1.0, 0.0}, 1.2);
+    c.update(&scene, &input, 1.5)?;
+    check("looking away ends the fuse", c.reticle.fuse_ratio < 0.0);
+    check("a background hit keeps the reticle's depth", near(scene.node(c.reticle.node).position.z, -1.75, 1e-3));
+    scene.node(cam).rotation = quat_identity();
+
+    // a pointer controller to the right of the box, pointing at it
+    SceneController p = scene_controller(&scene, SCENE_CONTROLLER_POINTER);
+    defer p.free();
+    p.set_pose(Vec3{2.0, 0.0, -2.0}, quat_axis_angle(Vec3{0.0, 1.0, 0.0}, 1.5707963));
+    p.update(&scene, &input, 2.0)?;
+    *SceneNode pn = scene.node(p.reticle.node);
+    check("the pointer's reticle on the box's right face", pn.parent == 0 && near(pn.position.x, 0.25, 1e-3) && near(pn.position.z, -2.0, 1e-3));
+    check("it faces the camera", pn.billboard == SCENE_BILLBOARD_ALL);
+    int clicks = count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED);
+    p.button(&scene, &input, true);
+    p.button(&scene, &input, false);
+    check("its trigger clicks", count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == clicks + 1);
+    c.show_reticle(false);
+    c.update(&scene, &input, 2.1)?;
+    check("a hidden reticle", !scene.node(c.reticle.node).visible);
+    scene.render_to(&eye_t)?;
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("vr: ok\n");
+    return 0;
+}
