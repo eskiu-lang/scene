@@ -73,6 +73,15 @@ void rays(*Scene scene, int box_mesh) {
     scene.node(b).position = Vec3{0.0, 0.0, -3.0};
     List<SceneHit> all;
     check("two hits, nearest first", scene.hit_test_all(center, &all) == 2 && all.data[0].node == a && all.data[1].node == b);
+    // drawn on top wins: the far box with a later order and no depth test takes the hit
+    SceneMaterial over = scene_material(SCENE_CONSTANT);
+    over.skip_depth_test = true;
+    scene.node(b).material = scene.add_material(over);
+    scene.node(b).rendering_order = 1;
+    check("a later order without the depth test takes the hit", scene.hit_test(center, &hit) && hit.node == b);
+    scene.node(b).rendering_order = 0;
+    check("same order: the nearest", scene.hit_test(center, &hit) && hit.node == a);
+    scene.node(b).material = 0;
     scene.node(a).ignore_events = true;
     check("ignore_events lets the ray through", scene.hit_test(center, &hit) && hit.node == b);
     scene.node(a).ignore_events = false;

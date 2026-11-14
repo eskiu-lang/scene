@@ -151,6 +151,36 @@ Result<int, string> graph() {
     Vec3 ahead = w.point(Vec3{0.0, 0.0, -1.0}) - eye;
     check("look_at under a rotated, scaled parent", near3(ahead.normalize(), (Vec3{3.0, 0.0, 0.0} - eye).normalize(), 1e-4));
 
+    // billboards: a node at the origin, the camera at (4, 3, 0)
+    int bb = scene.add_node(0, "bb");
+    int viewer = scene.add_camera(0, scene_perspective(1.0, 0.1, 100.0));
+    scene.node(viewer).position = Vec3{4.0, 3.0, 0.0};
+    scene.set_camera(viewer);
+    scene.node(bb).billboard = SCENE_BILLBOARD_ALL;
+    scene.update();
+    Mat4 wb = scene.node(bb).world;
+    Vec3 fwd = Vec3{wb.m[8], wb.m[9], wb.m[10]};
+    check("billboard: +Z faces the camera", near3(fwd.normalize(), Vec3{4.0, 3.0, 0.0}.normalize(), 1e-4));
+    scene.node(bb).billboard = SCENE_BILLBOARD_Y;
+    scene.update();
+    wb = scene.node(bb).world;
+    check("billboardY: turns about Y only", near3(Vec3{wb.m[8], wb.m[9], wb.m[10]}, Vec3{1.0, 0.0, 0.0}, 1e-4) && near3(Vec3{wb.m[4], wb.m[5], wb.m[6]}, Vec3{0.0, 1.0, 0.0}, 1e-4));
+    scene.node(bb).scale = Vec3{2.0, 2.0, 2.0};
+    scene.node(bb).position = Vec3{0.0, 0.0, 1.0};
+    scene.update();
+    wb = scene.node(bb).world;
+    check("billboard keeps position and scale", near3(Vec3{wb.m[12], wb.m[13], wb.m[14]}, Vec3{0.0, 0.0, 1.0}, 1e-5) && near(Vec3{wb.m[0], wb.m[1], wb.m[2]}.length(), 2.0, 1e-4));
+    scene.remove(bb);
+    scene.remove(viewer);
+
+    // the view frustum test behind culling: a camera at the origin looking down -Z
+    Mat4 vp = mat4_perspective(1.0, 1.0, 0.1, 100.0);
+    check("in front is in view", _scene_sphere_in_view(vp, Vec3{0.0, 0.0, -5.0}, 0.5));
+    check("behind is out", !_scene_sphere_in_view(vp, Vec3{0.0, 0.0, 5.0}, 0.5));
+    check("far to the side is out", !_scene_sphere_in_view(vp, Vec3{50.0, 0.0, -5.0}, 1.0));
+    check("crossing the edge is in", _scene_sphere_in_view(vp, Vec3{3.0, 0.0, -5.0}, 1.0));
+    check("past far is out", !_scene_sphere_in_view(vp, Vec3{0.0, 0.0, -200.0}, 1.0));
+
     scene.remove(a);
     check("remove takes the subtree", !scene.node(a).alive && !scene.node(b).alive && !scene.node(cam).alive && scene.node(c).alive);
     check("root stays", scene.node(0).alive && scene.node(0).children.size == 1);

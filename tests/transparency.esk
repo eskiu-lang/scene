@@ -5,6 +5,7 @@
 //   an opaque quad between them hides the far one.
 // - each blend mode over a gray background against its formula.
 // - node opacity on opaque and blended materials, multiplied down the tree.
+// - rendering order with and without the depth test.
 // - a texture with a cut-out quadrant under the MASK alpha mode.
 import <io>;
 import <mem>;
@@ -144,6 +145,28 @@ Result<int, string> run() {
     target.read(px)?;
     expect("opacity 0 is not drawn", pixel(px, 16, 16), Vec3{0.5, 0.5, 0.5});
     scene.remove(holder);
+
+    // rendering order: a far opaque quad with a higher order whose material skips the depth
+    // test draws over a near one; without the skip the depth test still hides it
+    int near_q = scene.add_object(0, quad, flat(&scene, Vec4{0.0, 1.0, 0.0, 1.0}, SCENE_ALPHA_OPAQUE, 0));
+    SceneMaterial over = scene_material(SCENE_CONSTANT);
+    over.diffuse = Vec4{1.0, 0.0, 1.0, 1.0};
+    int far_q = scene.add_object(0, quad, scene.add_material(over));
+    scene.node(far_q).position = Vec3{0.0, 0.0, -2.0};
+    scene.node(far_q).rendering_order = 1;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("a later order still loses the depth test", pixel(px, 16, 16), Vec3{0.0, 1.0, 0.0});
+    scene.material(scene.node(far_q).material).skip_depth_test = true;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("a later order that skips the depth test is on top", pixel(px, 16, 16), Vec3{1.0, 0.0, 1.0});
+    scene.node(far_q).rendering_order = -1;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("an earlier order is drawn over by the near quad", pixel(px, 16, 16), Vec3{0.0, 1.0, 0.0});
+    scene.remove(near_q);
+    scene.remove(far_q);
 
     // an 8x8 texture in quadrants: red, cut out (alpha 0), blue, white
     uint8[256] texels;
