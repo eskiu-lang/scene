@@ -1,0 +1,511 @@
+// vr.esk: stereo rendering, Cardboard viewers, the reticle and VR controllers
+// (`<scene/vr>`), what ViroVRSceneNavigator and ViroController do.
+//
+// The scene's camera node is the head. Scene_render_eye draws one eye: the eye's pose in
+// the head (half the interpupillary distance to the side) and its projection, which is
+// what a headset runtime (OpenXR) hands over for each eye. SceneCardboard draws both eyes
+// of a phone in a Cardboard viewer side by side, through the lens distortion:
+//
+//     SceneCardboard vr = scene_cardboard();
+//     defer vr.release();
+//     ...each frame, with the head's pose on the camera node:
+//     vr.render(&scene, &target)?;
+//
+// A SceneController turns a controller into SceneInput events and moves its SceneReticle,
+// the ring ViroReact draws where the pointer is: a Cardboard controller is the gaze (the
+// head's forward ray, a tap on the screen is its button) with a head-locked reticle; a
+// tracked controller (Daydream, Quest) points along its pose's -Z with the reticle on what
+// it hits. The reticle grows a fuse arc while a node that takes fuse events counts down,
+// and pulses when it fuses or the button clicks, with ViroReact's sizes, colors and
+// timings (VROReticle, VROInputPresenter).
+
+import <mem>;
+import <list>;
+import <result>;
+import <libc>;
+import <math>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/material>;
+import <scene/shapes>;
+import <scene/input>;
+
+// ViroReact's interpupillary distance when the viewer gives none, in meters.
+const float SCENE_IPD = 0.064;
+
+// An eye: its pose in the head (the camera node) and its projection (depth 0 at near to 1
+// at far), with the near and far it was made with.
+struct SceneEye {
+    Mat4 pose;
+    Mat4 projection;
+    float near;
+    float far;
+}
+
+// A projection from the tangents of the four half angles of an eye's field of view (left
+// and down negative, as OpenXR's XrFovf gives them as angles), depth 0 at near to 1 at far.
+Mat4 scene_fov_projection(float left, float right, float down, float up, float near, float far) {
+    float l = (float)tan((double)left);
+    float r = (float)tan((double)right);
+    float d = (float)tan((double)down);
+    float u = (float)tan((double)up);
+    Mat4 m;
+    m.m[0] = 2.0 / (r - l);
+    m.m[5] = 2.0 / (u - d);
+    m.m[8] = (r + l) / (r - l);
+    m.m[9] = (u + d) / (u - d);
+    m.m[10] = far / (near - far);
+    m.m[11] = -1.0;
+    m.m[14] = near * far / (near - far);
+    return m;
+}
+
+// An eye offset x meters to the side of the head (negative for the left eye) with a
+// symmetric perspective of vertical field of view fov (radians) and width over height
+// aspect.
+SceneEye scene_eye(float x, float fov, float aspect, float near, float far) {
+    return SceneEye{pose: mat4_translate(Vec3{x, 0.0, 0.0}), projection: mat4_perspective(fov, aspect, near, far), near: near, far: far};
+}
+
+// Draws the scene from one eye into target. The camera node stays where it is (it is the
+// head): the eye's offset goes into the projection, so nodes under the camera, such as a
+// head-locked reticle, are seen with each eye's parallax.
+Result<int, string> Scene_render_eye(*Scene self, *GpuTexture target, SceneEye eye) {
+    int cam = self.camera;
+    *SceneCamera c = Scene_camera(self, cam);
+    if (c == null) return Err<int, string>("scene: no camera to render an eye from");
+    SceneCamera saved = *c;
+    *c = scene_projection(eye.projection * eye.pose.inverse(), eye.near, eye.far);
+    Result<int, string> r = Scene_render_to(self, target);
+    c = Scene_camera(self, cam);
+    if (c != null) *c = saved;
+    return r;
+}
+
+// A Cardboard viewer: the interpupillary distance, the vertical field of view each eye
+// sees on the screen (before the lens), the lens's radial distortion k1 and k2 (Cardboard's
+// polynomial: a point at tangent radius r is seen at r (1 + k1 r^2 + k2 r^4)), and the
+// clipping distances. scene_cardboard gives Google Cardboard (2015)'s.
+struct SceneCardboard {
+    float ipd;
+    float fov;
+    float k1;
+    float k2;
+    float near;
+    float far;
+    bool made;
+    Gpu gpu;
+    GpuTexture left;
+    GpuTexture right;
+    uint32 eye_w;
+    uint32 eye_h;
+    GpuBindLayout layout;
+    GpuBindGroup group;
+    GpuBuffer uniforms;
+    GpuSampler samp;
+    GpuPipeline pipe;
+    WGPUTextureFormat format;
+}
+
+// A Cardboard viewer with Google Cardboard (2015)'s values: 64 mm between the eyes, 60
+// degrees seen per eye, k1 0.34 and k2 0.55.
+SceneCardboard scene_cardboard() {
+    return SceneCardboard{ipd: SCENE_IPD, fov: 1.047198, k1: 0.34, k2: 0.55, near: 0.01, far: 100.0};
+}
+
+string _scene_cardboard_wgsl =
+    "struct U { lens: vec4<f32>, k: vec4<f32> };\n"
+    "@group(0) @binding(0) var<uniform> u: U;\n"
+    "@group(0) @binding(1) var left: texture_2d<f32>;\n"
+    "@group(0) @binding(2) var right: texture_2d<f32>;\n"
+    "@group(0) @binding(3) var samp: sampler;\n"
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    var o: V;\n"
+    "    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    o.uv = vec2<f32>(p.x, 1.0 - p.y);\n"
+    "    return o;\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    let is_right = v.uv.x >= 0.5;\n"
+    "    let ux = select(v.uv.x * 2.0, v.uv.x * 2.0 - 1.0, is_right);\n"
+    "    let q = vec2<f32>(ux * 2.0 - 1.0, 1.0 - v.uv.y * 2.0);\n"
+    "    let t = vec2<f32>(q.x * u.lens.x * u.lens.y, q.y * u.lens.y);\n"
+    "    let r2 = dot(t, t);\n"
+    "    let d = t * (1.0 + u.k.x * r2 + u.k.y * r2 * r2);\n"
+    "    let tex = vec2<f32>(d.x / (u.lens.x * u.lens.z) * 0.5 + 0.5, 0.5 - d.y / u.lens.z * 0.5);\n"
+    "    let l = textureSampleLevel(left, samp, tex, 0.0);\n"
+    "    let r = textureSampleLevel(right, samp, tex, 0.0);\n"
+    "    let c = select(l, r, is_right);\n"
+    "    let inside = all(tex >= vec2<f32>(0.0)) && all(tex <= vec2<f32>(1.0));\n"
+    "    return select(vec4<f32>(0.0, 0.0, 0.0, 1.0), vec4<f32>(c.rgb, 1.0), inside);\n"
+    "}\n";
+
+// The tangent of half the vertical field of view each eye's image needs so the lens's
+// distortion of the screen's corners stays inside it.
+float _scene_cardboard_tex_tan(*SceneCardboard self, float aspect) {
+    float t = (float)tan((double)(self.fov * 0.5));
+    float r2 = t * t * (1.0 + aspect * aspect);
+    return t * (1.0 + self.k1 * r2 + self.k2 * r2 * r2);
+}
+
+// The two eyes SceneCardboard_render draws for a target of width x height (each eye one
+// half, with the field of view the distortion needs).
+void SceneCardboard_eyes(*SceneCardboard self, uint32 width, uint32 height, *SceneEye left, *SceneEye right) {
+    float aspect = (float)(width / 2) / (float)(height > 0 ? height : (uint32)1);
+    float fov = 2.0 * (float)atan((double)_scene_cardboard_tex_tan(self, aspect));
+    *left = scene_eye(-self.ipd * 0.5, fov, aspect, self.near, self.far);
+    *right = scene_eye(self.ipd * 0.5, fov, aspect, self.near, self.far);
+}
+
+Result<int, string> _scene_cardboard_make(*SceneCardboard self, *Scene scene, WGPUTextureFormat format) {
+    if (self.made && self.format == format) return Ok<int, string>(0);
+    SceneCardboard_release(self);
+    self.gpu = scene.gpu;
+    self.layout = self.gpu.bind_layout();
+    self.layout.uniform(0, WGPUShaderStage_Fragment);
+    self.layout.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    self.layout.texture(2, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    self.layout.sampler(3, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+    *GpuBindLayout[1] groups = {&self.layout};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_cardboard_wgsl, vertex: "vs", fragment: "fs", format: format,
+        groups: &groups[0], group_count: 1};
+    self.pipe = self.gpu.pipeline(&d)?;
+    GpuSamplerOptions so = GpuSamplerOptions{wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge};
+    self.samp = self.gpu.sampler_with(&so)?;
+    self.uniforms = self.gpu.uniform(null, 32)?;
+    self.group = self.layout.group()?;
+    self.group.buffer(0, &self.uniforms);
+    self.group.sampler(3, &self.samp);
+    self.format = format;
+    self.made = true;
+    return Ok<int, string>(0);
+}
+
+// Draws both eyes into target (left half, right half) through the lens distortion.
+Result<int, string> SceneCardboard_render(*SceneCardboard self, *Scene scene, *GpuTexture target) {
+    _scene_cardboard_make(self, scene, target.format)?;
+    uint32 w = target.width / 2;
+    uint32 h = target.height;
+    if (w < 1) w = 1;
+    if (self.eye_w != w || self.eye_h != h || self.left.handle == null) {
+        self.left.release();
+        self.right.release();
+        self.left = self.gpu.target_with(w, h, target.format)?;
+        self.right = self.gpu.target_with(w, h, target.format)?;
+        self.eye_w = w;
+        self.eye_h = h;
+        self.group.texture(1, &self.left);
+        self.group.texture(2, &self.right);
+    }
+    SceneEye l;
+    SceneEye r;
+    SceneCardboard_eyes(self, target.width, target.height, &l, &r);
+    Scene_render_eye(scene, &self.left, l)?;
+    Scene_render_eye(scene, &self.right, r)?;
+    float aspect = (float)w / (float)h;
+    float[8] u = {aspect, (float)tan((double)(self.fov * 0.5)), _scene_cardboard_tex_tan(self, aspect), 0.0,
+        self.k1, self.k2, 0.0, 0.0};
+    self.uniforms.write(0, &u, 32);
+    GpuEncoder enc = self.gpu.encoder();
+    GpuPass p = enc.pass(target.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    p.set_group(0, &self.group);
+    p.draw(&self.pipe, null, 3, 1);
+    p.end()?;
+    return enc.submit();
+}
+
+// Releases the eye images and the distortion pass.
+void SceneCardboard_release(*SceneCardboard self) {
+    if (!self.made) return;
+    self.left.release();
+    self.right.release();
+    self.pipe.release();
+    self.group.release();
+    self.layout.release();
+    self.uniforms.release();
+    self.samp.release();
+    self.eye_w = 0;
+    self.made = false;
+}
+
+// ViroReact's reticle constants: the ring's radius and thickness at scale 1, the pulse
+// length and how much thicker it gets, the fuse ring's size, and the colors.
+const float SCENE_RETICLE_SIZE = 0.01;
+const float SCENE_RETICLE_THICKNESS = 0.005;
+const double SCENE_RETICLE_PULSE = 0.4;
+const int _SCENE_RETICLE_SEGMENTS = 64;
+
+// The reticle: a ring (ViroReact's cyan), and while fusing a faint ring three times as
+// wide with a white arc filling it, then a burst when the fuse completes. radius is the
+// ring's current radius in world units; headlocked keeps it in front of the camera at the
+// depth of what the pointer hits (Cardboard), otherwise it sits on the hit facing the
+// camera.
+struct SceneReticle {
+    int node;
+    ScenePolyline ring;
+    ScenePolyline fuse_bg;
+    ScenePolyline fuse;
+    ScenePolyline burst;
+    float radius;
+    float depth;
+    bool headlocked;
+    bool placed;
+    bool visible;
+    float fuse_ratio;
+    double fuse_since;
+    double burst_since;
+    double pulse_since;
+    double now;
+}
+
+ScenePolyline _scene_reticle_line(*Scene scene, int parent, Vec4 color, int order) {
+    ScenePolyline l = scene_polyline(scene, parent, SCENE_RETICLE_THICKNESS).value;
+    *SceneMaterial m = Scene_material(scene, l.material);
+    m.diffuse = color;
+    m.skip_depth_test = true;
+    m.skip_depth_write = true;
+    *SceneNode n = Scene_node(scene, l.node);
+    n.rendering_order = order;
+    n.casts_shadows = false;
+    n.receives_shadows = false;
+    n.ignore_events = true;
+    return l;
+}
+
+// A reticle under parent (the camera node for a head-locked one, the root otherwise).
+SceneReticle scene_reticle(*Scene scene, int parent, bool headlocked) {
+    SceneReticle r;
+    r.node = Scene_add_node(scene, parent, "reticle");
+    Scene_node(scene, r.node).ignore_events = true;
+    Scene_node(scene, r.node).position = Vec3{0.0, 0.0, -2.0};
+    if (!headlocked) Scene_node(scene, r.node).billboard = SCENE_BILLBOARD_ALL;
+    Vec4 cyan = Vec4{0.33, 0.976, 0.968, 1.0};
+    r.ring = _scene_reticle_line(scene, r.node, cyan, 100003);
+    r.fuse_bg = _scene_reticle_line(scene, r.node, Vec4{0.33, 0.976, 0.968, 0.1}, 100000);
+    r.fuse = _scene_reticle_line(scene, r.node, Vec4{1.0, 1.0, 0.968, 1.0}, 100001);
+    r.burst = _scene_reticle_line(scene, r.node, Vec4{1.0, 1.0, 1.0, 0.5}, 100002);
+    r.radius = SCENE_RETICLE_SIZE;
+    r.depth = 2.0;
+    r.headlocked = headlocked;
+    r.visible = true;
+    r.fuse_ratio = -1.0;
+    r.burst_since = -1.0;
+    r.pulse_since = -1.0;
+    return r;
+}
+
+// A circle of radius r (ViroReact's arc: 64 segments from the top, clockwise), the first
+// share of it.
+void _scene_reticle_arc(*ScenePolyline l, float r, float share) {
+    ScenePolyline_clear(l);
+    int n = (int)ceil((double)((float)_SCENE_RETICLE_SEGMENTS * share));
+    if (share >= 1.0) n = _SCENE_RETICLE_SEGMENTS + 1;
+    if (n < 2) return;
+    List<Vec3> pts;
+    defer pts.free();
+    for (i in 0..n) {
+        float a = (float)i / (float)_SCENE_RETICLE_SEGMENTS * 6.2831853;
+        List_push(&pts, Vec3{(float)sin((double)a) * r, (float)cos((double)a) * r, 0.0});
+    }
+    ScenePolyline_add_path(l, &pts);
+}
+
+// Starts the pulse a click or a fuse gives (the ring gets three times as thick and back
+// in 0.4 s).
+void SceneReticle_trigger(*SceneReticle self) {
+    self.pulse_since = self.now;
+}
+
+// The reticle's fuse: share is the fuse time left (1 down to 0, as SceneEvent.fuse), -1
+// when nothing is fusing.
+void SceneReticle_set_fuse(*SceneReticle self, float share) {
+    if (share < 0.0) {
+        self.fuse_ratio = -1.0;
+        self.burst_since = -1.0;
+        return;
+    }
+    if (self.fuse_ratio < 0.0) self.fuse_since = self.now;
+    self.fuse_ratio = 1.0 - share;
+    if (share <= 0.0 && self.burst_since < 0.0) {
+        self.burst_since = self.now;
+        SceneReticle_trigger(self);
+    }
+}
+
+// Places the reticle on what ray hit: on the hit (radius kept to three pixels' worth at
+// its distance, ViroReact's size) or, head-locked, straight ahead at its depth. A hit on
+// the background keeps a head-locked reticle's depth once placed, so it does not jump.
+// width and height are the view's pixels, fov the camera's vertical field of view.
+void SceneReticle_place(*SceneReticle self, *Scene scene, SceneHit hit, float fov, uint32 width, uint32 height) {
+    float d = hit.distance > 0.0 ? hit.distance : SCENE_BACKGROUND_DISTANCE;
+    float aspect = (float)width / (float)(height > 0 ? height : (uint32)1);
+    // Viro's VROCamera::getWorldPerScreen: the horizontal half angle over half the view
+    float per_px = d * (float)tan((double)(fov * 0.5)) * aspect / ((float)width * 0.5);
+    float radius = per_px * 3.0;
+    *SceneNode n = Scene_node(scene, self.node);
+    if (!self.headlocked) {
+        n.position = hit.point;
+        self.radius = radius;
+    } else if (!self.placed || !hit.background) {
+        n.position = Vec3{0.0, 0.0, -d};
+        self.depth = d;
+        self.radius = radius;
+        self.placed = true;
+    }
+}
+
+float _scene_ease_decel(float t) {
+    return 1.0 - (1.0 - t) * (1.0 - t);
+}
+
+// Moves the reticle's animations to time (seconds) and rebuilds its lines for the camera.
+Result<int, string> SceneReticle_update(*SceneReticle self, *Scene scene, double time) {
+    self.now = time;
+    float thick = SCENE_RETICLE_THICKNESS;
+    if (self.pulse_since >= 0.0) {
+        float t = (float)((time - self.pulse_since) / SCENE_RETICLE_PULSE);
+        if (t >= 1.0) {
+            self.pulse_since = -1.0;
+        } else {
+            float k = t < 0.5 ? t / 0.5 : (1.0 - t) / 0.5;
+            thick = SCENE_RETICLE_THICKNESS * (1.0 + 2.0 * k);
+        }
+    }
+    float scale = self.radius / SCENE_RETICLE_SIZE;
+    bool fusing = self.fuse_ratio >= 0.0;
+    Scene_node(scene, self.node).visible = self.visible;
+    Scene_node(scene, self.ring.node).visible = !fusing;
+    Scene_node(scene, self.fuse_bg.node).visible = fusing;
+    Scene_node(scene, self.fuse.node).visible = fusing;
+    Scene_node(scene, self.burst.node).visible = fusing && self.burst_since >= 0.0;
+    self.ring.thickness = thick * scale;
+    _scene_reticle_arc(&self.ring, self.radius, 1.0);
+    if (fusing) {
+        // the fuse rings grow to three times the radius in 0.25 s (PowerDecel)
+        float g = (float)((time - self.fuse_since) / 0.25);
+        if (g > 1.0) g = 1.0;
+        float fr = self.radius * (1.0 + 2.0 * _scene_ease_decel(g));
+        self.fuse_bg.thickness = thick * scale;
+        self.fuse.thickness = thick * scale;
+        _scene_reticle_arc(&self.fuse_bg, fr, 1.0);
+        _scene_reticle_arc(&self.fuse, fr, self.fuse_ratio);
+        if (self.burst_since >= 0.0) {
+            // the burst: from 1.75 to 3.5 radii, fading out, in 0.4 s (EaseIn)
+            float b = (float)((time - self.burst_since) / 0.4);
+            if (b > 1.0) b = 1.0;
+            float e = b * b;
+            self.burst.thickness = SCENE_RETICLE_THICKNESS * 3.0 * scale;
+            _scene_reticle_arc(&self.burst, self.radius * (1.75 + 1.75 * e), 1.0);
+            Scene_node(scene, self.burst.node).opacity = 1.0 - e;
+        }
+    }
+    ScenePolyline_update(&self.ring, scene)?;
+    ScenePolyline_update(&self.fuse_bg, scene)?;
+    ScenePolyline_update(&self.fuse, scene)?;
+    ScenePolyline_update(&self.burst, scene)?;
+    return Ok<int, string>(0);
+}
+
+// Frees the reticle's lines (its nodes stay in the scene).
+void SceneReticle_free(*SceneReticle self) {
+    ScenePolyline_free(&self.ring);
+    ScenePolyline_free(&self.fuse_bg);
+    ScenePolyline_free(&self.fuse);
+    ScenePolyline_free(&self.burst);
+}
+
+// Controller kinds: a Cardboard viewer's gaze (its button a screen tap), or a tracked
+// controller pointing along its pose (Daydream, Quest, any 6DoF or 3DoF pointer).
+const int SCENE_CONTROLLER_CARDBOARD = 0;
+const int SCENE_CONTROLLER_POINTER = 1;
+
+// A VR controller: its kind, its pose in world space (a pointer's; Cardboard's is the
+// camera's), its reticle, and the view's pixels for the reticle's size.
+struct SceneController {
+    int kind;
+    Vec3 position;
+    Quat rotation;
+    bool has_reticle;
+    SceneReticle reticle;
+    uint32 width;
+    uint32 height;
+    bool down;
+}
+
+// A controller of kind with a reticle (head-locked for Cardboard), as ViroController's
+// reticleVisibility defaults to.
+SceneController scene_controller(*Scene scene, int kind) {
+    SceneController c = SceneController{kind: kind, rotation: quat_identity(), width: 1000, height: 1000};
+    int parent = kind == SCENE_CONTROLLER_CARDBOARD ? scene.camera : 0;
+    c.reticle = scene_reticle(scene, parent >= 0 ? parent : 0, kind == SCENE_CONTROLLER_CARDBOARD);
+    c.has_reticle = true;
+    return c;
+}
+
+// Sets a pointer controller's pose (world space; it points along its -Z).
+void SceneController_set_pose(*SceneController self, Vec3 position, Quat rotation) {
+    self.position = position;
+    self.rotation = rotation;
+}
+
+// Where the controller points: the camera's forward ray for Cardboard, the pose's -Z for
+// a pointer.
+SceneRay SceneController_ray(*SceneController self, *Scene scene) {
+    if (self.kind == SCENE_CONTROLLER_CARDBOARD) {
+        Scene_update(scene);
+        Mat4 w = Scene_node(scene, scene.camera).world;
+        Vec3 f = Vec3{-w.m[8], -w.m[9], -w.m[10]}.normalize();
+        return SceneRay{origin: Vec3{w.m[12], w.m[13], w.m[14]}, dir: f};
+    }
+    return SceneRay{origin: self.position, dir: self.rotation.rotate(Vec3{0.0, 0.0, -1.0}).normalize()};
+}
+
+// Once a frame: moves the pointer and the gaze (hover, drag and fuse events), then the
+// reticle (placed on the hit, its fuse arc from input's countdown, its animations).
+Result<int, string> SceneController_update(*SceneController self, *Scene scene, *SceneInput input, double time) {
+    SceneRay ray = SceneController_ray(self, scene);
+    SceneInput_pointer(input, scene, ray, time);
+    SceneInput_gaze(input, scene, ray, time);
+    if (!self.has_reticle) return Ok<int, string>(0);
+    SceneHit hit;
+    Scene_hit_test(scene, ray, &hit);
+    float fov = 1.0;
+    *SceneCamera c = Scene_camera(scene, scene.camera);
+    if (c != null && c.projection == SCENE_PERSPECTIVE) fov = c.fov;
+    SceneReticle_place(&self.reticle, scene, hit, fov, self.width, self.height);
+    self.reticle.now = time;
+    if (input.fused >= 0 && input.fused < input.handlers.size) {
+        double total = input.handlers.data[input.fused].fuse_time;
+        float left = total > 0.0 ? (float)((input.fuse_at - time) / total) : 0.0;
+        SceneReticle_set_fuse(&self.reticle, left < 0.0 ? 0.0 : left);
+    } else {
+        SceneReticle_set_fuse(&self.reticle, -1.0);
+    }
+    return SceneReticle_update(&self.reticle, scene, time);
+}
+
+// The controller's button (a Cardboard tap, a trigger): down presses, up releases, and a
+// press pulses the reticle.
+void SceneController_button(*SceneController self, *Scene scene, *SceneInput input, bool down) {
+    if (down == self.down) return;
+    self.down = down;
+    if (down) {
+        SceneInput_press(input, scene);
+        if (self.has_reticle) SceneReticle_trigger(&self.reticle);
+    } else {
+        SceneInput_release(input, scene);
+    }
+}
+
+// Shows or hides the reticle (ViroController's reticleVisibility).
+void SceneController_show_reticle(*SceneController self, bool show) {
+    self.reticle.visible = show;
+}
+
+// Frees the controller's reticle lines.
+void SceneController_free(*SceneController self) {
+    if (self.has_reticle) SceneReticle_free(&self.reticle);
+}
