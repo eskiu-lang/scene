@@ -40,6 +40,9 @@ const int SCENE_TONE_HABLE = 3;
 // - bloom: add a blur of the bright parts; bloom_threshold is the luminance where it
 //   starts (0 is 1.0), bloom_strength scales it (0 is 1.0), bloom_passes is the number of
 //   horizontal and vertical blur pairs at half size (0 is 4; more spreads wider).
+// - effects: SCENE_EFFECT_* in order. time (seconds, set each frame) drives the swirl, and
+//   window (left, bottom, right, top in 0..1 from the bottom left; all 0 is the whole
+//   image) is where the swirl and the zoom happen, as ViroReact's window mask.
 struct ScenePost {
     int tone_mapping;
     float exposure;
@@ -50,6 +53,8 @@ struct ScenePost {
     float bloom_strength;
     int bloom_passes;
     int[8] effects;
+    float time;
+    Vec4 window;
 }
 
 // Post-process effects (ScenePost.effects, applied in order, 0 for an empty slot):
@@ -66,15 +71,19 @@ const int SCENE_EFFECT_CROSSHATCH = 7;
 const int SCENE_EFFECT_PIXELATED = 8;
 const int SCENE_EFFECT_TOONIFY = 9;
 const int SCENE_EFFECT_INVERTED = 10;
+// A swirl in the circle inside ScenePost.window, turning back and forth with time.
+const int SCENE_EFFECT_SWIRL = 11;
+// The circle inside ScenePost.window magnified twice.
+const int SCENE_EFFECT_ZOOM = 12;
 
 // The effect ViroReact names name ("grayscale", "sepia", "sincity", "baralleldistortion",
 // "pincushiondistortion", "thermalvision", "crosshatch", "pixelated", "toonify",
-// "inverted"; any case), or SCENE_EFFECT_NONE.
+// "inverted", "swirldistortion", "zoomindistortion"; any case), or SCENE_EFFECT_NONE.
 int scene_effect_named(string name) {
-    string[10] names = {"grayscale", "sepia", "sincity", "baralleldistortion", "pincushiondistortion", "thermalvision",
-        "crosshatch", "pixelated", "toonify", "inverted"};
+    string[12] names = {"grayscale", "sepia", "sincity", "baralleldistortion", "pincushiondistortion", "thermalvision",
+        "crosshatch", "pixelated", "toonify", "inverted", "swirldistortion", "zoomindistortion"};
     if (name == null) return SCENE_EFFECT_NONE;
-    for (k in 0..10) {
+    for (k in 0..12) {
         string a = names[k];
         int i = 0;
         bool same = true;
@@ -205,7 +214,34 @@ void _scene_effect_body(int e, *String out) {
         out.append(_SCENE_DISTORT);
         return;
     }
+    if (e == SCENE_EFFECT_SWIRL || e == SCENE_EFFECT_ZOOM) {
+        _scene_circle_effect(e, out);
+        return;
+    }
     out.append(_scene_effect_text(e));
+}
+
+// ViroReact's swirl and zoom: a circle centered in the window, its radius half the window's
+// smaller side in uv units, distances with y scaled by height / width.
+void _scene_circle_effect(int e, *String t) {
+    t.append("    let g = vec2<f32>(uv.x, 1.0 - uv.y);\n    let w = post.d;\n"
+        "    if (g.x < w.x || g.x > w.z || g.y < w.y || g.y > w.w) { return prev(uv); }\n"
+        "    let center = vec2<f32>((w.x + w.z) * 0.5, (w.y + w.w) * 0.5);\n"
+        "    let ap = post.c.y / post.c.x;\n"
+        "    let dist = length(vec2<f32>(g.x, g.y * ap) - vec2<f32>(center.x, center.y * ap));\n"
+        "    let radius = min((w.z - w.x) / 2.0, (w.w - w.y) / 2.0);\n"
+        "    if (dist > radius) { return prev(uv); }\n");
+    if (e == SCENE_EFFECT_ZOOM) {
+        t.append("    let q = center + (g - center) / 2.0;\n");
+    } else {
+        // as ViroReact computes it, cos(sin(...)) included
+        t.append("    let percent = (radius - dist) / radius;\n"
+            "    let theta = percent * percent * sin(post.c.z) * 8.0;\n"
+            "    let s = sin(theta * 0.35);\n    let c = cos(sin(theta * 0.35));\n"
+            "    let tc = g - center;\n"
+            "    let q = vec2<f32>(dot(tc, vec2<f32>(c, -s)), dot(tc, vec2<f32>(s, c))) + center;\n");
+    }
+    t.append("    return prev(vec2<f32>(q.x, 1.0 - q.y));\n");
 }
 
 string _scene_effect_text(int e) {
@@ -419,8 +455,10 @@ Result<int, string> _scene_post_run(*_ScenePostGpu self, *GpuEncoder enc, *GpuTe
     float white = p.white_point > 0.0 ? p.white_point : 11.2;
     bool encode = p.gamma && !_scene_is_srgb(format);
     bool srgb_target = _scene_is_srgb(format) && p.gamma;
+    Vec4 win = p.window;
+    if (win.x == 0.0 && win.y == 0.0 && win.z == 0.0 && win.w == 0.0) win = Vec4{0.0, 0.0, 1.0, 1.0};
     float[16] ut = {(float)p.tone_mapping, p.exposure, white, strength, encode ? 1.0 : 0.0, srgb_target ? 1.0 : 0.0, 0.0, 0.0,
-        (float)hdr.width, (float)hdr.height, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        (float)hdr.width, (float)hdr.height, p.time * 2.0, 0.0, win.x, win.y, win.z, win.w};
     self.u_tone.write(0, &ut, 64);
     *GpuPipeline tone = _scene_post_tone_pipe(self, format, &p.effects[0])?;
     GpuPass tp = enc.pass(view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);

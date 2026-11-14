@@ -84,6 +84,8 @@ as it is displayed (tone mapped, and sRGB-encoded when `gamma` is on), with Viro
 | `SCENE_EFFECT_PIXELATED` | `pixelated` | blocks of 2% of the image |
 | `SCENE_EFFECT_TOONIFY` | `toonify` | black where the brightness changes sharply |
 | `SCENE_EFFECT_INVERTED` | `inverted` | one minus the color |
+| `SCENE_EFFECT_SWIRL` | `swirldistortion` | a swirl in a circle, turning back and forth with `post.time` |
+| `SCENE_EFFECT_ZOOM` | `zoomindistortion` | a circle magnified twice |
 
 ```eskiu
 scene.post.effects[0] = SCENE_EFFECT_SEPIA;
@@ -91,9 +93,13 @@ scene.post.effects[1] = scene_effect_named("pixelated");
 ```
 
 `scene_effect_named` maps ViroReact's names. The effects are composed into the tone
-mapping pass, one shader per list, so they add no render pass. ViroReact's
-`swirldistortion` and `zoomindistortion`, which animate over a window of the image, are not
-here.
+mapping pass, one shader per list, so they add no render pass.
+
+The swirl and the zoom work in a circle centered in `post.window` (left, bottom, right, top,
+from 0 to 1 with the origin at the bottom left; the whole image when all are 0), its radius
+half the window's smaller side, as ViroReact's window mask. The swirl's angle is
+`sin(2 * post.time)`: set `post.time` to the time in seconds each frame, as ViroReact reads
+its clock.
 
 ## Background, skybox and image-based lighting
 

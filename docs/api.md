@@ -2647,6 +2647,8 @@ struct ScenePost {
     float bloom_strength;
     int bloom_passes;
     int[8] effects;
+    float time;
+    Vec4 window;
 }
 ```
 
@@ -2659,6 +2661,9 @@ encoding off (Gpu_scene turns gamma on):
 - bloom: add a blur of the bright parts; bloom_threshold is the luminance where it
   starts (0 is 1.0), bloom_strength scales it (0 is 1.0), bloom_passes is the number of
   horizontal and vertical blur pairs at half size (0 is 4; more spreads wider).
+- effects: SCENE_EFFECT_* in order. time (seconds, set each frame) drives the swirl, and
+  window (left, bottom, right, top in 0..1 from the bottom left; all 0 is the whole
+  image) is where the swirl and the zoom happen, as ViroReact's window mask.
 
 ### SCENE_EFFECT_NONE, SCENE_EFFECT_GRAYSCALE, SCENE_EFFECT_SEPIA, SCENE_EFFECT_SINCITY, SCENE_EFFECT_BARREL, SCENE_EFFECT_PINCUSHION, SCENE_EFFECT_THERMAL, SCENE_EFFECT_CROSSHATCH, SCENE_EFFECT_PIXELATED, SCENE_EFFECT_TOONIFY, SCENE_EFFECT_INVERTED
 
@@ -2680,6 +2685,22 @@ Post-process effects (ScenePost.effects, applied in order, 0 for an empty slot):
 ViroReact's postProcessEffects with its formulas, on the displayed (tone mapped and,
 with gamma, sRGB-encoded) image.
 
+### SCENE_EFFECT_SWIRL
+
+```eskiu
+const int SCENE_EFFECT_SWIRL = 11;
+```
+
+A swirl in the circle inside ScenePost.window, turning back and forth with time.
+
+### SCENE_EFFECT_ZOOM
+
+```eskiu
+const int SCENE_EFFECT_ZOOM = 12;
+```
+
+The circle inside ScenePost.window magnified twice.
+
 ### scene_effect_named
 
 ```eskiu
@@ -2688,7 +2709,7 @@ int scene_effect_named(string name)
 
 The effect ViroReact names name ("grayscale", "sepia", "sincity", "baralleldistortion",
 "pincushiondistortion", "thermalvision", "crosshatch", "pixelated", "toonify",
-"inverted"; any case), or SCENE_EFFECT_NONE.
+"inverted", "swirldistortion", "zoomindistortion"; any case), or SCENE_EFFECT_NONE.
 
 ### scene_tone_map
 

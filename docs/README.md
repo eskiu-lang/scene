@@ -67,7 +67,7 @@ Each test renders small images and reads them back:
 | `tests/graph.esk` | world matrices through parents, `look_at` under a rotated and scaled parent, reparenting, removal, the shapes' winding, normals and bounds, matrix decomposition, material keys, the CPU falloff and tone curves |
 | `tests/lighting.esk` | each lighting model on a sphere against its formula at ten pixels (linear output, within 0.006 + 1%) |
 | `tests/attenuation.esk` | point light falloff (exponent 2 and 1) and the spot cone along a profile, the influence mask, eight lights per draw |
-| `tests/effects.esk` | each color effect against ViroReact's formula, a chain's order, crosshatch lines at their pixels, toonify's edge, barrel and pincushion moving an edge |
+| `tests/effects.esk` | each color effect against ViroReact's formula, a chain's order, crosshatch lines at their pixels, toonify's edge, barrel and pincushion moving an edge, the zoom in a window, the swirl over time |
 | `tests/portals.esk` | a portal's world only through its window, an outer object covering the window, the portal's sky, walking in and looking back out, a portal that is not passable, a portal inside a portal |
 | `tests/shapes.esk` | polygon area with holes and concave outlines, winding, texture coordinates, repeated points; polyline width, round ends and joins; both drawn |
 | `tests/particles.esk` | modifier intervals, the rate per second, the cap, bursts, a cycle without loop, motion, fixed and free particles, spawn volumes, an explosion, additive drawing |
@@ -86,7 +86,7 @@ Each test renders small images and reads them back:
 These ViroReact renderer features are planned for later versions:
 
 - Extruded 3D text, outlined and drop-shadow text strokes, and Knuth-Plass line breaks for justified text.
-- Post effects beyond ViroReact's (color grading, vignette, depth of field, SSAO), and its swirl and zoom distortions.
+- Post effects beyond ViroReact's (color grading, vignette, depth of field, SSAO).
 - Shader modifiers (user WGSL inserted into the generated shaders).
 - Cascaded shadow maps for large scenes, and shadows from point lights (ViroReact has neither).
 - Instanced drawing.

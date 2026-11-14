@@ -35,7 +35,8 @@ All notable changes to this package are documented here. The format follows
   zoomed by a pinch.
 - Post effects: `ScenePost.effects`, ViroReact's postProcessEffects (grayscale, sepia,
   sincity, barrel and pincushion distortion, thermal vision, crosshatch, pixelated,
-  toonify, inverted) with its formulas, chained in order inside the tone mapping pass;
+  toonify, inverted, swirl and zoom distortion over `ScenePost.window` driven by
+  `ScenePost.time`) with its formulas, chained in order inside the tone mapping pass;
   `scene_effect_named`.
 - Portals: `SceneNode.portal`, `portal_entrance`, `passable`, `portal_sky` and
   `Scene.active_portal` (ViroPortalScene and ViroPortal): a portal's world drawn only

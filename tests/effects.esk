@@ -108,6 +108,33 @@ Result<int, string> run() {
     t.read(px)?;
     expect("toonify: the edge is black", pixel(px, 40, 32), Vec3{0.0, 0.0, 0.0});
     expect("toonify: inside stays red", pixel(px, 52, 32), Vec3{1.0, 0.0, 0.0});
+
+    // zoom: the circle in the middle magnified twice, the corners untouched
+    effects(&scene, SCENE_EFFECT_ZOOM, SCENE_EFFECT_NONE);
+    scene.render_to(&t)?;
+    t.read(px)?;
+    expect("zoom: x 0.7 reads x 0.6", pixel(px, 44, 32), Vec3{0.0, 0.0, 0.0});
+    expect("zoom: x 0.95 reads x 0.72", pixel(px, 60, 32), Vec3{1.0, 0.0, 0.0});
+    expect("zoom: outside the circle", pixel(px, 62, 2), Vec3{1.0, 0.0, 0.0});
+    // a window on the right half moves the circle there
+    scene.post.window = Vec4{0.5, 0.0, 1.0, 1.0};
+    scene.render_to(&t)?;
+    t.read(px)?;
+    expect("zoom in a window: x 0.54 reads x 0.64", pixel(px, 34, 32), Vec3{1.0, 0.0, 0.0});
+    expect("zoom in a window: the left half untouched", pixel(px, 20, 32), Vec3{0.0, 0.0, 0.0});
+    scene.post.window = Vec4{0.0, 0.0, 0.0, 0.0};
+    // swirl: still at time 0, turned at sin(2 t) = 1
+    effects(&scene, SCENE_EFFECT_SWIRL, SCENE_EFFECT_NONE);
+    scene.post.time = 0.0;
+    scene.render_to(&t)?;
+    t.read(px)?;
+    expect("swirl at rest", pixel(px, 42, 32), Vec3{1.0, 0.0, 0.0});
+    scene.post.time = 0.78539816;
+    scene.render_to(&t)?;
+    t.read(px)?;
+    expect("swirl turned: x 0.66 reads x 0.6", pixel(px, 42, 32), Vec3{0.0, 0.0, 0.0});
+    expect("swirl: outside the circle", pixel(px, 62, 2), Vec3{1.0, 0.0, 0.0});
+    check("swirl and zoom names", scene_effect_named("SwirlDistortion") == SCENE_EFFECT_SWIRL && scene_effect_named("zoomindistortion") == SCENE_EFFECT_ZOOM);
     return Ok<int, string>(0);
 }
 
