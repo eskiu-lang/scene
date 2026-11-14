@@ -36,9 +36,9 @@ frames to Eskiu, `<gpu/yuv>` turns each into an RGBA texture, and the scene show
 GpuYuv yuv = gpu.yuv(WGPUTextureFormat_RGBA8Unorm)?;
 int screen_tex = 0;
 use_video_frames(player, VideoFrameOptions{max_width: 1280, max_height: 720}, void(*VideoFrame f) {
-    yuv.upload((*GpuYuvImage)f)?;
-    *GpuTexture rgba = yuv.to_rgba(true)?;
-    screen_tex = scene.borrow_texture(screen_tex, rgba);   // the same id while the size holds
+    if (!yuv.upload((*GpuYuvImage)f).ok) return;
+    Result<*GpuTexture, string> rgba = yuv.to_rgba(true);
+    if (rgba.ok) screen_tex = scene.borrow_texture(screen_tex, rgba.value);   // same id while the size holds
 });
 ...the material: m.diffuse_texture = screen_tex;
 ```
