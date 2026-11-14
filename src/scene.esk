@@ -773,6 +773,36 @@ Result<int, string> Scene_add_geometry(*Scene self, *SceneGeometry geometry) {
     return Ok<int, string>(self.meshes.size - 1);
 }
 
+// Replaces mesh's vertices and indices with geometry (a text that changed, a shape built
+// again). Its morph targets are dropped. False, changing nothing, for an unknown mesh or
+// an empty geometry, or when the upload fails.
+bool Scene_set_geometry(*Scene self, int mesh, *SceneGeometry geometry) {
+    if (mesh <= 0 || mesh >= self.meshes.size) return false;
+    if (geometry.vertex_count == 0 || geometry.index_count < 3) return false;
+    Result<GpuBuffer, string> vb = self.gpu.vertices(geometry.vertices, (uint64)geometry.vertex_count * SCENE_VERTEX_FLOATS * 4);
+    if (!vb.ok) return false;
+    Result<GpuBuffer, string> ib = self.gpu.indices(geometry.indices, (uint64)geometry.index_count);
+    if (!ib.ok) {
+        vb.value.release();
+        return false;
+    }
+    *SceneMesh m = &self.meshes.data[mesh];
+    m.vertices.release();
+    m.indices.release();
+    m.morph.release();
+    m.targets = 0;
+    m.vertices = vb.value;
+    m.indices = ib.value;
+    m.index_count = geometry.index_count;
+    m.vertex_count = geometry.vertex_count;
+    m.min = geometry.min;
+    m.max = geometry.max;
+    for (i in 0..self._r.nodes.size) {
+        if (self._r.nodes.data[i].bound_mesh == mesh) self._r.nodes.data[i].bound_mesh = -1;
+    }
+    return true;
+}
+
 // Gives mesh targets morph targets: positions and normals (normals may be null) hold
 // targets * vertex_count * 3 floats each, the delta of target t for vertex v at
 // (t * vertex_count + v) * 3. A node drawing the mesh blends them by its weights
@@ -836,6 +866,20 @@ int Scene_add_material(*Scene self, SceneMaterial material) {
 int Scene_add_texture(*Scene self, GpuTexture texture) {
     List_push(&self.textures, texture);
     return self.textures.size - 1;
+}
+
+// Replaces texture id with texture, releasing the old one; every material using the id
+// shows the new one. False for an unknown id (texture is then not taken over).
+bool Scene_set_texture(*Scene self, int id, GpuTexture texture) {
+    if (id <= 0 || id >= self.textures.size) return false;
+    self.textures.data[id].release();
+    self.textures.data[id] = texture;
+    for (i in 0..self._r.mats.size) {
+        for (k in 0..6) {
+            if (self._r.mats.data[i].bound[k] == id) self._r.mats.data[i].bound[k] = -1;
+        }
+    }
+    return true;
 }
 
 // A texture from decoded pixels, stored as sRGB when srgb (color data) or linear (normal,
