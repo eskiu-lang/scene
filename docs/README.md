@@ -12,6 +12,7 @@ Guides and reference for scene. The [README](../README.md) has the overview.
 - [Polygons and polylines](shapes.md)
 - [Particles](particles.md): emitters, spawn volumes, bursts, modifiers
 - [Text](text.md): TrueType text laid out as ViroText
+- [Physics](physics.md): rigid bodies, forces, collisions, ray and shape tests
 - [Property animations](animation.md): groups, easing, chains, loops
 - [Hit testing and events](input.md): rays, hit tests, click, drag, pinch, rotate, hover and fuse
 - [API reference](api.md): every public function and type
@@ -53,6 +54,7 @@ macOS; on Linux and Windows, an SDL3 build from your package manager or libsdl.o
 | `<scene/particles>` | `SceneParticleEmitter`, modifiers, bursts, spawn volumes |
 | `<scene/text>` | `SceneText`, `SceneTextStyle`, layout and glyph atlases over eskiu-lang/font |
 | `<scene/animation>` | `SceneAnimations`: groups, easing curves, chains, playback |
+| `<scene/physics>` | `ScenePhysicsWorld`, bodies, shapes, forces, collision events, ray and shape tests |
 | `<scene/input>` | screen rays, hit tests, `SceneInput` and node events, `SceneOrbit` |
 
 ## Tests
@@ -76,6 +78,7 @@ Each test renders small images and reads them back:
 | `tests/shadows.esk` | a box's shadow on the ground where geometry puts it, opacity, nodes that do not cast or receive, two shadowed lights, a spot light's shadow over its whole cone |
 | `tests/gltf.esk` | a glTF model's node tree, transforms, unlit material and pose updates |
 | `tests/animation.esk` | the easing curves against ViroReact's formulas, Euler order, groups with delays, serial and parallel chains, a skipped frame, ViroReact's property strings, relative values across loops, opacity, color, pause, resume, stop |
+| `tests/physics.esk` | free fall against ViroReact's gravity and fixed steps, the 10-step cap, a ball resting on a floor with one collision event, a bounce, a stack of boxes settling flat and sleeping, forces, constant velocity, a torque impulse, a kinematic body pushing, closest and all ray hits, shape tests at a point and swept, shapes from scaled meshes and children |
 | `tests/input.esk` | screen rays against the camera's field of view, hits on rotated, scaled and nested nodes, hidden and `ignore_events` nodes, bubbling to a handler, click states, fixed-distance and plane drags, pinch, rotation, hover hysteresis, fuse |
 
 ## Not yet

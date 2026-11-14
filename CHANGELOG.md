@@ -62,6 +62,11 @@ All notable changes to this package are documented here. The format follows
   glTF material takes its base color texture's sampler.
 - `Scene_set_geometry` and `Scene_set_texture` replace a mesh's or a texture's contents in
   place.
+- `<scene/physics>`: `ScenePhysicsWorld`, ViroReact's physics bodies: static, kinematic and
+  dynamic bodies with box, sphere, automatic and compound shapes, gravity, friction,
+  restitution, forces, torques, impulses, constant velocities and sleeping, stepped in fixed
+  1/60 s steps (at most 10 a frame); collision events sampled every 160 ms on new contacts,
+  with the other body's tag, point and normal; ray and shape tests that notify the bodies.
 - `<scene/animation>`: `SceneAnimations` animates position, scale, Euler rotation,
   opacity and material color in groups (duration, delay, easing) and serial or parallel
   chains, with ViroReact's easing curves, relative values and property strings, loops,

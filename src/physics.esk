@@ -1,0 +1,1208 @@
+// physics.esk: rigid body physics (`<scene/physics>`).
+//
+// ViroReact's physics, on an engine written in Eskiu: bodies attached to nodes, static,
+// kinematic or dynamic, with box, sphere and compound shapes (or shapes taken from the node's
+// meshes), gravity, friction and restitution, forces, impulses and velocities, collision
+// events, and ray and shape tests against the bodies.
+//
+//     ScenePhysicsWorld world = scene_physics();
+//     defer world.free();
+//     int floor = world.add(&scene, ground, SCENE_BODY_STATIC, 0.0, scene_physics_box(Vec3{10.0, 0.1, 10.0}));
+//     int ball = world.add(&scene, node, SCENE_BODY_DYNAMIC, 1.0, scene_physics_sphere(0.2));
+//     world.body(ball).restitution = 0.6;
+//     world.on_collision(ball, void(*ScenePhysicsCollision c) { ... });
+//     ...each frame, before rendering:
+//     world.update(&scene, now);
+//
+// The world steps in fixed substeps of 1/60 s over the time that passed (at most 10 a
+// frame), as ViroReact's does, and writes dynamic bodies' transforms to their nodes.
+// Static and kinematic bodies follow their nodes. Collisions use contact manifolds (box
+// against box by separating axes and face clipping, spheres exactly) solved by sequential
+// impulses; motion is plausible and stable, not step-for-step identical to Bullet's.
+
+import <mem>;
+import <list>;
+import <libc>;
+import <gpu/math>;
+import <scene>;
+
+// Body types (ViroReact's physicsBody type): static bodies never move and have no mass;
+// kinematic ones have no mass and move only with their node; dynamic ones have a mass and
+// move under the simulation.
+const int SCENE_BODY_STATIC = 0;
+const int SCENE_BODY_KINEMATIC = 1;
+const int SCENE_BODY_DYNAMIC = 2;
+
+const int _PH_BOX = 0;
+const int _PH_SPHERE = 1;
+
+// The fixed step and the most steps one update takes (ViroReact's).
+const double SCENE_PHYSICS_STEP = 0.016666666666666666;
+const int SCENE_PHYSICS_MAX_STEPS = 10;
+
+// One part of a shape: a box (size: width, height, length) or a sphere (radius in size.x),
+// placed at offset and turned by rotation in the body's space.
+struct ScenePhysicsPart {
+    int kind;
+    Vec3 size;
+    Vec3 offset;
+    Quat rotation;
+}
+
+// A collision shape: one or more parts. compound weighs parts by volume for the center of
+// mass and the inertia (ViroReact's authored compounds); otherwise equally.
+struct ScenePhysicsShape {
+    List<ScenePhysicsPart> parts;
+    bool by_volume;
+}
+
+// A box width x height x length, centered on the node.
+ScenePhysicsShape scene_physics_box(Vec3 size) {
+    ScenePhysicsShape s;
+    List_push(&s.parts, ScenePhysicsPart{_PH_BOX, size, Vec3{0.0, 0.0, 0.0}, quat_identity()});
+    return s;
+}
+
+// A sphere of radius, centered on the node.
+ScenePhysicsShape scene_physics_sphere(float radius) {
+    ScenePhysicsShape s;
+    List_push(&s.parts, ScenePhysicsPart{_PH_SPHERE, Vec3{radius, radius, radius}, Vec3{0.0, 0.0, 0.0}, quat_identity()});
+    return s;
+}
+
+// An empty compound shape; add parts with ScenePhysicsShape_add_box and _add_sphere.
+ScenePhysicsShape scene_physics_compound() {
+    ScenePhysicsShape s;
+    s.by_volume = true;
+    return s;
+}
+
+// Adds a box of size at offset to a compound.
+void ScenePhysicsShape_add_box(*ScenePhysicsShape self, Vec3 size, Vec3 offset) {
+    List_push(&self.parts, ScenePhysicsPart{_PH_BOX, size, offset, quat_identity()});
+}
+
+// Adds a sphere of radius at offset to a compound.
+void ScenePhysicsShape_add_sphere(*ScenePhysicsShape self, float radius, Vec3 offset) {
+    List_push(&self.parts, ScenePhysicsPart{_PH_SPHERE, Vec3{radius, radius, radius}, offset, quat_identity()});
+}
+
+void _ph_mesh_box(*Scene scene, int node, Mat4 to_root, *ScenePhysicsShape s) {
+    *SceneNode n = Scene_node(scene, node);
+    if (n.mesh > 0 && n.mesh < scene.meshes.size) {
+        *SceneMesh m = &scene.meshes.data[n.mesh];
+        Vec3 size = m.max - m.min;
+        if (size.x < 0.001) size.x = 0.001;
+        if (size.y < 0.001) size.y = 0.001;
+        if (size.z < 0.001) size.z = 0.001;
+        Vec3 t;
+        Quat r;
+        Vec3 sc;
+        scene_decompose(to_root, &t, &r, &sc);
+        Vec3 mid = (m.min + m.max) * 0.5;
+        Vec3 off = to_root.point(mid);
+        List_push(&s.parts, ScenePhysicsPart{_PH_BOX, Vec3{size.x * sc.x, size.y * sc.y, size.z * sc.z}, off, r});
+    }
+}
+
+void _ph_auto_compound(*Scene scene, int root, int node, Mat4 inv_root, Vec3 root_scale, *ScenePhysicsShape s) {
+    *SceneNode n = Scene_node(scene, node);
+    if (!n.alive) return;
+    // the node's place in the root's space, with the root's scale kept (ViroReact scales the
+    // parts by the compound node's scale by hand)
+    Mat4 rel = inv_root * n.world;
+    Mat4 scaled = mat4_scale(root_scale) * rel;
+    _ph_mesh_box(scene, node, scaled, s);
+    for (i in 0..n.children.size) _ph_auto_compound(scene, root, n.children.data[i], inv_root, root_scale, s);
+}
+
+// The shape ViroReact's "Auto" body takes from a node: a box around the node's own mesh, in
+// its scale.
+ScenePhysicsShape scene_physics_auto(*Scene scene, int node) {
+    Scene_update(scene);
+    ScenePhysicsShape s;
+    Vec3 t;
+    Quat r;
+    Vec3 sc;
+    scene_decompose(Scene_node(scene, node).world, &t, &r, &sc);
+    _ph_mesh_box(scene, node, mat4_scale(sc), &s);
+    return s;
+}
+
+// ViroReact's "Compound" body without parts: a box around each mesh of the node and its
+// descendants, placed as they are under the node.
+ScenePhysicsShape scene_physics_auto_compound(*Scene scene, int node) {
+    Scene_update(scene);
+    ScenePhysicsShape s;
+    Vec3 t;
+    Quat r;
+    Vec3 sc;
+    Mat4 w = Scene_node(scene, node).world;
+    scene_decompose(w, &t, &r, &sc);
+    Mat4 unscaled = mat4_trs(t, r, Vec3{1.0, 1.0, 1.0});
+    _ph_auto_compound(scene, node, node, unscaled.inverse(), Vec3{1.0, 1.0, 1.0}, &s);
+    return s;
+}
+
+// A collision event: the body, the other body's tag (or a ray's or shape test's tag), where
+// they touched on this body, and the contact normal pointing from the other body into this
+// one.
+struct ScenePhysicsCollision {
+    int body;
+    string other_tag;
+    Vec3 point;
+    Vec3 normal;
+}
+
+struct _PhMat3 {
+    float[9] m;
+}
+
+// A body. tag names it in other bodies' collision events (ViroReact's viroTag). friction
+// (0.5) and restitution (0) are Bullet's defaults; use_gravity, enabled (taking part in the
+// simulation) and the velocities are ViroReact's.
+struct ScenePhysicsBody {
+    int node;
+    int type;
+    float mass;
+    ScenePhysicsShape shape;
+    string tag;
+    float friction;
+    float restitution;
+    bool use_gravity;
+    bool enabled;
+    Vec3 linear_velocity;
+    Vec3 angular_velocity;
+    bool alive;
+    bool sleeping;
+    float _sleep_time;
+    Vec3 _pos;
+    Quat _rot;
+    Vec3 _com;
+    float _inv_mass;
+    _PhMat3 _inv_inertia_local;
+    Vec3 _force;
+    Vec3 _torque;
+    Vec3 _impulse;
+    Vec3 _impulse_at;
+    bool _has_impulse;
+    Vec3 _torque_impulse;
+    Vec3 _set_velocity;
+    int _velocity_mode;
+    List<Vec3> _forces;
+    List<Vec3> _force_at;
+    bool _has_handler;
+    fn(*ScenePhysicsCollision)->void _handler;
+    double _sampled;
+    List<int> _last_keys;
+    List<int> _cur_keys;
+    List<ScenePhysicsCollision> _cur;
+    Vec3 _prev_pos;
+    Quat _prev_rot;
+}
+
+struct _PhContact {
+    int a;
+    int b;
+    Vec3 point;
+    Vec3 normal;
+    float depth;
+    Vec3 ra;
+    Vec3 rb;
+    float normal_mass;
+    float bias;
+    float accum_n;
+    Vec3 t1;
+    Vec3 t2;
+    float accum_t1;
+    float accum_t2;
+    float mass_t1;
+    float mass_t2;
+    float restitution_v;
+}
+
+// A physics world: gravity ((0, -9.81, 0) by default) and its bodies by id.
+struct ScenePhysicsWorld {
+    Vec3 gravity;
+    int iterations;
+    List<ScenePhysicsBody> bodies;
+    List<_PhContact> _contacts;
+    double _last;
+    double _carry;
+    bool _started;
+}
+
+// A world with ViroReact's defaults.
+ScenePhysicsWorld scene_physics() {
+    ScenePhysicsWorld w;
+    w.gravity = Vec3{0.0, -9.81, 0.0};
+    w.iterations = 10;
+    return w;
+}
+
+_PhMat3 _ph_diag(Vec3 d) {
+    _PhMat3 r;
+    r.m[0] = d.x;
+    r.m[4] = d.y;
+    r.m[8] = d.z;
+    return r;
+}
+
+_PhMat3 _ph_from_quat(Quat q) {
+    Mat4 m = mat4_trs(Vec3{0.0, 0.0, 0.0}, q, Vec3{1.0, 1.0, 1.0});
+    _PhMat3 r;
+    for (c in 0..3) {
+        for (rr in 0..3) r.m[c * 3 + rr] = m.m[c * 4 + rr];
+    }
+    return r;
+}
+
+// column-major 3x3: m[c * 3 + r]
+Vec3 _ph_mul(*_PhMat3 a, Vec3 v) {
+    return Vec3{a.m[0] * v.x + a.m[3] * v.y + a.m[6] * v.z, a.m[1] * v.x + a.m[4] * v.y + a.m[7] * v.z,
+        a.m[2] * v.x + a.m[5] * v.y + a.m[8] * v.z};
+}
+
+_PhMat3 _ph_mm(*_PhMat3 a, *_PhMat3 b) {
+    _PhMat3 r;
+    for (c in 0..3) {
+        for (rr in 0..3) {
+            float s = 0.0;
+            for (k in 0..3) s += a.m[k * 3 + rr] * b.m[c * 3 + k];
+            r.m[c * 3 + rr] = s;
+        }
+    }
+    return r;
+}
+
+_PhMat3 _ph_transpose(*_PhMat3 a) {
+    _PhMat3 r;
+    for (c in 0..3) {
+        for (rr in 0..3) r.m[c * 3 + rr] = a.m[rr * 3 + c];
+    }
+    return r;
+}
+
+_PhMat3 _ph_inverse(*_PhMat3 a) {
+    float[9] m = a.m;
+    float c00 = m[4] * m[8] - m[7] * m[5];
+    float c01 = m[7] * m[2] - m[1] * m[8];
+    float c02 = m[1] * m[5] - m[4] * m[2];
+    float det = m[0] * c00 + m[3] * c01 + m[6] * c02;
+    _PhMat3 r;
+    if (det > -1e-20 && det < 1e-20) return r;
+    float inv = 1.0 / det;
+    r.m[0] = c00 * inv;
+    r.m[1] = c01 * inv;
+    r.m[2] = c02 * inv;
+    r.m[3] = (m[6] * m[5] - m[3] * m[8]) * inv;
+    r.m[4] = (m[0] * m[8] - m[6] * m[2]) * inv;
+    r.m[5] = (m[3] * m[2] - m[0] * m[5]) * inv;
+    r.m[6] = (m[3] * m[7] - m[6] * m[4]) * inv;
+    r.m[7] = (m[6] * m[1] - m[0] * m[7]) * inv;
+    r.m[8] = (m[0] * m[4] - m[3] * m[1]) * inv;
+    return r;
+}
+
+float _ph_volume(*ScenePhysicsPart p) {
+    if (p.kind == _PH_SPHERE) return 4.18879 * p.size.x * p.size.x * p.size.x;
+    return p.size.x * p.size.y * p.size.z;
+}
+
+// Mass properties: the center of mass (in the node's space) and the inverse inertia about
+// it, from the parts' weights.
+void _ph_mass(*ScenePhysicsBody b) {
+    int n = b.shape.parts.size;
+    b._com = Vec3{0.0, 0.0, 0.0};
+    b._inv_inertia_local = _ph_diag(Vec3{0.0, 0.0, 0.0});
+    if (b.type != SCENE_BODY_DYNAMIC || b.mass <= 0.0 || n == 0) {
+        b._inv_mass = 0.0;
+        return;
+    }
+    b._inv_mass = 1.0 / b.mass;
+    float total = 0.0;
+    float[64] w;
+    for (i in 0..n) {
+        if (i >= 64) break;
+        w[i] = b.shape.by_volume ? _ph_volume(&b.shape.parts.data[i]) : 1.0;
+        total += w[i];
+    }
+    if (total <= 0.0) {
+        for (i in 0..n) w[i] = 1.0;
+        total = (float)n;
+    }
+    for (i in 0..n) {
+        if (i >= 64) break;
+        b._com = b._com + b.shape.parts.data[i].offset * (w[i] / total);
+    }
+    _PhMat3 inertia;
+    for (i in 0..n) {
+        if (i >= 64) break;
+        ScenePhysicsPart p = b.shape.parts.data[i];
+        float pm = b.mass * w[i] / total;
+        Vec3 d;
+        if (p.kind == _PH_SPHERE) {
+            float k = 0.4 * pm * p.size.x * p.size.x;
+            d = Vec3{k, k, k};
+        } else {
+            Vec3 s = p.size;
+            d = Vec3{pm / 12.0 * (s.y * s.y + s.z * s.z), pm / 12.0 * (s.x * s.x + s.z * s.z), pm / 12.0 * (s.x * s.x + s.y * s.y)};
+        }
+        _PhMat3 rot = _ph_from_quat(p.rotation);
+        _PhMat3 dd = _ph_diag(d);
+        _PhMat3 rt = _ph_transpose(&rot);
+        _PhMat3 tmp = _ph_mm(&rot, &dd);
+        _PhMat3 local = _ph_mm(&tmp, &rt);
+        // parallel axis: m (|r|^2 I - r r^T)
+        Vec3 r = p.offset - b._com;
+        float rr = r.dot(r);
+        float[9] pa = {pm * (rr - r.x * r.x), -pm * r.y * r.x, -pm * r.z * r.x,
+                       -pm * r.x * r.y, pm * (rr - r.y * r.y), -pm * r.z * r.y,
+                       -pm * r.x * r.z, -pm * r.y * r.z, pm * (rr - r.z * r.z)};
+        for (k in 0..9) inertia.m[k] += local.m[k] + pa[k];
+    }
+    b._inv_inertia_local = _ph_inverse(&inertia);
+}
+
+_PhMat3 _ph_inv_inertia_world(*ScenePhysicsBody b) {
+    if (b._inv_mass == 0.0) return _ph_diag(Vec3{0.0, 0.0, 0.0});
+    _PhMat3 r = _ph_from_quat(b._rot);
+    _PhMat3 rt = _ph_transpose(&r);
+    _PhMat3 t = _ph_mm(&r, &b._inv_inertia_local);
+    return _ph_mm(&t, &rt);
+}
+
+void _ph_read_node(*ScenePhysicsBody b, *Scene scene) {
+    Mat4 w = Scene_node(scene, b.node).world;
+    Vec3 t;
+    Quat r;
+    Vec3 s;
+    scene_decompose(w, &t, &r, &s);
+    b._rot = r;
+    b._pos = t + r.rotate(b._com);
+}
+
+// Adds a body to node and returns its id. mass must be above 0 for a dynamic body and 0
+// for the others (ViroReact's rule); a wrong mass is fixed to 1 or 0. The shape is taken
+// over; its sizes are in the node's space without its scale, which the world applies.
+int ScenePhysicsWorld_add(*ScenePhysicsWorld self, *Scene scene, int node, int type, float mass, ScenePhysicsShape shape) {
+    Scene_update(scene);
+    ScenePhysicsBody b;
+    b.node = node;
+    b.type = type;
+    b.mass = type == SCENE_BODY_DYNAMIC ? (mass > 0.0 ? mass : 1.0) : 0.0;
+    b.friction = 0.5;
+    b.restitution = 0.0;
+    b.use_gravity = true;
+    b.enabled = true;
+    b.alive = true;
+    b.tag = "";
+    // the node's scale goes into the parts
+    Vec3 t;
+    Quat r;
+    Vec3 s;
+    scene_decompose(Scene_node(scene, node).world, &t, &r, &s);
+    for (i in 0..shape.parts.size) {
+        *ScenePhysicsPart p = &shape.parts.data[i];
+        if (p.kind == _PH_SPHERE) {
+            float k = s.x > s.y ? s.x : s.y;
+            if (s.z > k) k = s.z;
+            p.size = p.size * k;
+        } else {
+            p.size = Vec3{p.size.x * s.x, p.size.y * s.y, p.size.z * s.z};
+        }
+        p.offset = Vec3{p.offset.x * s.x, p.offset.y * s.y, p.offset.z * s.z};
+    }
+    b.shape = shape;
+    _ph_mass(&b);
+    _ph_read_node(&b, scene);
+    b._prev_pos = b._pos;
+    b._prev_rot = b._rot;
+    List_push(&self.bodies, b);
+    return self.bodies.size - 1;
+}
+
+// The body with id, for its properties.
+*ScenePhysicsBody ScenePhysicsWorld_body(*ScenePhysicsWorld self, int id) {
+    if (id < 0 || id >= self.bodies.size) return null;
+    return &self.bodies.data[id];
+}
+
+// Removes a body from the simulation (its id is not reused).
+void ScenePhysicsWorld_remove(*ScenePhysicsWorld self, int id) {
+    *ScenePhysicsBody b = ScenePhysicsWorld_body(self, id);
+    if (b != null) b.alive = false;
+}
+
+// Takes the node's current transform into the body (after moving a dynamic body's node by
+// hand), and wakes it.
+void ScenePhysicsWorld_refresh(*ScenePhysicsWorld self, *Scene scene, int id) {
+    *ScenePhysicsBody b = ScenePhysicsWorld_body(self, id);
+    if (b == null) return;
+    Scene_update(scene);
+    _ph_read_node(b, scene);
+    b.sleeping = false;
+    b._sleep_time = 0.0;
+}
+
+// Adds a force (newtons) applied at position (an offset from the body's center, in world
+// directions) at every step until ScenePhysicsWorld_clear_forces (ViroReact's applyForce).
+void ScenePhysicsWorld_apply_force(*ScenePhysicsWorld self, int id, Vec3 force, Vec3 position) {
+    *ScenePhysicsBody b = ScenePhysicsWorld_body(self, id);
+    if (b == null) return;
+    List_push(&b._forces, force);
+    List_push(&b._force_at, position);
+    b.sleeping = false;
+}
+
+// Adds a torque applied at every step until cleared.
+void ScenePhysicsWorld_apply_torque(*ScenePhysicsWorld self, int id, Vec3 torque) {
+    *ScenePhysicsBody b = ScenePhysicsWorld_body(self, id);
+    if (b == null) return;
+    b._torque = b._torque + torque;
+    b.sleeping = false;
+}
+
+// Removes the forces and torques.
+void ScenePhysicsWorld_clear_forces(*ScenePhysicsWorld self, int id) {
+    *ScenePhysicsBody b = ScenePhysicsWorld_body(self, id);
+    if (b == null) return;
+    List_clear(&b._forces);
+    List_clear(&b._force_at);
+    b._torque = Vec3{0.0, 0.0, 0.0};
+}
+
+// An impulse (newton seconds) at position (offset from the center), once, on the next step.
+void ScenePhysicsWorld_apply_impulse(*ScenePhysicsWorld self, int id, Vec3 impulse, Vec3 position) {
+    *ScenePhysicsBody b = ScenePhysicsWorld_body(self, id);
+    if (b == null || b._inv_mass == 0.0) return;
+    b.linear_velocity = b.linear_velocity + impulse * b._inv_mass;
+    _PhMat3 iw = _ph_inv_inertia_world(b);
+    b.angular_velocity = b.angular_velocity + _ph_mul(&iw, position.cross(impulse));
+    b.sleeping = false;
+}
+
+// A torque impulse, once.
+void ScenePhysicsWorld_apply_torque_impulse(*ScenePhysicsWorld self, int id, Vec3 impulse) {
+    *ScenePhysicsBody b = ScenePhysicsWorld_body(self, id);
+    if (b == null || b._inv_mass == 0.0) return;
+    _PhMat3 iw = _ph_inv_inertia_world(b);
+    b.angular_velocity = b.angular_velocity + _ph_mul(&iw, impulse);
+    b.sleeping = false;
+}
+
+// Sets the body's velocity: kept at every step when constant (ViroReact's constant
+// velocity), else once.
+void ScenePhysicsWorld_set_velocity(*ScenePhysicsWorld self, int id, Vec3 velocity, bool constant) {
+    *ScenePhysicsBody b = ScenePhysicsWorld_body(self, id);
+    if (b == null) return;
+    b._set_velocity = velocity;
+    b._velocity_mode = constant ? 2 : 1;
+    b.sleeping = false;
+}
+
+// Calls handler when the body starts touching another body, as ViroReact's onCollision:
+// contacts are sampled every 160 ms and only new ones are reported.
+void ScenePhysicsWorld_on_collision(*ScenePhysicsWorld self, int id, escaping fn(*ScenePhysicsCollision)->void handler) {
+    *ScenePhysicsBody b = ScenePhysicsWorld_body(self, id);
+    if (b == null) return;
+    if (b._has_handler) free_closure(b._handler);
+    b._has_handler = true;
+    b._handler = handler;
+}
+
+// --- collision ---
+
+struct _PhPart {
+    int kind;
+    Vec3 center;
+    Quat rot;
+    Vec3 half;
+    float radius;
+}
+
+_PhPart _ph_world_part(*ScenePhysicsBody b, *ScenePhysicsPart p) {
+    _PhPart w;
+    w.kind = p.kind;
+    w.rot = b._rot * p.rotation;
+    w.center = b._pos + b._rot.rotate(p.offset - b._com);
+    w.half = p.size * 0.5;
+    w.radius = p.size.x;
+    return w;
+}
+
+void _ph_add_contact(*ScenePhysicsWorld self, int a, int b, Vec3 point, Vec3 normal, float depth) {
+    _PhContact c;
+    c.a = a;
+    c.b = b;
+    c.point = point;
+    c.normal = normal;
+    c.depth = depth;
+    List_push(&self._contacts, c);
+}
+
+// normal points from b into a
+void _ph_sphere_sphere(*ScenePhysicsWorld self, int a, int b, _PhPart pa, _PhPart pb) {
+    Vec3 d = pa.center - pb.center;
+    float dist = d.length();
+    float r = pa.radius + pb.radius;
+    if (dist >= r) return;
+    Vec3 n = dist > 1e-6 ? d / dist : Vec3{0.0, 1.0, 0.0};
+    _ph_add_contact(self, a, b, pb.center + n * pb.radius, n, r - dist);
+}
+
+// sphere a against box b
+void _ph_sphere_box(*ScenePhysicsWorld self, int a, int b, _PhPart s, _PhPart bx, bool flip) {
+    Quat inv = bx.rot.conjugate();
+    Vec3 local = inv.rotate(s.center - bx.center);
+    Vec3 h = bx.half;
+    Vec3 q = Vec3{local.x < -h.x ? -h.x : (local.x > h.x ? h.x : local.x), local.y < -h.y ? -h.y : (local.y > h.y ? h.y : local.y),
+        local.z < -h.z ? -h.z : (local.z > h.z ? h.z : local.z)};
+    Vec3 d = local - q;
+    float dist = d.length();
+    Vec3 n_local;
+    float depth = 0.0;
+    if (dist > 1e-6) {
+        if (dist >= s.radius) return;
+        n_local = d / dist;
+        depth = s.radius - dist;
+    } else {
+        // the center is inside: out through the nearest face
+        float[3] gaps = {h.x - (local.x < 0.0 ? -local.x : local.x), h.y - (local.y < 0.0 ? -local.y : local.y),
+            h.z - (local.z < 0.0 ? -local.z : local.z)};
+        int k = 0;
+        if (gaps[1] < gaps[k]) k = 1;
+        if (gaps[2] < gaps[k]) k = 2;
+        float[3] lc = {local.x, local.y, local.z};
+        float sign = lc[k] < 0.0 ? -1.0 : 1.0;
+        n_local = k == 0 ? Vec3{sign, 0.0, 0.0} : (k == 1 ? Vec3{0.0, sign, 0.0} : Vec3{0.0, 0.0, sign});
+        depth = gaps[k] + s.radius;
+        if (k == 0) q.x = sign * h.x;
+        if (k == 1) q.y = sign * h.y;
+        if (k == 2) q.z = sign * h.z;
+    }
+    Vec3 n = bx.rot.rotate(n_local);
+    Vec3 p = bx.center + bx.rot.rotate(q);
+    if (flip) _ph_add_contact(self, b, a, p, -n, depth);
+    else _ph_add_contact(self, a, b, p, n, depth);
+}
+
+Vec3 _ph_axis(Quat r, int k) {
+    if (k == 0) return r.rotate(Vec3{1.0, 0.0, 0.0});
+    if (k == 1) return r.rotate(Vec3{0.0, 1.0, 0.0});
+    return r.rotate(Vec3{0.0, 0.0, 1.0});
+}
+
+float _ph_project(_PhPart p, Vec3 axis) {
+    float e = 0.0;
+    float[3] h = {p.half.x, p.half.y, p.half.z};
+    for (k in 0..3) {
+        float d = _ph_axis(p.rot, k).dot(axis);
+        e += h[k] * (d < 0.0 ? -d : d);
+    }
+    return e;
+}
+
+// box a against box b by separating axes; contacts from clipping the incident face to the
+// reference face, or one point between the closest edges
+void _ph_box_box(*ScenePhysicsWorld self, int a, int b, _PhPart pa, _PhPart pb) {
+    Vec3 t = pa.center - pb.center;
+    float best = 1e30;
+    Vec3 best_axis;
+    int best_kind = -1;
+    int ea = 0;
+    int eb = 0;
+    for (i in 0..15) {
+        Vec3 axis;
+        int kind = 0;
+        if (i < 3) {
+            axis = _ph_axis(pa.rot, i);
+            kind = 0;
+        } else if (i < 6) {
+            axis = _ph_axis(pb.rot, i - 3);
+            kind = 1;
+        } else {
+            axis = _ph_axis(pa.rot, (i - 6) / 3).cross(_ph_axis(pb.rot, (i - 6) % 3));
+            float l = axis.length();
+            if (l < 1e-5) continue;
+            axis = axis / l;
+            kind = 2;
+        }
+        float dist = t.dot(axis);
+        float overlap = _ph_project(pa, axis) + _ph_project(pb, axis) - (dist < 0.0 ? -dist : dist);
+        if (overlap < 0.0) return;
+        // prefer face axes over nearly equal edge axes, for stable resting contacts
+        float score = kind == 2 ? overlap * 1.05 + 1e-4 : overlap;
+        if (score < best) {
+            best = score;
+            best_axis = dist < 0.0 ? -axis : axis;
+            best_kind = kind;
+            ea = (i - 6) / 3;
+            eb = (i - 6) % 3;
+        }
+    }
+    Vec3 n = best_axis;
+    float depth = _ph_project(pa, n) + _ph_project(pb, n) - (t.dot(n) < 0.0 ? -t.dot(n) : t.dot(n));
+    if (best_kind == 2) {
+        // closest points between the two edges along the axis
+        Vec3 da = _ph_axis(pa.rot, ea);
+        Vec3 db = _ph_axis(pb.rot, eb);
+        Vec3 ca = pa.center;
+        Vec3 cb = pb.center;
+        float[3] ha = {pa.half.x, pa.half.y, pa.half.z};
+        float[3] hb = {pb.half.x, pb.half.y, pb.half.z};
+        for (k in 0..3) {
+            if (k != ea) {
+                Vec3 ax = _ph_axis(pa.rot, k);
+                ca = ca + ax * (ax.dot(n) > 0.0 ? -ha[k] : ha[k]);
+            }
+            if (k != eb) {
+                Vec3 bx = _ph_axis(pb.rot, k);
+                cb = cb + bx * (bx.dot(n) > 0.0 ? hb[k] : -hb[k]);
+            }
+        }
+        Vec3 r = cb - ca;
+        float dd = da.dot(db);
+        float denom = 1.0 - dd * dd;
+        float sa = 0.0;
+        float sb = 0.0;
+        if (denom > 1e-6) {
+            sa = (da.dot(r) - dd * db.dot(r)) / denom;
+            sb = (dd * da.dot(r) - db.dot(r)) / denom;
+        }
+        if (sa > ha[ea]) sa = ha[ea];
+        if (sa < -ha[ea]) sa = -ha[ea];
+        if (sb > hb[eb]) sb = hb[eb];
+        if (sb < -hb[eb]) sb = -hb[eb];
+        Vec3 pa_pt = ca + da * sa;
+        Vec3 pb_pt = cb + db * sb;
+        _ph_add_contact(self, a, b, (pa_pt + pb_pt) * 0.5, n, depth);
+        return;
+    }
+    // reference box: the one whose face is the axis; the other is incident
+    _PhPart ref = best_kind == 0 ? pa : pb;
+    _PhPart inc = best_kind == 0 ? pb : pa;
+    Vec3 rn = best_kind == 0 ? -n : n;   // reference face normal, toward the incident box
+    // the reference face
+    int rf = 0;
+    float bestd = -1e30;
+    for (k in 0..3) {
+        float d = _ph_axis(ref.rot, k).dot(rn);
+        float ad = d < 0.0 ? -d : d;
+        if (ad > bestd) {
+            bestd = ad;
+            rf = k;
+        }
+    }
+    Vec3 rax = _ph_axis(ref.rot, rf);
+    float rsign = rax.dot(rn) > 0.0 ? 1.0 : -1.0;
+    float[3] rh = {ref.half.x, ref.half.y, ref.half.z};
+    Vec3 rface_c = ref.center + rax * (rsign * rh[rf]);
+    Vec3 rnorm = rax * rsign;
+    int u = (rf + 1) % 3;
+    int v = (rf + 2) % 3;
+    Vec3 ru = _ph_axis(ref.rot, u);
+    Vec3 rv = _ph_axis(ref.rot, v);
+    // the incident face: most anti-parallel to the reference normal
+    int f = 0;
+    float most = 1e30;
+    for (k in 0..3) {
+        float d = _ph_axis(inc.rot, k).dot(rnorm);
+        float s = d < 0.0 ? d : -d;
+        if (s < most) {
+            most = s;
+            f = k;
+        }
+    }
+    Vec3 iax = _ph_axis(inc.rot, f);
+    float isign = iax.dot(rnorm) > 0.0 ? -1.0 : 1.0;
+    float[3] ih = {inc.half.x, inc.half.y, inc.half.z};
+    Vec3 ic = inc.center + iax * (isign * ih[f]);
+    Vec3 iu = _ph_axis(inc.rot, (f + 1) % 3) * ih[(f + 1) % 3];
+    Vec3 iv = _ph_axis(inc.rot, (f + 2) % 3) * ih[(f + 2) % 3];
+    Vec3[16] poly;
+    int count = 4;
+    poly[0] = ic + iu + iv;
+    poly[1] = ic - iu + iv;
+    poly[2] = ic - iu - iv;
+    poly[3] = ic + iu - iv;
+    // clip against the 4 side planes of the reference face
+    Vec3[4] pn = {ru, -ru, rv, -rv};
+    float[4] pd = {ru.dot(ref.center) + rh[u], -ru.dot(ref.center) + rh[u], rv.dot(ref.center) + rh[v], -rv.dot(ref.center) + rh[v]};
+    for (pl in 0..4) {
+        Vec3[16] out;
+        int oc = 0;
+        for (i in 0..count) {
+            Vec3 p = poly[i];
+            Vec3 q = poly[(i + 1) % count];
+            float dp = pn[pl].dot(p) - pd[pl];
+            float dq = pn[pl].dot(q) - pd[pl];
+            if (dp <= 0.0 && oc < 16) {
+                out[oc] = p;
+                oc++;
+            }
+            if ((dp < 0.0 && dq > 0.0) || (dp > 0.0 && dq < 0.0)) {
+                if (oc < 16) {
+                    out[oc] = p + (q - p) * (dp / (dp - dq));
+                    oc++;
+                }
+            }
+        }
+        count = oc;
+        for (i in 0..count) poly[i] = out[i];
+        if (count == 0) return;
+    }
+    for (i in 0..count) {
+        float sep = rnorm.dot(poly[i] - rface_c);
+        if (sep <= 0.0) {
+            // normal from b into a
+            _ph_add_contact(self, a, b, poly[i] - rnorm * (sep * 0.5), n, -sep);
+        }
+    }
+}
+
+void _ph_collide(*ScenePhysicsWorld self, int a, int b) {
+    *ScenePhysicsBody ba = &self.bodies.data[a];
+    *ScenePhysicsBody bb = &self.bodies.data[b];
+    for (i in 0..ba.shape.parts.size) {
+        _PhPart pa = _ph_world_part(ba, &ba.shape.parts.data[i]);
+        for (j in 0..bb.shape.parts.size) {
+            _PhPart pb = _ph_world_part(bb, &bb.shape.parts.data[j]);
+            if (pa.kind == _PH_SPHERE && pb.kind == _PH_SPHERE) _ph_sphere_sphere(self, a, b, pa, pb);
+            else if (pa.kind == _PH_SPHERE) _ph_sphere_box(self, a, b, pa, pb, false);
+            else if (pb.kind == _PH_SPHERE) _ph_sphere_box(self, b, a, pb, pa, true);
+            else _ph_box_box(self, a, b, pa, pb);
+            ba = &self.bodies.data[a];
+            bb = &self.bodies.data[b];
+        }
+    }
+}
+
+float _ph_bound_radius(*ScenePhysicsBody b) {
+    float r = 0.0;
+    for (i in 0..b.shape.parts.size) {
+        ScenePhysicsPart p = b.shape.parts.data[i];
+        float pr = p.kind == _PH_SPHERE ? p.size.x : (p.size * 0.5).length();
+        float d = (p.offset - b._com).length() + pr;
+        if (d > r) r = d;
+    }
+    return r;
+}
+
+// --- the step ---
+
+Vec3 _ph_point_velocity(*ScenePhysicsBody b, Vec3 r) {
+    return b.linear_velocity + b.angular_velocity.cross(r);
+}
+
+void _ph_apply(*ScenePhysicsBody b, Vec3 impulse, Vec3 r) {
+    if (b._inv_mass == 0.0) return;
+    b.linear_velocity = b.linear_velocity + impulse * b._inv_mass;
+    _PhMat3 iw = _ph_inv_inertia_world(b);
+    b.angular_velocity = b.angular_velocity + _ph_mul(&iw, r.cross(impulse));
+}
+
+float _ph_eff_mass(*ScenePhysicsBody a, *ScenePhysicsBody b, Vec3 ra, Vec3 rb, Vec3 dir) {
+    _PhMat3 ia = _ph_inv_inertia_world(a);
+    _PhMat3 ib = _ph_inv_inertia_world(b);
+    Vec3 ta = _ph_mul(&ia, ra.cross(dir)).cross(ra);
+    Vec3 tb = _ph_mul(&ib, rb.cross(dir)).cross(rb);
+    float k = a._inv_mass + b._inv_mass + dir.dot(ta + tb);
+    return k > 0.0 ? 1.0 / k : 0.0;
+}
+
+bool _ph_moves(*ScenePhysicsBody b) {
+    return b.alive && b.enabled && b.type == SCENE_BODY_DYNAMIC;
+}
+
+void _ph_step(*ScenePhysicsWorld self, *Scene scene, double dt) {
+    float h = (float)dt;
+    int n = self.bodies.size;
+    // static and kinematic bodies follow their nodes; kinematic ones get the velocity of
+    // that motion for their contacts
+    for (i in 0..n) {
+        *ScenePhysicsBody b = &self.bodies.data[i];
+        if (!b.alive || !b.enabled || b.type == SCENE_BODY_DYNAMIC) continue;
+        Vec3 prev = b._pos;
+        _ph_read_node(b, scene);
+        b.linear_velocity = b.type == SCENE_BODY_KINEMATIC && h > 0.0 ? (b._pos - prev) / h : Vec3{0.0, 0.0, 0.0};
+    }
+    // forces and preset velocities
+    for (i in 0..n) {
+        *ScenePhysicsBody b = &self.bodies.data[i];
+        if (!_ph_moves(b)) continue;
+        if (b._velocity_mode != 0) {
+            b.linear_velocity = b._set_velocity;
+            if (b._velocity_mode == 1) b._velocity_mode = 0;
+            b.sleeping = false;
+        }
+        if (b.sleeping) continue;
+        Vec3 f = b.use_gravity ? self.gravity * b.mass : Vec3{0.0, 0.0, 0.0};
+        Vec3 tq = b._torque;
+        for (k in 0..b._forces.size) {
+            f = f + b._forces.data[k];
+            tq = tq + b._force_at.data[k].cross(b._forces.data[k]);
+        }
+        b.linear_velocity = b.linear_velocity + f * (b._inv_mass * h);
+        _PhMat3 iw = _ph_inv_inertia_world(b);
+        b.angular_velocity = b.angular_velocity + _ph_mul(&iw, tq) * h;
+    }
+    // contacts
+    List_clear(&self._contacts);
+    for (i in 0..n) {
+        *ScenePhysicsBody bi = &self.bodies.data[i];
+        if (!bi.alive || !bi.enabled) continue;
+        for (j in (i + 1)..n) {
+            *ScenePhysicsBody bj = &self.bodies.data[j];
+            if (!bj.alive || !bj.enabled) continue;
+            if (!_ph_moves(bi) && !_ph_moves(bj)) continue;
+            if (bi.sleeping && bj.sleeping) continue;
+            if ((bi.sleeping || !_ph_moves(bi)) && (bj.sleeping || !_ph_moves(bj))) continue;
+            float reach = _ph_bound_radius(bi) + _ph_bound_radius(bj);
+            if ((bi._pos - bj._pos).length() > reach) continue;
+            _ph_collide(self, i, j);
+            bi = &self.bodies.data[i];
+        }
+    }
+    // prepare: effective masses, friction directions, restitution, position bias
+    for (k in 0..self._contacts.size) {
+        *_PhContact c = &self._contacts.data[k];
+        *ScenePhysicsBody a = &self.bodies.data[c.a];
+        *ScenePhysicsBody b = &self.bodies.data[c.b];
+        // a contact wakes a sleeping body touched by a moving one
+        if (a.sleeping && _ph_moves(b) && !b.sleeping) a.sleeping = false;
+        if (b.sleeping && _ph_moves(a) && !a.sleeping) b.sleeping = false;
+        c.ra = c.point - a._pos;
+        c.rb = c.point - b._pos;
+        c.normal_mass = _ph_eff_mass(a, b, c.ra, c.rb, c.normal);
+        Vec3 nn = c.normal;
+        Vec3 t1 = nn.cross(nn.x > 0.57 || nn.x < -0.57 ? Vec3{0.0, 1.0, 0.0} : Vec3{1.0, 0.0, 0.0}).normalize();
+        c.t1 = t1;
+        c.t2 = nn.cross(t1);
+        c.mass_t1 = _ph_eff_mass(a, b, c.ra, c.rb, c.t1);
+        c.mass_t2 = _ph_eff_mass(a, b, c.ra, c.rb, c.t2);
+        float vn = (_ph_point_velocity(a, c.ra) - _ph_point_velocity(b, c.rb)).dot(nn);
+        float e = a.restitution * b.restitution;
+        if (a.restitution > b.restitution && b._inv_mass == 0.0) e = a.restitution;
+        if (b.restitution > a.restitution && a._inv_mass == 0.0) e = b.restitution;
+        c.restitution_v = vn < -1.0 ? -e * vn : 0.0;
+        float slop = 0.005;
+        c.bias = c.depth > slop ? 0.2 / h * (c.depth - slop) : 0.0;
+    }
+    // sequential impulses
+    for (it in 0..self.iterations) {
+        for (k in 0..self._contacts.size) {
+            *_PhContact c = &self._contacts.data[k];
+            *ScenePhysicsBody a = &self.bodies.data[c.a];
+            *ScenePhysicsBody b = &self.bodies.data[c.b];
+            Vec3 dv = _ph_point_velocity(a, c.ra) - _ph_point_velocity(b, c.rb);
+            float vn = dv.dot(c.normal);
+            float lambda = c.normal_mass * (-vn + c.bias + c.restitution_v);
+            float old = c.accum_n;
+            c.accum_n = old + lambda > 0.0 ? old + lambda : 0.0;
+            float applied = c.accum_n - old;
+            Vec3 p = c.normal * applied;
+            _ph_apply(a, p, c.ra);
+            _ph_apply(b, -p, c.rb);
+            float mu = (float)sqrt((double)(a.friction * b.friction));
+            float maxf = mu * c.accum_n;
+            dv = _ph_point_velocity(a, c.ra) - _ph_point_velocity(b, c.rb);
+            float l1 = -c.mass_t1 * dv.dot(c.t1);
+            float o1 = c.accum_t1;
+            c.accum_t1 = o1 + l1 < -maxf ? -maxf : (o1 + l1 > maxf ? maxf : o1 + l1);
+            Vec3 p1 = c.t1 * (c.accum_t1 - o1);
+            _ph_apply(a, p1, c.ra);
+            _ph_apply(b, -p1, c.rb);
+            dv = _ph_point_velocity(a, c.ra) - _ph_point_velocity(b, c.rb);
+            float l2 = -c.mass_t2 * dv.dot(c.t2);
+            float o2 = c.accum_t2;
+            c.accum_t2 = o2 + l2 < -maxf ? -maxf : (o2 + l2 > maxf ? maxf : o2 + l2);
+            Vec3 p2 = c.t2 * (c.accum_t2 - o2);
+            _ph_apply(a, p2, c.ra);
+            _ph_apply(b, -p2, c.rb);
+        }
+    }
+    // integrate, then sleep bodies that stayed nearly still for 2 s (Bullet's)
+    for (i in 0..n) {
+        *ScenePhysicsBody b = &self.bodies.data[i];
+        if (!_ph_moves(b) || b.sleeping) continue;
+        if (b._velocity_mode == 2) b.linear_velocity = b._set_velocity;
+        b._pos = b._pos + b.linear_velocity * h;
+        Vec3 w = b.angular_velocity;
+        float wl = w.length();
+        if (wl > 1e-9) b._rot = (quat_axis_angle(w / wl, wl * h) * b._rot).normalize();
+        if (b.linear_velocity.length() < 0.08 && wl < 0.1 && b._velocity_mode == 0 && b._forces.size == 0) {
+            b._sleep_time += h;
+            if (b._sleep_time > 2.0) {
+                b.sleeping = true;
+                b.linear_velocity = Vec3{0.0, 0.0, 0.0};
+                b.angular_velocity = Vec3{0.0, 0.0, 0.0};
+            }
+        } else {
+            b._sleep_time = 0.0;
+        }
+    }
+}
+
+void _ph_write_nodes(*ScenePhysicsWorld self, *Scene scene) {
+    for (i in 0..self.bodies.size) {
+        *ScenePhysicsBody b = &self.bodies.data[i];
+        if (!_ph_moves(b)) continue;
+        *SceneNode n = Scene_node(scene, b.node);
+        if (!n.alive) continue;
+        Vec3 origin = b._pos - b._rot.rotate(b._com);
+        Mat4 parent = n.parent >= 0 ? scene.nodes.data[n.parent].world : mat4_identity();
+        Vec3 pt;
+        Quat pr;
+        Vec3 ps;
+        scene_decompose(parent, &pt, &pr, &ps);
+        Mat4 pinv = parent.inverse();
+        n.position = pinv.point(origin);
+        n.rotation = (pr.conjugate() * b._rot).normalize();
+    }
+}
+
+// The collision events of one update, sampled as ViroReact samples them.
+void _ph_events(*ScenePhysicsWorld self, double time) {
+    for (k in 0..self._contacts.size) {
+        _PhContact c = self._contacts.data[k];
+        for (side in 0..2) {
+            int me = side == 0 ? c.a : c.b;
+            int other = side == 0 ? c.b : c.a;
+            *ScenePhysicsBody b = &self.bodies.data[me];
+            if (!b._has_handler) continue;
+            bool seen = false;
+            for (q in 0..b._cur_keys.size) {
+                if (b._cur_keys.data[q] == other) seen = true;
+            }
+            if (seen) continue;
+            List_push(&b._cur_keys, other);
+            ScenePhysicsCollision ev;
+            ev.body = me;
+            ev.other_tag = self.bodies.data[other].tag;
+            ev.point = c.point;
+            ev.normal = side == 0 ? c.normal : -c.normal;
+            List_push(&b._cur, ev);
+        }
+    }
+    for (i in 0..self.bodies.size) {
+        *ScenePhysicsBody b = &self.bodies.data[i];
+        if (!b._has_handler) continue;
+        if (b._sampled + 0.16 > time) continue;
+        b._sampled = time;
+        for (q in 0..b._cur.size) {
+            ScenePhysicsCollision ev = b._cur.data[q];
+            int other = b._cur_keys.data[q];
+            bool before = false;
+            for (z in 0..b._last_keys.size) {
+                if (b._last_keys.data[z] == other) before = true;
+            }
+            if (before) continue;
+            fn(*ScenePhysicsCollision)->void h = self.bodies.data[i]._handler;
+            h(&ev);
+            b = &self.bodies.data[i];
+        }
+        List_clear(&b._last_keys);
+        for (q in 0..b._cur_keys.size) List_push(&b._last_keys, b._cur_keys.data[q]);
+        List_clear(&b._cur_keys);
+        List_clear(&b._cur);
+    }
+}
+
+// Advances the world to time (seconds) in fixed steps and moves the dynamic bodies' nodes.
+// Returns the number of steps taken.
+int ScenePhysicsWorld_update(*ScenePhysicsWorld self, *Scene scene, double time) {
+    Scene_update(scene);
+    if (!self._started) {
+        self._started = true;
+        self._last = time;
+        return 0;
+    }
+    double elapsed = time - self._last;
+    self._last = time;
+    if (elapsed < 0.0) elapsed = 0.0;
+    double cap = SCENE_PHYSICS_STEP * (double)SCENE_PHYSICS_MAX_STEPS;
+    if (elapsed > cap) elapsed = cap;
+    self._carry += elapsed;
+    int steps = 0;
+    while (self._carry >= SCENE_PHYSICS_STEP && steps < SCENE_PHYSICS_MAX_STEPS) {
+        _ph_step(self, scene, SCENE_PHYSICS_STEP);
+        self._carry -= SCENE_PHYSICS_STEP;
+        steps++;
+    }
+    _ph_write_nodes(self, scene);
+    Scene_update(scene);
+    _ph_events(self, time);
+    return steps;
+}
+
+// --- queries ---
+
+// The distance along from + dir * t (dir unit) to where the ray enters part p, or -1.
+float _ph_ray_part(_PhPart p, Vec3 from, Vec3 dir, float max_t, *Vec3 normal) {
+    if (p.kind == _PH_SPHERE) {
+        Vec3 m = from - p.center;
+        float b = m.dot(dir);
+        float c = m.dot(m) - p.radius * p.radius;
+        if (c > 0.0 && b > 0.0) return -1.0;
+        float disc = b * b - c;
+        if (disc < 0.0) return -1.0;
+        float t = -b - (float)sqrt((double)disc);
+        if (t < 0.0) t = 0.0;
+        if (t > max_t) return -1.0;
+        *normal = (from + dir * t - p.center).normalize();
+        return t;
+    }
+    Quat inv = p.rot.conjugate();
+    Vec3 o = inv.rotate(from - p.center);
+    Vec3 d = inv.rotate(dir);
+    float tmin = 0.0;
+    float tmax = max_t;
+    int axis = -1;
+    float sign = 1.0;
+    float[3] os = {o.x, o.y, o.z};
+    float[3] ds = {d.x, d.y, d.z};
+    float[3] hs = {p.half.x, p.half.y, p.half.z};
+    for (k in 0..3) {
+        if (ds[k] > -1e-9 && ds[k] < 1e-9) {
+            if (os[k] < -hs[k] || os[k] > hs[k]) return -1.0;
+            continue;
+        }
+        float t1 = (-hs[k] - os[k]) / ds[k];
+        float t2 = (hs[k] - os[k]) / ds[k];
+        float s = -1.0;
+        if (t1 > t2) {
+            float tt = t1;
+            t1 = t2;
+            t2 = tt;
+            s = 1.0;
+        }
+        if (t1 > tmin) {
+            tmin = t1;
+            axis = k;
+            sign = s;
+        }
+        if (t2 < tmax) tmax = t2;
+        if (tmin > tmax) return -1.0;
+    }
+    Vec3 nl = Vec3{0.0, 0.0, 0.0};
+    if (axis == 0) nl.x = sign;
+    if (axis == 1) nl.y = sign;
+    if (axis == 2) nl.z = sign;
+    *normal = axis >= 0 ? p.rot.rotate(nl) : -dir;
+    return tmin;
+}
+
+void _ph_notify(*ScenePhysicsWorld self, int id, string tag, Vec3 point, Vec3 normal) {
+    *ScenePhysicsBody b = &self.bodies.data[id];
+    if (!b._has_handler) return;
+    ScenePhysicsCollision ev = ScenePhysicsCollision{id, tag, point, normal};
+    fn(*ScenePhysicsCollision)->void h = b._handler;
+    h(&ev);
+}
+
+// ViroReact's findCollisionsWithRayAsync: the bodies the segment from..to crosses (only the
+// closest when closest), each told through its collision handler with tag as the other
+// body's tag. True when it hit something.
+bool ScenePhysicsWorld_ray_test(*ScenePhysicsWorld self, Vec3 from, Vec3 to, bool closest, string tag) {
+    Vec3 seg = to - from;
+    float len = seg.length();
+    if (len <= 0.0) return false;
+    Vec3 dir = seg / len;
+    int best = -1;
+    float best_t = 1e30;
+    Vec3 best_n;
+    bool any = false;
+    for (i in 0..self.bodies.size) {
+        *ScenePhysicsBody b = &self.bodies.data[i];
+        if (!b.alive || !b.enabled) continue;
+        float bt = 1e30;
+        Vec3 bn;
+        for (k in 0..b.shape.parts.size) {
+            Vec3 nrm;
+            float t = _ph_ray_part(_ph_world_part(b, &b.shape.parts.data[k]), from, dir, len, &nrm);
+            if (t >= 0.0 && t < bt) {
+                bt = t;
+                bn = nrm;
+            }
+        }
+        if (bt > len) continue;
+        any = true;
+        if (closest) {
+            if (bt < best_t) {
+                best_t = bt;
+                best = i;
+                best_n = bn;
+            }
+        } else {
+            _ph_notify(self, i, tag, from + dir * bt, bn);
+        }
+    }
+    if (closest && best >= 0) _ph_notify(self, best, tag, from + dir * best_t, best_n);
+    return any;
+}
+
+// ViroReact's findCollisionsWithShapeAsync: shape placed at from (and swept to to when they
+// differ, notifying the first body it meets, checked along the path every tenth of the
+// shape's size) against the bodies, each told through its collision handler with tag. True
+// when it touched something.
+bool ScenePhysicsWorld_shape_test(*ScenePhysicsWorld self, Vec3 from, Vec3 to, ScenePhysicsShape shape, string tag) {
+    ScenePhysicsBody probe;
+    probe.type = SCENE_BODY_STATIC;
+    probe.shape = shape;
+    probe.alive = true;
+    probe.enabled = true;
+    probe._rot = quat_identity();
+    float size = _ph_bound_radius(&probe);
+    float dist = (to - from).length();
+    int samples = dist > 0.0 && size > 0.0 ? (int)(dist / (size * 0.1)) + 1 : 1;
+    if (samples > 1000) samples = 1000;
+    bool hit = false;
+    for (s in 0..samples + (dist > 0.0 ? 1 : 0)) {
+        float f = samples > 0 && dist > 0.0 ? (float)s / (float)samples : 0.0;
+        probe._pos = from + (to - from) * f;
+        List_push(&self.bodies, probe);
+        int pid = self.bodies.size - 1;
+        List_clear(&self._contacts);
+        for (i in 0..pid) {
+            *ScenePhysicsBody b = &self.bodies.data[i];
+            if (!b.alive || !b.enabled) continue;
+            _ph_collide(self, pid, i);
+        }
+        List_pop(&self.bodies);
+        // one event per body, at its first contact
+        List<int> told;
+        for (k in 0..self._contacts.size) {
+            _PhContact c = self._contacts.data[k];
+            int other = c.a == pid ? c.b : c.a;
+            bool done = false;
+            for (q in 0..told.size) {
+                if (told.data[q] == other) done = true;
+            }
+            if (done) continue;
+            List_push(&told, other);
+            _ph_notify(self, other, tag, c.point, c.a == other ? c.normal : -c.normal);
+            hit = true;
+        }
+        told.free();
+        List_clear(&self._contacts);
+        if (hit && dist > 0.0) break;
+    }
+    return hit;
+}
+
+// Frees the bodies and their handlers.
+void ScenePhysicsWorld_free(*ScenePhysicsWorld self) {
+    for (i in 0..self.bodies.size) {
+        *ScenePhysicsBody b = &self.bodies.data[i];
+        b.shape.parts.free();
+        b._forces.free();
+        b._force_at.free();
+        b._last_keys.free();
+        b._cur_keys.free();
+        b._cur.free();
+        if (b._has_handler) free_closure(b._handler);
+    }
+    self.bodies.free();
+    self._contacts.free();
+}

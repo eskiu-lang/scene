@@ -1,0 +1,242 @@
+// Physics: free fall under ViroReact's gravity and fixed steps, a ball resting on a floor
+// with one collision event, a bounce, a box settling flat, impulses and velocities, a
+// kinematic body following its node, sleeping, ray and shape tests, and a shape taken from a
+// scaled mesh.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/physics>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b, float tol) {
+    float d = a - b;
+    return d < tol && d > -tol;
+}
+
+// runs the world for seconds in 60 Hz frames from t0
+double run_for(*ScenePhysicsWorld w, *Scene scene, double t0, double seconds) {
+    int frames = (int)(seconds * 60.0 + 0.5);
+    for (i in 1..frames + 1) w.update(scene, t0 + (double)i / 60.0);
+    return t0 + (double)frames / 60.0;
+}
+
+int hits = 0;
+string last_tag = "";
+Vec3 last_normal;
+Vec3 last_point;
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+
+    // free fall: 1 s from rest in 60 steps of 1/60 s
+    ScenePhysicsWorld w = scene_physics();
+    int a = scene.add_node(0, "a");
+    scene.node(a).position = Vec3{0.0, 10.0, 0.0};
+    int ba = w.add(&scene, a, SCENE_BODY_DYNAMIC, 1.0, scene_physics_sphere(0.5));
+    w.update(&scene, 0.0);
+    double t = run_for(&w, &scene, 0.0, 1.0);
+    float want = 10.0 - 9.81 / 3600.0 * 60.0 * 61.0 / 2.0;
+    check("free fall writes the node", near(scene.node(a).position.y, want, 0.01));
+    check("velocity after 1 s", near(w.body(ba).linear_velocity.y, -9.81, 0.01));
+    // a long frame takes at most 10 steps
+    check("at most 10 steps", w.update(&scene, t + 1.0) == 10);
+    w.free();
+
+    // a ball dropped on a static floor rests on it and reports one collision
+    w = scene_physics();
+    int floor = scene.add_node(0, "floor");
+    int fb = w.add(&scene, floor, SCENE_BODY_STATIC, 5.0, scene_physics_box(Vec3{10.0, 1.0, 10.0}));
+    check("a static body has no mass", w.body(fb).mass == 0.0);
+    w.body(fb).tag = "floor";
+    int ball = scene.add_node(0, "ball");
+    scene.node(ball).position = Vec3{0.0, 2.0, 0.0};
+    int bb = w.add(&scene, ball, SCENE_BODY_DYNAMIC, 1.0, scene_physics_sphere(0.25));
+    w.on_collision(bb, void(*ScenePhysicsCollision c) {
+        hits++;
+        last_tag = c.other_tag;
+        last_normal = c.normal;
+        last_point = c.point;
+    });
+    w.update(&scene, 0.0);
+    run_for(&w, &scene, 0.0, 4.0);
+    check("rests on the floor", near(scene.node(ball).position.y, 0.75, 0.02));
+    check("one collision event", hits == 1);
+    check("with the floor's tag", strcmp(last_tag, "floor") == 0);
+    check("normal from the floor into the ball", near(last_normal.y, 1.0, 0.01));
+    check("point on the floor's top", near(last_point.y, 0.5, 0.05));
+    check("asleep at rest", w.body(bb).sleeping);
+    // waking it with an impulse
+    w.apply_impulse(bb, Vec3{0.0, 3.0, 0.0}, Vec3{0.0, 0.0, 0.0});
+    check("an impulse wakes and moves it", !w.body(bb).sleeping && near(w.body(bb).linear_velocity.y, 3.0, 0.001));
+    w.free();
+
+    // a bouncy ball comes back up
+    w = scene_physics();
+    fb = w.add(&scene, floor, SCENE_BODY_STATIC, 0.0, scene_physics_box(Vec3{10.0, 1.0, 10.0}));
+    w.body(fb).restitution = 1.0;
+    scene.node(ball).position = Vec3{0.0, 2.0, 0.0};
+    bb = w.add(&scene, ball, SCENE_BODY_DYNAMIC, 1.0, scene_physics_sphere(0.25));
+    w.body(bb).restitution = 0.8;
+    w.update(&scene, 0.0);
+    float top = 0.0;
+    bool fell = false;
+    for (i in 1..120) {
+        w.update(&scene, (double)i / 60.0);
+        float y = scene.node(ball).position.y;
+        if (y < 0.8) fell = true;
+        if (fell && y > top) top = y;
+    }
+    // dropped 1.25 above contact, restitution 0.8 -> about 0.64 * 1.25 = 0.8 back up
+    check("bounces back up", fell && top > 1.35 && top < 1.75);
+    w.free();
+
+    // a box dropped flat settles flat on the floor, half its height above
+    w = scene_physics();
+    w.add(&scene, floor, SCENE_BODY_STATIC, 0.0, scene_physics_box(Vec3{10.0, 1.0, 10.0}));
+    int crate = scene.add_node(0, "crate");
+    scene.node(crate).position = Vec3{0.3, 1.5, 0.0};
+    int cb = w.add(&scene, crate, SCENE_BODY_DYNAMIC, 2.0, scene_physics_box(Vec3{0.4, 0.6, 0.4}));
+    // a second box on top
+    int top_crate = scene.add_node(0, "top");
+    scene.node(top_crate).position = Vec3{0.3, 2.5, 0.0};
+    w.add(&scene, top_crate, SCENE_BODY_DYNAMIC, 1.0, scene_physics_box(Vec3{0.4, 0.4, 0.4}));
+    w.update(&scene, 0.0);
+    run_for(&w, &scene, 0.0, 3.0);
+    check("box rests on the floor", near(scene.node(crate).position.y, 0.8, 0.02));
+    check("stacked box rests on it", near(scene.node(top_crate).position.y, 1.3, 0.03));
+    check("stays flat", near(scene.node(crate).rotation.w < 0.0 ? -scene.node(crate).rotation.w : scene.node(crate).rotation.w, 1.0, 0.001));
+    check("stays in place", near(scene.node(crate).position.x, 0.3, 0.02));
+    run_for(&w, &scene, 3.0, 2.0);
+    check("the stack sleeps after 2 s still", w.body(cb).sleeping);
+    check("and stays put", near(scene.node(top_crate).position.y, 1.3, 0.03));
+    w.free();
+
+    // forces, torque, velocities without gravity
+    w = scene_physics();
+    int p = scene.add_node(0, "p");
+    scene.node(p).position = Vec3{0.0, 20.0, 0.0};
+    int pb = w.add(&scene, p, SCENE_BODY_DYNAMIC, 2.0, scene_physics_box(Vec3{1.0, 1.0, 1.0}));
+    w.body(pb).use_gravity = false;
+    w.apply_force(pb, Vec3{4.0, 0.0, 0.0}, Vec3{0.0, 0.0, 0.0});
+    w.update(&scene, 0.0);
+    run_for(&w, &scene, 0.0, 1.0);
+    check("a force accelerates (F / m)", near(w.body(pb).linear_velocity.x, 2.0, 0.01));
+    w.clear_forces(pb);
+    w.set_velocity(pb, Vec3{0.0, 0.0, -1.0}, true);
+    run_for(&w, &scene, 1.0, 1.0);
+    check("constant velocity", near(w.body(pb).linear_velocity.z, -1.0, 0.0001) && near(w.body(pb).linear_velocity.x, 0.0, 0.0001));
+    w.set_velocity(pb, Vec3{0.0, 0.0, 0.0}, false);
+    w.apply_torque_impulse(pb, Vec3{0.0, 1.0, 0.0});
+    run_for(&w, &scene, 2.0, 0.5);
+    // inertia of a 2 kg unit cube about y: 2 / 6
+    check("a torque impulse spins it", near(w.body(pb).angular_velocity.y, 3.0, 0.01));
+    check("its node turns", scene.node(p).rotation.y > 0.5);
+    w.free();
+
+    // a kinematic body follows its node and pushes a dynamic one
+    w = scene_physics();
+    w.gravity = Vec3{0.0, 0.0, 0.0};
+    int k = scene.add_node(0, "k");
+    scene.node(k).position = Vec3{-2.0, 0.0, 0.0};
+    scene.node(k).rotation = quat_identity();
+    int kb = w.add(&scene, k, SCENE_BODY_KINEMATIC, 3.0, scene_physics_box(Vec3{1.0, 1.0, 1.0}));
+    check("a kinematic body has no mass", w.body(kb).mass == 0.0);
+    int d = scene.add_node(0, "d");
+    scene.node(d).position = Vec3{0.0, 0.0, 0.0};
+    scene.node(d).rotation = quat_identity();
+    w.add(&scene, d, SCENE_BODY_DYNAMIC, 1.0, scene_physics_sphere(0.4));
+    w.update(&scene, 0.0);
+    for (i in 1..61) {
+        scene.node(k).position = Vec3{-2.0 + 2.5 * (float)i / 60.0, 0.0, 0.0};
+        w.update(&scene, (double)i / 60.0);
+    }
+    check("the kinematic body is where its node is", near(scene.node(k).position.x, 0.5, 0.001));
+    check("it pushed the ball ahead", scene.node(d).position.x > 0.85);
+    w.free();
+
+    // queries
+    w = scene_physics();
+    int n1 = scene.add_node(0, "n1");
+    scene.node(n1).position = Vec3{0.0, 0.0, -2.0};
+    int q1 = w.add(&scene, n1, SCENE_BODY_STATIC, 0.0, scene_physics_box(Vec3{1.0, 1.0, 1.0}));
+    int n2 = scene.add_node(0, "n2");
+    scene.node(n2).position = Vec3{0.0, 0.0, -5.0};
+    int q2 = w.add(&scene, n2, SCENE_BODY_STATIC, 0.0, scene_physics_sphere(0.5));
+    hits = 0;
+    w.on_collision(q1, void(*ScenePhysicsCollision c) {
+        hits += 1;
+        last_tag = c.other_tag;
+        last_point = c.point;
+        last_normal = c.normal;
+    });
+    w.on_collision(q2, void(*ScenePhysicsCollision c) {
+        hits += 100;
+        last_point = c.point;
+    });
+    check("closest ray hit", w.ray_test(Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 0.0, -10.0}, true, "ray") && hits == 1);
+    check("the ray's tag", strcmp(last_tag, "ray") == 0);
+    check("hit point on the box's face", near(last_point.z, -1.5, 0.001) && near(last_normal.z, 1.0, 0.001));
+    hits = 0;
+    w.ray_test(Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 0.0, -10.0}, false, "ray");
+    check("all ray hits", hits == 101);
+    hits = 0;
+    check("a short ray misses", !w.ray_test(Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 0.0, -1.0}, true, "ray") && hits == 0);
+    hits = 0;
+    check("a sphere at a point", w.shape_test(Vec3{0.0, 0.0, -4.4}, Vec3{0.0, 0.0, -4.4}, scene_physics_sphere(0.2), "probe") && hits == 100);
+    hits = 0;
+    check("a swept box meets the first body", w.shape_test(Vec3{0.0, 3.0, -2.0}, Vec3{0.0, -3.0, -2.0}, scene_physics_box(Vec3{0.2, 0.2, 0.2}), "sweep") && hits == 1);
+    w.free();
+
+    // a shape from a scaled mesh, and a compound from children
+    SceneGeometry g = scene_box(1.0, 2.0, 1.0);
+    int mesh = scene.add_geometry(&g)?;
+    g.free();
+    int mat = scene.add_material(scene_material(SCENE_CONSTANT));
+    int obj = scene.add_object(0, mesh, mat);
+    scene.node(obj).scale = Vec3{2.0, 1.0, 1.0};
+    ScenePhysicsShape auto_shape = scene_physics_auto(&scene, obj);
+    check("auto box from the mesh, scaled", auto_shape.parts.size == 1 && near(auto_shape.parts.data[0].size.x, 2.0, 0.001) &&
+        near(auto_shape.parts.data[0].size.y, 2.0, 0.001));
+    auto_shape.parts.free();
+    int group = scene.add_node(0, "group");
+    int c1 = scene.add_object(group, mesh, mat);
+    scene.node(c1).position = Vec3{1.0, 0.0, 0.0};
+    int c2 = scene.add_object(group, mesh, mat);
+    scene.node(c2).position = Vec3{-1.0, 0.0, 0.0};
+    ScenePhysicsShape cs = scene_physics_auto_compound(&scene, group);
+    check("compound from children", cs.parts.size == 2 && near(cs.parts.data[0].offset.x, 1.0, 0.001) && near(cs.parts.data[1].offset.x, -1.0, 0.001));
+    w = scene_physics();
+    scene.node(group).position = Vec3{0.0, 3.0, 0.0};
+    w.add(&scene, floor, SCENE_BODY_STATIC, 0.0, scene_physics_box(Vec3{10.0, 1.0, 10.0}));
+    w.add(&scene, group, SCENE_BODY_DYNAMIC, 1.0, cs);
+    w.update(&scene, 0.0);
+    run_for(&w, &scene, 0.0, 3.0);
+    check("the compound rests on its two boxes", near(scene.node(group).position.y, 1.5, 0.03));
+    w.free();
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("physics: ok\n");
+    return 0;
+}
