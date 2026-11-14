@@ -1,7 +1,9 @@
 // Shader modifiers as ViroReact's: GLSL surface, geometry, vertex, lighting and fragment
 // modifiers with uniforms updated between frames, a texture uniform, a varying from the
 // vertex stage to the fragment stage, swizzle assignments, GLSL's splats, mod and ?:, a
-// WGSL modifier, and an error for a body that cannot be read.
+// WGSL modifier, an error for a body that cannot be read; a moved mesh casting its moved
+// shadow, a varying in a lighting body, gl_FragCoord from the bottom, the last frame's
+// depth and the camera image.
 import <io>;
 import <mem>;
 import <list>;
@@ -194,8 +196,136 @@ Result<int, string> run() {
     return Ok<int, string>(0);
 }
 
+// The red value seen at ground point (x, z) of a 64-pixel top view 4 units wide.
+float ground_at(*uint16 px, float x, float z) {
+    int ix = (int)((x + 2.0) / 4.0 * 64.0);
+    int iz = (int)((z + 2.0) / 4.0 * 64.0);
+    return half_to_float(px[(iz * 64 + ix) * 4]);
+}
+
+// A box moved by a geometry modifier casts its shadow where it was moved to.
+Result<int, string> shadows(*Gpu gpu) {
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    scene.shadow_size = 512;
+    SceneGeometry pg = scene_plane(4.0, 4.0);
+    int plane = scene.add_geometry(&pg)?;
+    pg.free();
+    SceneGeometry bg = scene_box(1.0, 0.2, 1.0);
+    int box = scene.add_geometry(&bg)?;
+    bg.free();
+    scene.add_object(0, plane, scene.add_material(scene_material(SCENE_LAMBERT)));
+    SceneMaterial mm = scene_material(SCENE_LAMBERT);
+    mm.shader = program(&scene, scene_modifier(SCENE_MODIFIER_GEOMETRY, "uniform float shift;", "_geometry.position.z += shift;"))?;
+    int moved = scene.add_material(mm);
+    int occluder = scene.add_object(0, box, moved);
+    scene.node(occluder).position = Vec3{0.0, 1.0, 0.0};
+    scene.set_uniform_float(moved, "shift", 1.2);
+    int cam = scene.add_camera(0, scene_orthographic(4.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 6.0, 0.0};
+    scene.look_at(cam, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 0.0, -1.0});
+    scene.set_camera(cam);
+    int sun = scene.add_light(scene_directional(Vec3{1.0, -1.0, 0.0}, Vec3{1.0, 1.0, 1.0}, 1.0));
+    scene.light(sun).casts_shadows = true;
+    GpuTexture target = gpu.target_with(64, 64, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(64 * 64 * 4);
+    defer free(px);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("the moved box's shadow", ground_at(px, 1.0, 1.2) < 0.05);
+    check("not where the box was", ground_at(px, 1.0, -0.2) > 0.6);
+    return Ok<int, string>(0);
+}
+
+// A varying read in a lighting body, gl_FragCoord counted from the bottom, the last frame's
+// depth, and the camera image with its transform.
+Result<int, string> screen(*Gpu gpu) {
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    scene.background = Vec4{0.0, 0.0, 0.0, 1.0};
+    SceneGeometry q = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    int cam = scene.add_camera(0, scene_orthographic(2.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+
+    // lighting: the diffuse scaled by a varying from the vertex stage
+    List<SceneShaderModifier> vm;
+    SceneShaderModifier g = scene_modifier(SCENE_MODIFIER_GEOMETRY, "", "k = _geometry.position.x + 0.5;");
+    g.varyings = "highp float k";
+    List_push(&vm, g);
+    SceneShaderModifier lm = scene_modifier(SCENE_MODIFIER_LIGHTING, "", "_lightingContribution.diffuse *= k;");
+    lm.varyings = "highp float k";
+    List_push(&vm, lm);
+    SceneMaterial m = scene_material(SCENE_LAMBERT);
+    m.shader = scene.add_shader(&vm)?;
+    vm.free();
+    int obj = scene.add_object(0, quad, scene.add_material(m));
+    scene.node(obj).scale = Vec3{2.0, 2.0, 1.0};
+    scene.add_light(scene_directional(Vec3{0.0, 0.0, -1.0}, Vec3{1.0, 1.0, 1.0}, 1.0));
+    shot(&scene, &target, px)?;
+    check("a varying in the lighting: dark on the left, lit on the right", pixel(px, 2, 16).x < 0.1 && pixel(px, 29, 16).x > 0.85);
+
+    // gl_FragCoord.y counts from the bottom row
+    SceneMaterial fm = scene_material(SCENE_CONSTANT);
+    fm.shader = program(&scene, scene_modifier(SCENE_MODIFIER_FRAGMENT, "", "_output_color = vec4(gl_FragCoord.y / 32.0, 0.0, 0.0, 1.0);"))?;
+    scene.node(obj).material = scene.add_material(fm);
+    shot(&scene, &target, px)?;
+    expect("gl_FragCoord at the top", pixel(px, 16, 0), Vec3{31.5 / 32.0, 0.0, 0.0});
+    expect("gl_FragCoord at the bottom", pixel(px, 16, 31), Vec3{0.5 / 32.0, 0.0, 0.0});
+
+    // the last frame's depth: a quad covering the top half in front of the full one; the
+    // full one shows the depth the last frame left at its own pixel
+    SceneMaterial dm = scene_material(SCENE_CONSTANT);
+    dm.shader = program(&scene, scene_modifier(SCENE_MODIFIER_FRAGMENT, "uniform sampler2D scene_depth_texture;",
+        "_output_color = vec4(texture(scene_depth_texture, gl_FragCoord.xy / vec2(32.0)).r, 0.0, 0.0, 1.0);"))?;
+    scene.node(obj).material = scene.add_material(dm);
+    scene.node(obj).position = Vec3{0.0, 0.0, 1.0};
+    int top = scene.add_object(0, quad, scene.add_material(scene_material(SCENE_CONSTANT)));
+    scene.node(top).position = Vec3{0.0, 0.5, 2.0};
+    scene.node(top).scale = Vec3{2.0, 1.0, 1.0};
+    shot(&scene, &target, px)?;
+    shot(&scene, &target, px)?;
+    float bottom = pixel(px, 16, 28).x;
+    printf("  scene depth: bottom %.4f\n", (double)bottom);
+    // the full quad at distance 4 of an orthographic 0.1..20 view
+    check("the last frame's depth at its own pixel", bottom > 0.19 && bottom < 0.2);
+    scene.remove(top);
+
+    // the camera image through its transform: every point mapped to the center of the
+    // second row of a two-row image
+    uint8[8] img = {255, 0, 0, 255, 0, 0, 255, 255};
+    GpuImageOptions lo = GpuImageOptions{srgb: false};
+    scene.camera_texture = scene.add_texture(gpu.image_with(1, 2, &img[0], &lo)?);
+    scene.camera_image_transform = mat4_trs(Vec3{0.0, 0.75, 0.0}, quat_identity(), Vec3{1.0, 0.0, 1.0});
+    SceneMaterial cm = scene_material(SCENE_CONSTANT);
+    cm.shader = program(&scene, scene_modifier(SCENE_MODIFIER_SURFACE, "uniform sampler2D camera_texture;\nuniform mat4 camera_image_transform;",
+        "_surface.diffuse_color = texture(camera_texture, (camera_image_transform * vec4(v_texcoord, 0.0, 1.0)).xy);"))?;
+    scene.node(obj).material = scene.add_material(cm);
+    shot(&scene, &target, px)?;
+    expect("the camera image through its transform", pixel(px, 16, 16), Vec3{0.0, 0.0, 1.0});
+    return Ok<int, string>(0);
+}
+
 int main() {
     Result<int, string> r = run();
+    if (r.ok) {
+        Result<Gpu, string> g = gpu_open();
+        if (g.ok) {
+            Gpu gpu = g.value;
+            r = shadows(&gpu);
+            if (r.ok) r = screen(&gpu);
+            gpu.release();
+        }
+    }
     if (!r.ok) {
         printf("FAIL %s\n", r.error);
         return 1;

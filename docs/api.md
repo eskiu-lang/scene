@@ -237,6 +237,8 @@ struct Scene {
     ScenePost post;
     uint32 shadow_size;
     int active_portal;
+    int camera_texture;
+    Mat4 camera_image_transform;
 }
 ```
 
@@ -246,7 +248,10 @@ for a 360 image) is set by Scene_set_skybox, Scene_set_skybox_faces, Scene_set_s
 Scene_load_sky_360, and sky_rotation turns it; ibl by Scene_set_ibl; post holds
 the tone mapping, gamma and bloom settings; shadow_size is the width and height of each
 shadow map (2048). camera is the node of the camera that renders (-1 is a default camera
-at the origin looking down -Z). The lists are the scene's objects by id.
+at the origin looking down -Z). The lists are the scene's objects by id. camera_texture
+(a texture id) and camera_image_transform are what shader modifiers get as camera_texture
+and camera_image_transform (ViroReact's AR camera image and its mapping from the view's
+coordinates): an AR session sets them each frame.
 
 ### Gpu_scene
 
@@ -1325,6 +1330,7 @@ struct GlslTranslator {
     List<GlslSym> syms;
     String error;
     String sampler;
+    bool vertex;
 }
 ```
 
@@ -2344,6 +2350,25 @@ void scene_shader_free(*SceneShader self)
 ```
 
 Frees a program.
+
+### scene_shader_moves_geometry
+
+```eskiu
+bool scene_shader_moves_geometry(*SceneShader prog)
+```
+
+Whether prog changes the geometry (its shadows then need its own shadow shader).
+
+### scene_shadow_shader_with
+
+```eskiu
+void scene_shadow_shader_with(*SceneShader p, *String out)
+```
+
+The shadow-map shader of a program with geometry modifiers: the geometry bodies run as
+in the scene's vertex stage, with the light's matrix as the projection and an identity
+view, so a deformed mesh casts its deformed shadow. Vertex modifiers (clip space of the
+camera) do not apply to a light's map.
 
 
 ## `<scene/particles>`

@@ -284,6 +284,10 @@ struct _SceneRenderer {
     List<GpuBindGroup> shadow_groups;
     GpuPipeline shadow_pipe;
     List<_ScenePipe> pipes;
+    List<_ScenePipe> shadow_pipes;
+    GpuTexture depth_prev;
+    GpuTextureView depth_prev_view;
+    GpuTextureView depth_view;
     GpuTexture hdr;
     GpuTexture depth;
     uint32 w;
@@ -319,7 +323,10 @@ struct _SceneRenderer {
 // Scene_load_sky_360, and sky_rotation turns it; ibl by Scene_set_ibl; post holds
 // the tone mapping, gamma and bloom settings; shadow_size is the width and height of each
 // shadow map (2048). camera is the node of the camera that renders (-1 is a default camera
-// at the origin looking down -Z). The lists are the scene's objects by id.
+// at the origin looking down -Z). The lists are the scene's objects by id. camera_texture
+// (a texture id) and camera_image_transform are what shader modifiers get as camera_texture
+// and camera_image_transform (ViroReact's AR camera image and its mapping from the view's
+// coordinates): an AR session sets them each frame.
 struct Scene {
     Gpu gpu;
     List<SceneNode> nodes;
@@ -342,6 +349,8 @@ struct Scene {
     ScenePost post;
     uint32 shadow_size;
     int active_portal;
+    int camera_texture;
+    Mat4 camera_image_transform;
     _SceneRenderer _r;
 }
 
@@ -454,6 +463,7 @@ Result<Scene, string> Gpu_scene(*Gpu self) {
     s.background = Vec4{0.0, 0.0, 0.0, 1.0};
     s.sky_intensity = 1.0;
     s.sky_rotation = quat_identity();
+    s.camera_image_transform = mat4_identity();
     s.post.gamma = true;
     s.shadow_size = 2048;
     _scene_new_node(&s, -1, "root");
@@ -540,6 +550,11 @@ void Scene_release(*Scene self) {
     r.shadow_maps.release();
     r.hdr.release();
     r.depth.release();
+    r.depth_prev.release();
+    r.depth_view.release();
+    r.depth_prev_view.release();
+    for (i in 0..r.shadow_pipes.size) r.shadow_pipes.data[i].pipe.release();
+    List_free(&r.shadow_pipes);
     r.frame_layout.release();
     r.draw_layout.release();
     r.mat_layout.release();
@@ -1504,6 +1519,28 @@ Result<int, string> _scene_material_gpu(*Scene self, int id) {
     return Ok<int, string>(0);
 }
 
+// The shadow-map pipeline of shader program sid (one that moves vertices), made on first
+// use.
+Result<*GpuPipeline, string> _scene_shadow_pipe(*Scene self, int sid) {
+    *_SceneRenderer r = &self._r;
+    for (i in 0..r.shadow_pipes.size) {
+        if (r.shadow_pipes.data[i].key == sid) return Ok<*GpuPipeline, string>(&r.shadow_pipes.data[i].pipe);
+    }
+    String src;
+    defer src.free();
+    scene_shadow_shader_with(&self.shaders.data[sid], &src);
+    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)SCENE_VERTEX_FLOATS * 4};
+    defer layout.release();
+    _scene_vertex_layout(&layout);
+    *GpuBindLayout[4] sg = {&r.shadow_layout, &r.draw_layout, &r.mat_layout, _scene_shader_layout(self, sid)};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: null, layout: &layout,
+        groups: &sg[0], group_count: 4, depth: true, depth_format: WGPUTextureFormat_Depth32Float,
+        depth_bias: 2, depth_bias_slope: 1.5};
+    GpuPipeline p = self.gpu.pipeline(&d)?;
+    List_push(&r.shadow_pipes, _ScenePipe{sid, p});
+    return Ok<*GpuPipeline, string>(&r.shadow_pipes.data[r.shadow_pipes.size - 1].pipe);
+}
+
 // The bind layout of shader program sid, made on first use.
 *GpuBindLayout _scene_shader_layout(*Scene self, int sid) {
     *_SceneRenderer r = &self._r;
@@ -1517,7 +1554,14 @@ Result<int, string> _scene_material_gpu(*Scene self, int id) {
         sg.layout = self.gpu.bind_layout();
         sg.layout.uniform(0, WGPUShaderStage_Vertex | WGPUShaderStage_Fragment);
         sg.layout.sampler(1, WGPUShaderStage_Vertex | WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
-        for (k in 0..p.textures) sg.layout.texture((uint32)(2 + k), WGPUShaderStage_Vertex | WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+        int t = 0;
+        for (k in 0..p.uniforms.size) {
+            if (p.offsets.data[k] >= 0) continue;
+            bool depth = strcmp((string)p.uniforms.data[k].name.data, "scene_depth_texture") == 0;
+            sg.layout.texture((uint32)(2 + t), WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
+                depth ? WGPUTextureSampleType_Depth : WGPUTextureSampleType_Float);
+            t++;
+        }
         sg.made = true;
     }
     return &sg.layout;
@@ -1551,8 +1595,21 @@ Result<int, string> _scene_material_mods(*Scene self, int id) {
     }
     int t = 0;
     for (k in 0..p.uniforms.size) {
-        if (p.offsets.data[k] >= 0) continue;
-        g.mod_group.texture((uint32)(2 + t), _scene_tex(self, g.mod_textures.data[k]));
+        string un = (string)p.uniforms.data[k].name.data;
+        if (p.offsets.data[k] >= 0) {
+            // the AR camera image's mapping, kept current from the scene
+            if (strcmp(un, "camera_image_transform") == 0) {
+                for (j in 0..16) g.mod_values.data[p.offsets.data[k] / 4 + j] = self.camera_image_transform.m[j];
+            }
+            continue;
+        }
+        if (strcmp(un, "scene_depth_texture") == 0) {
+            g.mod_group.view((uint32)(2 + t), &self._r.depth_prev_view);
+        } else if (strcmp(un, "camera_texture") == 0) {
+            g.mod_group.texture((uint32)(2 + t), _scene_tex(self, self.camera_texture));
+        } else {
+            g.mod_group.texture((uint32)(2 + t), _scene_tex(self, g.mod_textures.data[k]));
+        }
         t++;
     }
     g.mod_buffer.write(0, g.mod_values.data, (uint64)p.uniform_bytes);
@@ -1932,7 +1989,7 @@ Result<int, string> _scene_shadow_targets(*Scene self, int layers) {
         }
     }
     while (r.shadow_bufs.size < layers) {
-        GpuBuffer b = self.gpu.uniform(null, 64)?;
+        GpuBuffer b = self.gpu.uniform(null, 80)?;
         List_push(&r.shadow_bufs, b);
         GpuBindGroup g = r.shadow_layout.group()?;
         List_push(&r.shadow_groups, g);
@@ -2050,10 +2107,26 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     if (r.w != width || r.h != height) {
         r.hdr.release();
         r.depth.release();
+        r.depth_prev.release();
+        r.depth_view.release();
+        r.depth_prev_view.release();
         r.hdr = self.gpu.target_with(width, height, WGPUTextureFormat_RGBA16Float)?;
-        r.depth = self.gpu.texture(width, height, SCENE_DEPTH_FORMAT, WGPUTextureUsage_RenderAttachment)?;
+        // two depth buffers in turn: the last frame's is what modifiers sample as
+        // scene_depth_texture
+        r.depth = self.gpu.texture(width, height, SCENE_DEPTH_FORMAT, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding)?;
+        r.depth_prev = self.gpu.texture(width, height, SCENE_DEPTH_FORMAT, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding)?;
+        GpuViewDesc dv = GpuViewDesc{format: WGPUTextureFormat_Depth24Plus, aspect: WGPUTextureAspect_DepthOnly, dimension: WGPUTextureViewDimension_2D};
+        r.depth_view = r.depth.view_with(&dv)?;
+        r.depth_prev_view = r.depth_prev.view_with(&dv)?;
         r.w = width;
         r.h = height;
+    } else {
+        GpuTexture t = r.depth;
+        r.depth = r.depth_prev;
+        r.depth_prev = t;
+        GpuTextureView tv = r.depth_view;
+        r.depth_view = r.depth_prev_view;
+        r.depth_prev_view = tv;
     }
     Scene_update(self);
     _scene_camera(self, width, height);
@@ -2104,7 +2177,13 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
             Mat4 vp = _scene_shadow_matrix(self, rec, &texel);
             o[19] = l.shadow_normal_bias * texel;
             for (k in 0..16) o[20 + k] = vp.m[k];
-            r.shadow_bufs.data[rec.layer].write(0, &vp, 64);
+            float[20] pv;
+            for (k in 0..16) pv[k] = vp.m[k];
+            pv[16] = r.eye.x;
+            pv[17] = r.eye.y;
+            pv[18] = r.eye.z;
+            pv[19] = 1.0;
+            r.shadow_bufs.data[rec.layer].write(0, &pv, 80);
         }
     }
     if (r.recs.size > 0) r.lights.write(0, &lb, (uint64)r.recs.size * 144);
@@ -2129,8 +2208,8 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     fu[30] = self.ibl != null ? self.ibl.max_lod() : 0.0;
     fu[31] = 0.0;
     fu[32] = 1.0 / (float)ssize;
-    fu[33] = 0.0;
-    fu[34] = 0.0;
+    fu[33] = (float)height;
+    fu[34] = (float)width;
     fu[35] = 0.0;
     for (k in 0..16) fu[36 + k] = r.view.m[k];
     for (k in 0..16) fu[52 + k] = r.proj.m[k];
@@ -2183,7 +2262,15 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
             *SceneMesh mesh = &self.meshes.data[d.mesh];
             sp.set_group(0, &r.shadow_groups.data[k]);
             sp.set_group(1, &r.nodes.data[d.node].group);
-            sp.draw_indexed(&r.shadow_pipe, &mesh.vertices, &mesh.indices, mesh.index_count, 1);
+            *GpuPipeline shp = &r.shadow_pipe;
+            int sid = scene_key_shader(d.key);
+            if (sid > 0 && sid < self.shaders.size && scene_shader_moves_geometry(&self.shaders.data[sid]) && r.mats.data[d.material].mod_made) {
+                // a program that moves vertices casts the moved mesh
+                shp = _scene_shadow_pipe(self, sid)?;
+                sp.set_group(2, &r.mats.data[d.material].group);
+                sp.set_group(3, &r.mats.data[d.material].mod_group);
+            }
+            sp.draw_indexed(shp, &mesh.vertices, &mesh.indices, mesh.index_count, 1);
         }
         sp.end()?;
     }

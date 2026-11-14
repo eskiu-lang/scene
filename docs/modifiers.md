@@ -52,7 +52,7 @@ float, vec2, vec3, vec4, mat3, mat4 and 2D textures. A body reads a uniform by i
 samples a texture with `texture(noise, uv)` (WGSL: `textureSample(noise, mod_samp, uv)`).
 
 `varyings` declares values the vertex stage passes to the fragment stage (`highp float
-lift`), written in a geometry or vertex body and read in a surface or fragment body:
+lift`), written in a geometry or vertex body and read in a surface, lighting or fragment body:
 
 ```eskiu
 SceneShaderModifier g = scene_modifier(SCENE_MODIFIER_GEOMETRY, "", "lift = _geometry.position.y;");
@@ -82,13 +82,37 @@ A body the translator cannot read makes `Scene_add_shader` fail with the place i
 WGSL it produces that the GPU rejects fails when a material with the program is first drawn,
 with the GPU's message.
 
+## The scene's depth and the camera image
+
+A modifier that declares `uniform sampler2D scene_depth_texture` reads the depth buffer of
+the previous frame (ViroReact's `requiresSceneDepth`): the scene keeps two depth buffers and
+draws into them in turn. `texture(scene_depth_texture, uv)` takes GL's screen coordinates, as
+`gl_FragCoord.xy / size` gives them, and returns the depth in every component.
+
+`uniform sampler2D camera_texture` and `uniform mat4 camera_image_transform` get
+`Scene.camera_texture` (a texture id) and `Scene.camera_image_transform` (ViroReact's
+`requiresCameraTexture`): an AR session sets them to the camera image and its mapping each
+frame, and a modifier samples it as ViroReact's do:
+
+```glsl
+uniform sampler2D camera_texture;
+uniform mat4 camera_image_transform;
+...
+vec2 uv = (camera_image_transform * vec4(gl_FragCoord.xy / size, 0.0, 1.0)).xy;
+_output_color.rgb = mix(_output_color.rgb, texture(camera_texture, uv).rgb, 0.5);
+```
+
+## Shadows
+
+A program with a geometry modifier draws its meshes into the shadow maps with that modifier
+(the light's matrix as `_transforms.projection_matrix` and an identity view), so a mesh that
+waves casts a waving shadow. Vertex modifiers work in the camera's clip space and do not
+apply to the shadow maps.
+
 ## Differences from ViroReact
 
-- Geometry and vertex modifiers do not move shadows: the shadow pass draws the meshes as they
-  are.
-- The constant lighting model has no lights, so its lighting modifiers do not run.
-- Varyings are not visible in lighting bodies.
-- `gl_FragCoord` counts rows from the top of the target.
-- ViroReact's `requiresSceneDepth` and `requiresCameraTexture` (the previous frame's depth
-  and the AR camera image as samplers) are not provided; image post-processing modifiers are
-  the effects of `ScenePost` (see [rendering](rendering.md)).
+- The constant lighting model has no lighting entry point, as in ViroReact: its lighting
+  modifiers do not run.
+- `gl_FragCoord` counts rows from the bottom, as GL does; the depth lookups take that into
+  account.
+- WGSL modifiers read `scene_depth_texture` with `textureLoad` (it is a `texture_depth_2d`).

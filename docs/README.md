@@ -81,7 +81,7 @@ Each test renders small images and reads them back:
 | `tests/gltf.esk` | a glTF model's node tree, transforms, unlit material and pose updates |
 | `tests/animation.esk` | the easing curves against ViroReact's formulas, Euler order, groups with delays, serial and parallel chains, a skipped frame, ViroReact's property strings, relative values across loops, opacity, color, pause, resume, stop |
 | `tests/physics.esk` | free fall against ViroReact's gravity and fixed steps, the 10-step cap, a ball resting on a floor with one collision event, a bounce, a stack of boxes settling flat and sleeping, forces, constant velocity, a torque impulse, a kinematic body pushing, closest and all ray hits, shape tests at a point and swept, shapes from scaled meshes and children |
-| `tests/modifiers.esk` | surface, geometry, vertex, lighting and fragment modifiers in GLSL, uniforms updated between frames, a texture uniform, a varying, swizzle assignments, splats, mod and ?:, a WGSL modifier, an unreadable body |
+| `tests/modifiers.esk` | surface, geometry, vertex, lighting and fragment modifiers in GLSL, uniforms updated between frames, a texture uniform, a varying, swizzle assignments, splats, mod and ?:, a WGSL modifier, an unreadable body, a moved mesh casting its moved shadow, a varying in a lighting body, gl_FragCoord from the bottom, the previous frame's depth, the camera image |
 | `tests/input.esk` | screen rays against the camera's field of view, hits on rotated, scaled and nested nodes, hidden and `ignore_events` nodes, bubbling to a handler, click states, fixed-distance and plane drags, pinch, rotation, hover hysteresis, fuse |
 
 ## Not yet

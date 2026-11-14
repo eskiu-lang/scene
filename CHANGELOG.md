@@ -71,7 +71,10 @@ All notable changes to this package are documented here. The format follows
   `_transforms`, `_vertex`, `_surface`, `_light`, `_lightingContribution`, `_output_color`),
   in GLSL (translated by `<scene/glsl>`) or WGSL; `Scene_add_shader`,
   `SceneMaterial.shader`, per-material uniforms (`Scene_set_uniform_float` and the others,
-  `Scene_set_uniform_texture`) and varyings. `docs/modifiers.md`.
+  `Scene_set_uniform_texture`) and varyings; `scene_depth_texture` (the previous frame's
+  depth), `camera_texture` and `camera_image_transform` (`Scene.camera_texture`,
+  `Scene.camera_image_transform`); geometry modifiers apply to the shadow maps.
+  `docs/modifiers.md`.
 - `<scene/physics>`: `ScenePhysicsWorld`, ViroReact's physics bodies: static, kinematic and
   dynamic bodies with box, sphere, automatic and compound shapes, gravity, friction,
   restitution, forces, torques, impulses, constant velocities and sleeping, stepped in fixed

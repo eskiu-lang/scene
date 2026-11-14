@@ -327,7 +327,7 @@ string _scene_common_wgsl =
     "    shininess: f32, metal: f32, rough: f32, ao: f32 };\n";
 
 string _scene_constant_wgsl =
-    "fn shade(s: Surf) -> vec3<f32> { return s.base.rgb; }\n";
+    "fn shade(s: Surf) -> vec3<f32> { return s.base.rgb * mat.extra.x; }\n";
 
 string _scene_classic_head =
     "fn shade(s: Surf) -> vec3<f32> {\n"
@@ -605,7 +605,11 @@ Result<SceneShader, string> scene_shader(*List<SceneShaderModifier> modifiers) {
             out.append("\n");
         } else {
             GlslTranslator t = glsl_translator("mod_samp");
-            for (k in 0..p.uniforms.size) GlslTranslator_declare(&t, (string)p.uniforms.data[k].name.data, (string)p.uniforms.data[k].type.data);
+            t.vertex = m.entry == SCENE_MODIFIER_GEOMETRY || m.entry == SCENE_MODIFIER_VERTEX;
+            for (k in 0..p.uniforms.size) {
+                string un = (string)p.uniforms.data[k].name.data;
+                GlslTranslator_declare(&t, un, strcmp(un, "scene_depth_texture") == 0 ? "depth" : (string)p.uniforms.data[k].type.data);
+            }
             for (k in 0..p.varyings.size) GlslTranslator_declare(&t, (string)p.varyings.data[k].name.data, (string)p.varyings.data[k].type.data);
             bool ok = GlslTranslator_body(&t, m.body == null ? "" : m.body, out, 2);
             if (!ok) {
@@ -754,7 +758,8 @@ void _scene_modified_shader(int key, *SceneShader p, *String out) {
     int tex = 0;
     for (k in 0..p.uniforms.size) {
         if (p.offsets.data[k] >= 0) continue;
-        out.appendf("@group(3) @binding(%d) var %s: texture_2d<f32>;\n", 2 + tex, (string)p.uniforms.data[k].name.data);
+        string tn = (string)p.uniforms.data[k].name.data;
+        out.appendf("@group(3) @binding(%d) var %s: %s;\n", 2 + tex, tn, strcmp(tn, "scene_depth_texture") == 0 ? "texture_depth_2d" : "texture_2d<f32>");
         tex++;
     }
     // the vertex stage
@@ -801,76 +806,75 @@ void _scene_modified_shader(int key, *SceneShader p, *String out) {
     out.append("    return o;\n}\n");
     out.append((string)rest.data);
     rest.free();
-    // the lighting: the model's own terms per light into _lightingContribution, then the
-    // modifiers', accumulated as ViroReact does
+    // the lighting, inside the fragment stage so its modifiers see the varyings: the
+    // model's own terms per light into _lightingContribution, then the modifiers',
+    // accumulated as ViroReact does
+    String lit;
     if (lighting == SCENE_CONSTANT) {
-        out.append(_scene_constant_wgsl);
-        out.append("fn shade_mod(s: Surf, dint: f32, ms: ModSurface) -> vec3<f32> { return s.base.rgb; }\n");
+        lit.append("    let shaded = s.base.rgb * _surface.diffuse_intensity;\n");
     } else {
-        out.append("fn shade_mod(s: Surf, dint: f32, ms: ModSurface) -> vec3<f32> {\n"
-            "    var _surface = ms;\n"
-            "    let camera_position = frame.eye.xyz;\n"
-            "    var amb = vec3<f32>(0.0);\n"
-            "    var diff = vec3<f32>(0.0);\n"
-            "    var spec = vec3<f32>(0.0);\n");
+        lit.append("    var shaded = vec3<f32>(0.0);\n    {\n"
+            "    var lm_amb = vec3<f32>(0.0);\n"
+            "    var lm_diff = vec3<f32>(0.0);\n"
+            "    var lm_spec = vec3<f32>(0.0);\n");
         if (lighting == SCENE_PBR) {
-            out.append("    let a = s.rough * s.rough;\n"
-                "    let a2 = a * a;\n"
-                "    let f0 = mix(vec3<f32>(0.04), s.base.rgb, s.metal);\n"
-                "    let nv = max(dot(s.n, s.v), 1e-4);\n");
+            lit.append("    let lm_a = s.rough * s.rough;\n"
+                "    let lm_a2 = lm_a * lm_a;\n"
+                "    let lm_f0 = mix(vec3<f32>(0.04), s.base.rgb, s.metal);\n"
+                "    let lm_nv = max(dot(s.n, s.v), 1e-4);\n");
         }
-        out.append("    let count = u32(draw.info.x);\n"
-            "    for (var k = 0u; k < count; k++) {\n"
-            "        let i = draw_light(k);\n"
-            "        let la = light_at(i, s.pos);\n"
-            "        let l = la.xyz;\n"
-            "        let radiance = lights[i].color.rgb * lights[i].color.w * la.w;\n"
-            "        let nl = max(dot(s.n, l), 0.0);\n"
+        lit.append("    let lm_count = u32(draw.info.x);\n"
+            "    for (var lm_k = 0u; lm_k < lm_count; lm_k++) {\n"
+            "        let lm_i = draw_light(lm_k);\n"
+            "        let lm_la = light_at(lm_i, s.pos);\n"
+            "        let lm_l = lm_la.xyz;\n"
+            "        let lm_radiance = lights[lm_i].color.rgb * lights[lm_i].color.w * lm_la.w;\n"
+            "        let lm_nl = max(dot(s.n, lm_l), 0.0);\n"
             "        var _lightingContribution: ModLighting;\n"
-            "        _lightingContribution.visibility = shadow_at(i, s.pos, s.geo_n);\n"
-            "        var _light = mod_light(i);\n");
+            "        _lightingContribution.visibility = shadow_at(lm_i, s.pos, s.geo_n);\n"
+            "        var _light = mod_light(lm_i);\n");
         if (lighting == SCENE_PBR) {
-            out.append("        let h = normalize(s.v + l);\n"
-                "        let nh = max(dot(s.n, h), 0.0);\n"
-                "        let vh = max(dot(s.v, h), 0.0);\n"
-                "        let f = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);\n"
-                "        let dn = nh * nh * (a2 - 1.0) + 1.0;\n"
-                "        let d = a2 / (PI * dn * dn);\n"
-                "        let gv = nl * sqrt(nv * nv * (1.0 - a2) + a2);\n"
-                "        let gl = nv * sqrt(nl * nl * (1.0 - a2) + a2);\n"
-                "        let vis = 0.5 / max(gv + gl, 1e-5);\n"
-                "        let kd = (1.0 - f) * (1.0 - s.metal);\n"
-                "        _lightingContribution.diffuse = kd * radiance * nl;\n"
-                "        _lightingContribution.specular = f * d * vis * radiance * nl * PI;\n");
+            lit.append("        let lm_h = normalize(s.v + lm_l);\n"
+                "        let lm_nh = max(dot(s.n, lm_h), 0.0);\n"
+                "        let lm_vh = max(dot(s.v, lm_h), 0.0);\n"
+                "        let lm_f = lm_f0 + (1.0 - lm_f0) * pow(1.0 - lm_vh, 5.0);\n"
+                "        let lm_dn = lm_nh * lm_nh * (lm_a2 - 1.0) + 1.0;\n"
+                "        let lm_d = lm_a2 / (PI * lm_dn * lm_dn);\n"
+                "        let lm_gv = lm_nl * sqrt(lm_nv * lm_nv * (1.0 - lm_a2) + lm_a2);\n"
+                "        let lm_gl = lm_nv * sqrt(lm_nl * lm_nl * (1.0 - lm_a2) + lm_a2);\n"
+                "        let lm_vis = 0.5 / max(lm_gv + lm_gl, 1e-5);\n"
+                "        let lm_kd = (1.0 - lm_f) * (1.0 - s.metal);\n"
+                "        _lightingContribution.diffuse = lm_kd * lm_radiance * lm_nl;\n"
+                "        _lightingContribution.specular = lm_f * lm_d * lm_vis * lm_radiance * lm_nl * PI;\n");
         } else {
-            out.append("        _lightingContribution.diffuse = radiance * nl;\n");
-            if (lighting == SCENE_PHONG) out.append("        if (nl > 0.0) { _lightingContribution.specular = radiance * pow(max(dot(s.v, reflect(-l, s.n)), 0.0), s.shininess); }\n");
-            if (lighting == SCENE_BLINN) out.append("        if (nl > 0.0) { _lightingContribution.specular = radiance * pow(max(dot(normalize(s.v + l), s.n), 0.0), s.shininess); }\n");
+            lit.append("        _lightingContribution.diffuse = lm_radiance * lm_nl;\n");
+            if (lighting == SCENE_PHONG) lit.append("        if (lm_nl > 0.0) { _lightingContribution.specular = lm_radiance * pow(max(dot(s.v, reflect(-lm_l, s.n)), 0.0), s.shininess); }\n");
+            if (lighting == SCENE_BLINN) lit.append("        if (lm_nl > 0.0) { _lightingContribution.specular = lm_radiance * pow(max(dot(normalize(s.v + lm_l), s.n), 0.0), s.shininess); }\n");
         }
         if (p.bodies[SCENE_MODIFIER_LIGHTING].len > 0) {
-            out.append("        {\n");
-            _scene_mod_lets(p, out);
-            out.append((string)p.bodies[SCENE_MODIFIER_LIGHTING].data);
-            out.append("        }\n");
+            lit.append("        {\n");
+            _scene_mod_lets(p, &lit);
+            lit.append((string)p.bodies[SCENE_MODIFIER_LIGHTING].data);
+            lit.append("        }\n");
         }
-        out.append("        amb += _lightingContribution.ambient;\n"
-            "        diff += _lightingContribution.diffuse * _lightingContribution.visibility;\n"
-            "        spec += _lightingContribution.specular * _lightingContribution.visibility;\n"
+        lit.append("        lm_amb += _lightingContribution.ambient;\n"
+            "        lm_diff += _lightingContribution.diffuse * _lightingContribution.visibility;\n"
+            "        lm_spec += _lightingContribution.specular * _lightingContribution.visibility;\n"
             "    }\n");
         if (lighting == SCENE_PBR) {
-            out.append("    var color = amb * s.base.rgb + diff * s.base.rgb + spec;\n"
+            lit.append("    var lm_color = lm_amb * s.base.rgb + lm_diff * s.base.rgb + lm_spec;\n"
                 "    if (frame.ibl.x > 0.5) {\n"
-                "        let fa = f0 + (max(vec3<f32>(1.0 - s.rough), f0) - f0) * pow(1.0 - nv, 5.0);\n"
-                "        let irr = textureSampleLevel(irr_tex, ibl_samp, s.n, 0.0).rgb;\n"
-                "        let pre = textureSampleLevel(spec_tex, ibl_samp, reflect(-s.v, s.n), s.rough * frame.ibl.z).rgb;\n"
-                "        let ab = textureSampleLevel(brdf_tex, ibl_samp, vec2<f32>(nv, s.rough), 0.0).rg;\n"
-                "        color += (irr * s.base.rgb * (1.0 - s.metal) * (1.0 - fa) + pre * (f0 * ab.x + ab.y)) * s.ao * frame.ibl.y;\n"
+                "        let lm_fa = lm_f0 + (max(vec3<f32>(1.0 - s.rough), lm_f0) - lm_f0) * pow(1.0 - lm_nv, 5.0);\n"
+                "        let lm_irr = textureSampleLevel(irr_tex, ibl_samp, s.n, 0.0).rgb;\n"
+                "        let lm_pre = textureSampleLevel(spec_tex, ibl_samp, reflect(-s.v, s.n), s.rough * frame.ibl.z).rgb;\n"
+                "        let lm_ab = textureSampleLevel(brdf_tex, ibl_samp, vec2<f32>(lm_nv, s.rough), 0.0).rg;\n"
+                "        lm_color += (lm_irr * s.base.rgb * (1.0 - s.metal) * (1.0 - lm_fa) + lm_pre * (lm_f0 * lm_ab.x + lm_ab.y)) * s.ao * frame.ibl.y;\n"
                 "    } else {\n"
-                "        color += frame.ambient.rgb * s.base.rgb * s.ao;\n"
+                "        lm_color += frame.ambient.rgb * s.base.rgb * s.ao;\n"
                 "    }\n"
-                "    return color;\n}\n");
+                "    shaded = lm_color;\n    }\n");
         } else {
-            out.append("    return frame.ambient.rgb * s.base.rgb + amb * s.base.rgb + diff * s.base.rgb * dint + spec * s.spec;\n}\n");
+            lit.append("    shaded = frame.ambient.rgb * s.base.rgb + lm_amb * s.base.rgb + lm_diff * s.base.rgb * _surface.diffuse_intensity + lm_spec * s.spec;\n    }\n");
         }
     }
     // the fragment stage
@@ -882,7 +886,7 @@ void _scene_modified_shader(int key, *SceneShader p, *String out) {
     out.append("    let camera_position = frame.eye.xyz;\n"
         "    let v_texcoord = v.uv;\n"
         "    let v_surface_position = v.world;\n"
-        "    let gl_FragCoord = v.clip;\n"
+        "    let gl_FragCoord = vec4<f32>(v.clip.x, frame.shadow.y - v.clip.y, v.clip.z, v.clip.w);\n"
         "    var _surface: ModSurface;\n"
         "    _surface.diffuse_color = s.base;\n"
         "    _surface.diffuse_texcoord = v.uv;\n"
@@ -910,7 +914,9 @@ void _scene_modified_shader(int key, *SceneShader p, *String out) {
         "    s.pos = _surface.position;\n"
         "    s.v = _surface.view;\n");
     if (alpha == SCENE_ALPHA_MASK) out.append("    if (s.base.a < mat.emissive.w) { discard; }\n");
-    out.append("    var color = shade_mod(s, _surface.diffuse_intensity, _surface) + mat.emissive.rgb * e_s;\n");
+    out.append((string)lit.data);
+    lit.free();
+    out.append("    var color = shaded + mat.emissive.rgb * e_s;\n");
     if (alpha == SCENE_ALPHA_BLEND) out.append("    var alpha = clamp(s.base.a * draw.info.w, 0.0, 1.0);\n");
     else if (scene_key_blended(key)) out.append("    var alpha = clamp(draw.info.w, 0.0, 1.0);\n");
     else out.append("    var alpha = 1.0;\n");
@@ -925,6 +931,70 @@ void _scene_modified_shader(int key, *SceneShader p, *String out) {
     if (blend == SCENE_BLEND_MULTIPLY) out.append("    color = mix(vec3<f32>(1.0), color, alpha);\n");
     if (blend == SCENE_BLEND_SCREEN) out.append("    color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)) * alpha;\n");
     out.append("    return vec4<f32>(color, alpha);\n}\n");
+}
+
+// Whether prog changes the geometry (its shadows then need its own shadow shader).
+bool scene_shader_moves_geometry(*SceneShader prog) {
+    return prog != null && prog.bodies[SCENE_MODIFIER_GEOMETRY].len > 0;
+}
+
+// The shadow-map shader of a program with geometry modifiers: the geometry bodies run as
+// in the scene's vertex stage, with the light's matrix as the projection and an identity
+// view, so a deformed mesh casts its deformed shadow. Vertex modifiers (clip space of the
+// camera) do not apply to a light's map.
+void scene_shadow_shader_with(*SceneShader p, *String out) {
+    out.append("struct Pass { vp: mat4x4<f32>, eye: vec4<f32> };\n"
+        "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32>, morph: vec4<f32> };\n"
+        "@group(0) @binding(0) var<uniform> sp: Pass;\n"
+        "@group(1) @binding(0) var<uniform> draw: Draw;\n"
+        "@group(1) @binding(1) var<storage, read> joints: array<mat4x4<f32>>;\n"
+        "@group(1) @binding(2) var<storage, read> morph: array<vec4<f32>>;\n"
+        "@group(1) @binding(3) var<storage, read> weights: array<f32>;\n"
+        SCENE_DEFORM_WGSL
+        "struct ModGeometry { position: vec3<f32>, normal: vec3<f32>, texcoord: vec2<f32>, tangent: vec4<f32>,\n"
+        "    bone_weights: vec4<f32>, bone_indices: vec4<i32> };\n"
+        "struct ModTransforms { model_matrix: mat4x4<f32>, view_matrix: mat4x4<f32>, projection_matrix: mat4x4<f32> };\n");
+    out.append("struct ModU {");
+    int fields = 0;
+    for (k in 0..p.uniforms.size) {
+        if (p.offsets.data[k] < 0) continue;
+        out.appendf("%s @align(16) %s: %s", fields > 0 ? "," : "", (string)p.uniforms.data[k].name.data, glsl_wgsl_type((string)p.uniforms.data[k].type.data));
+        fields++;
+    }
+    if (fields == 0) out.append(" pad: vec4<f32>");
+    out.append(" };\n@group(3) @binding(0) var<uniform> mu: ModU;\n@group(3) @binding(1) var mod_samp: sampler;\n");
+    int tex = 0;
+    for (k in 0..p.uniforms.size) {
+        if (p.offsets.data[k] >= 0) continue;
+        string tn = (string)p.uniforms.data[k].name.data;
+        out.appendf("@group(3) @binding(%d) var %s: %s;\n", 2 + tex, tn, strcmp(tn, "scene_depth_texture") == 0 ? "texture_depth_2d" : "texture_2d<f32>");
+        tex++;
+    }
+    out.append("@vertex fn vs(@builtin(vertex_index) vi: u32, @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>,\n"
+        "    @location(2) uv: vec2<f32>, @location(3) tangent: vec4<f32>, @location(6) joint: vec4<f32>,\n"
+        "    @location(7) weight: vec4<f32>) -> @builtin(position) vec4<f32> {\n"
+        "    var p = pos;\n"
+        "    var nrm = normal;\n"
+        "    morph_apply(vi, &p, &nrm);\n"
+        "    let sk = skin_matrix(joint, weight);\n"
+        "    let s3 = mat3x3<f32>(sk[0].xyz, sk[1].xyz, sk[2].xyz);\n"
+        "    var _geometry: ModGeometry;\n"
+        "    _geometry.position = (sk * vec4<f32>(p, 1.0)).xyz;\n"
+        "    _geometry.normal = s3 * nrm;\n"
+        "    _geometry.texcoord = uv;\n"
+        "    _geometry.tangent = vec4<f32>(s3 * tangent.xyz, tangent.w);\n"
+        "    _geometry.bone_weights = weight;\n"
+        "    _geometry.bone_indices = vec4<i32>(joint);\n"
+        "    var _transforms: ModTransforms;\n"
+        "    _transforms.model_matrix = draw.model;\n"
+        "    _transforms.view_matrix = mat4x4<f32>(vec4(1.0, 0.0, 0.0, 0.0), vec4(0.0, 1.0, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, 0.0, 0.0, 1.0));\n"
+        "    _transforms.projection_matrix = sp.vp;\n"
+        "    let camera_position = sp.eye.xyz;\n");
+    for (k in 0..p.varyings.size) {
+        out.appendf("    var %s: %s;\n", (string)p.varyings.data[k].name.data, glsl_wgsl_type((string)p.varyings.data[k].type.data));
+    }
+    _scene_mod_body(p, SCENE_MODIFIER_GEOMETRY, out);
+    out.append("    return _transforms.projection_matrix * _transforms.view_matrix * _transforms.model_matrix * vec4<f32>(_geometry.position, 1.0);\n}\n");
 }
 
 string _scene_shadow_wgsl =

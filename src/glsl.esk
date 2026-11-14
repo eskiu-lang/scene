@@ -37,6 +37,7 @@ struct GlslTranslator {
     List<GlslSym> syms;
     String error;
     String sampler;
+    bool vertex;
 }
 
 bool _g_ident_start(char c) {
@@ -366,6 +367,25 @@ _GExpr _g_call(*GlslTranslator self, string name) {
     }
     int n = args.size;
     string a0 = n > 0 ? (string)args.data[0].text.data : "";
+    if ((_g_streq(name, "texture") || _g_streq(name, "texture2D") || _g_streq(name, "textureLod")) && n >= 2 &&
+        _g_streq(_g_lookup(self, a0), "depth")) {
+        // a depth texture is read texel by texel, its value in every component; the
+        // coordinates are GL's (rows from the bottom, as gl_FragCoord), the texture's rows
+        // run from the top
+        string uv = (string)args.data[1].text.data;
+        r.text.appendf("vec4<f32>(textureLoad(%s, vec2<i32>(clamp(vec2<f32>((%s).x, 1.0 - (%s).y) * vec2<f32>(textureDimensions(%s)), "
+            "vec2<f32>(0.0), vec2<f32>(textureDimensions(%s)) - 1.0)), 0))", a0, uv, uv, a0, a0);
+        r.type = "vec4";
+        _g_free_args(&args);
+        return r;
+    }
+    if ((_g_streq(name, "texture") || _g_streq(name, "texture2D") || _g_streq(name, "textureCube")) && n >= 2 && self.vertex) {
+        // the vertex stage has no derivatives: the full-size level
+        r.text.appendf("textureSampleLevel(%s, %s, %s, 0.0)", a0, (string)self.sampler.data, (string)args.data[1].text.data);
+        r.type = "vec4";
+        _g_free_args(&args);
+        return r;
+    }
     if ((_g_streq(name, "texture") || _g_streq(name, "texture2D") || _g_streq(name, "textureCube")) && n >= 2) {
         if (n >= 3) r.text.appendf("textureSampleBias(%s, %s, %s, %s)", a0, (string)self.sampler.data, (string)args.data[1].text.data,
             (string)args.data[2].text.data);
