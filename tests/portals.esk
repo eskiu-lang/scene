@@ -1,6 +1,7 @@
 // Portals: a portal's world seen only through its window, the outer world around it, an
 // outer object in front of the window still covering it, the portal's own sky, walking
-// through a passable portal and looking back out, and a portal that is not passable.
+// through a passable portal and looking back out, a portal that is not passable, and a
+// portal inside a portal.
 import <io>;
 import <mem>;
 import <libc>;
@@ -154,8 +155,68 @@ Result<int, string> run() {
     return Ok<int, string>(0);
 }
 
+// Portal q inside portal p: q's window, larger than p's on screen, shows q's world only
+// where it is seen through p's window.
+Result<int, string> nested(*Gpu gpu) {
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    scene.background = Vec4{0.0, 0.0, 0.0, 1.0};
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+    SceneGeometry g = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&g)?;
+    g.free();
+    int clear = flat(&scene, Vec4{1.0, 1.0, 1.0, 0.0});
+    int outer = scene.add_object(0, quad, flat(&scene, Vec4{0.0, 1.0, 0.0, 1.0}));
+    scene.node(outer).position = Vec3{0.0, 0.0, -20.0};
+    scene.node(outer).scale = Vec3{80.0, 80.0, 1.0};
+    int p = scene.add_node(0, "p");
+    scene.node(p).portal = true;
+    int pw = scene.add_object(p, quad, clear);
+    scene.node(pw).portal_entrance = true;
+    scene.node(pw).scale = Vec3{2.0, 2.0, 1.0};
+    int pwall = scene.add_object(p, quad, flat(&scene, Vec4{1.0, 0.0, 0.0, 1.0}));
+    scene.node(pwall).position = Vec3{0.0, 0.0, -6.0};
+    scene.node(pwall).scale = Vec3{80.0, 80.0, 1.0};
+    int q = scene.add_node(p, "q");
+    scene.node(q).portal = true;
+    int qw = scene.add_object(q, quad, clear);
+    scene.node(qw).portal_entrance = true;
+    scene.node(qw).position = Vec3{0.0, 0.0, -3.0};
+    scene.node(qw).scale = Vec3{4.0, 4.0, 1.0};
+    int qwall = scene.add_object(q, quad, flat(&scene, Vec4{0.0, 0.0, 1.0, 1.0}));
+    scene.node(qwall).position = Vec3{0.0, 0.0, -8.0};
+    scene.node(qwall).scale = Vec3{80.0, 80.0, 1.0};
+    int cam = scene.add_camera(0, scene_perspective(1.2, 0.1, 100.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    // p's window spans 0.2 of the view's tangent, q's 0.25
+    expect("through both windows: q's world", pixel(px, 18, 16), Vec3{0.0, 0.0, 1.0});
+    expect("inside q's window but outside p's: the outer world", pixel(px, 21, 16), Vec3{0.0, 1.0, 0.0});
+    // q's window smaller than p's: p's world around it
+    scene.node(qw).scale = Vec3{1.0, 1.0, 1.0};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("q's world through q's window", pixel(px, 16, 16), Vec3{0.0, 0.0, 1.0});
+    expect("p's world around q's window", pixel(px, 19, 16), Vec3{1.0, 0.0, 0.0});
+    return Ok<int, string>(0);
+}
+
 int main() {
     Result<int, string> r = run();
+    if (r.ok) {
+        Result<Gpu, string> g = gpu_open();
+        if (g.ok) {
+            Gpu gpu = g.value;
+            r = nested(&gpu);
+            gpu.release();
+        }
+    }
     if (!r.ok) {
         printf("FAIL %s\n", r.error);
         return 1;
