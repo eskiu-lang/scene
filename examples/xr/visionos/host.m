@@ -6,7 +6,9 @@
 #import <ARKit/ARKit.h>
 #import <Metal/Metal.h>
 #include <simd/simd.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <string.h>
 
 int xr_scene_open(void);
 void xr_scene_step(float dt);
@@ -19,6 +21,37 @@ int xr_scene_render(uint64_t image, uint32_t width, uint32_t height, int format,
 #define XR_FAR 50.0f
 #define WGPU_DEPTH32FLOAT 0x30
 void xr_scene_wait(void);
+void xr_scene_pointer(float ox, float oy, float oz, float dx, float dy, float dz, bool down, bool active);
+
+// Pinches arrive on the main thread (App.swift's onSpatialEvent) and wait here for the
+// render thread, which hands them to the scene before each frame.
+typedef struct {
+    float o[3], d[3];
+    bool down, active;
+} XrPointerEvent;
+static XrPointerEvent xr_events[32];
+static int xr_event_count = 0;
+static pthread_mutex_t xr_event_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void eskiu_xr_pointer(float ox, float oy, float oz, float dx, float dy, float dz, bool down, bool active) {
+    pthread_mutex_lock(&xr_event_lock);
+    if (xr_event_count < 32) {
+        xr_events[xr_event_count++] = (XrPointerEvent){{ox, oy, oz}, {dx, dy, dz}, down, active};
+    }
+    pthread_mutex_unlock(&xr_event_lock);
+}
+
+static void xr_apply_pointer_events(void) {
+    XrPointerEvent ev[32];
+    pthread_mutex_lock(&xr_event_lock);
+    int n = xr_event_count;
+    memcpy(ev, xr_events, sizeof(XrPointerEvent) * (size_t)n);
+    xr_event_count = 0;
+    pthread_mutex_unlock(&xr_event_lock);
+    for (int i = 0; i < n; i++) {
+        xr_scene_pointer(ev[i].o[0], ev[i].o[1], ev[i].o[2], ev[i].d[0], ev[i].d[1], ev[i].d[2], ev[i].down, ev[i].active);
+    }
+}
 
 void eskiu_xr_run(cp_layer_renderer_t renderer) {
     if (xr_scene_open() != 0) {
@@ -52,6 +85,7 @@ void eskiu_xr_run(cp_layer_renderer_t renderer) {
             if (timing == NULL) continue;
             cp_frame_start_update(frame);
             CFTimeInterval now = CACurrentMediaTime();
+            xr_apply_pointer_events();
             xr_scene_step(last == 0 ? 0.0f : (float)(now - last));
             last = now;
             cp_frame_end_update(frame);

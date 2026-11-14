@@ -19,6 +19,18 @@ struct XRApp: App {
         }
         ImmersiveSpace(id: "scene") {
             CompositorLayer(configuration: XRConfiguration()) { renderer in
+                // a pinch is a click along its selection ray: down while held
+                renderer.onSpatialEvent = { events in
+                    for event in events {
+                        guard let ray = event.selectionRay else { continue }
+                        let o = ray.origin, d = ray.direction
+                        let held = event.phase == .active
+                        eskiu_xr_pointer(Float(o.x), Float(o.y), Float(o.z), Float(d.x), Float(d.y), Float(d.z), held, true)
+                        if !held {
+                            eskiu_xr_pointer(Float(o.x), Float(o.y), Float(o.z), Float(d.x), Float(d.y), Float(d.z), false, false)
+                        }
+                    }
+                }
                 let thread = Thread { eskiu_xr_run(renderer) }
                 thread.name = "eskiu render"
                 thread.qualityOfService = .userInteractive

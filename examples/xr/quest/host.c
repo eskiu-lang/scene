@@ -27,13 +27,21 @@ int xr_scene_render(uint64_t image, uint32_t width, uint32_t height, int format,
                     uint64_t depth_image, int depth_format, bool reverse);
 void xr_scene_wait(void);
 int xr_scene_vulkan(void **instance, void **physical_device, void **device, uint32_t *queue_family, uint32_t *queue_index);
+void xr_scene_pointer(float ox, float oy, float oz, float dx, float dy, float dz, bool down, bool active);
 
 #define WGPU_RGBA8_SRGB 0x17
+#define WGPU_DEPTH32FLOAT 0x30
+// xr_scene.esk's XR_NEAR and XR_FAR
+#define XR_NEAR 0.1f
+#define XR_FAR 50.0f
 
 typedef struct {
     XrSwapchain swapchain;
     uint32_t width, height, count;
     XrSwapchainImageVulkanKHR images[8];
+    XrSwapchain depth_swapchain;
+    uint32_t depth_count;
+    XrSwapchainImageVulkanKHR depth_images[8];
 } Eye;
 
 typedef struct {
@@ -44,6 +52,12 @@ typedef struct {
     Eye eyes[2];
     XrSessionState state;
     bool running;
+    bool depth_layer;
+    XrActionSet actions;
+    XrAction aim, trigger;
+    XrPath hands[2];
+    XrSpace aim_spaces[2];
+    int hand;
 } Xr;
 
 // A column-major world transform from an OpenXR pose.
@@ -55,6 +69,101 @@ static void pose_matrix(XrPosef p, float *m) {
     m[12] = p.position.x; m[13] = p.position.y; m[14] = p.position.z; m[15] = 1;
 }
 
+static XrPath path(Xr *xr, const char *s) {
+    XrPath p = XR_NULL_PATH;
+    xrStringToPath(xr->instance, s, &p);
+    return p;
+}
+
+// Both hands' aim pose and trigger, bound for the Touch controllers (Quest) and the simple
+// controller every runtime has; the hand whose trigger was pulled last is the pointer.
+static bool xr_actions(Xr *xr) {
+    XrActionSetCreateInfo si = {XR_TYPE_ACTION_SET_CREATE_INFO};
+    strcpy(si.actionSetName, "scene");
+    strcpy(si.localizedActionSetName, "Scene");
+    CHECK(xrCreateActionSet(xr->instance, &si, &xr->actions));
+    xr->hands[0] = path(xr, "/user/hand/left");
+    xr->hands[1] = path(xr, "/user/hand/right");
+    XrActionCreateInfo ai = {XR_TYPE_ACTION_CREATE_INFO};
+    ai.countSubactionPaths = 2;
+    ai.subactionPaths = xr->hands;
+    ai.actionType = XR_ACTION_TYPE_POSE_INPUT;
+    strcpy(ai.actionName, "aim");
+    strcpy(ai.localizedActionName, "Aim");
+    CHECK(xrCreateAction(xr->actions, &ai, &xr->aim));
+    ai.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+    strcpy(ai.actionName, "select");
+    strcpy(ai.localizedActionName, "Select");
+    CHECK(xrCreateAction(xr->actions, &ai, &xr->trigger));
+    XrActionSuggestedBinding touch[4] = {
+        {xr->aim, path(xr, "/user/hand/left/input/aim/pose")},
+        {xr->aim, path(xr, "/user/hand/right/input/aim/pose")},
+        {xr->trigger, path(xr, "/user/hand/left/input/trigger/value")},
+        {xr->trigger, path(xr, "/user/hand/right/input/trigger/value")},
+    };
+    XrInteractionProfileSuggestedBinding sb = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+    sb.interactionProfile = path(xr, "/interaction_profiles/oculus/touch_controller");
+    sb.suggestedBindings = touch;
+    sb.countSuggestedBindings = 4;
+    xrSuggestInteractionProfileBindings(xr->instance, &sb);
+    XrActionSuggestedBinding simple[4] = {
+        {xr->aim, path(xr, "/user/hand/left/input/aim/pose")},
+        {xr->aim, path(xr, "/user/hand/right/input/aim/pose")},
+        {xr->trigger, path(xr, "/user/hand/left/input/select/click")},
+        {xr->trigger, path(xr, "/user/hand/right/input/select/click")},
+    };
+    sb.interactionProfile = path(xr, "/interaction_profiles/khr/simple_controller");
+    sb.suggestedBindings = simple;
+    xrSuggestInteractionProfileBindings(xr->instance, &sb);
+    for (int h = 0; h < 2; h++) {
+        XrActionSpaceCreateInfo asi = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
+        asi.action = xr->aim;
+        asi.subactionPath = xr->hands[h];
+        asi.poseInActionSpace.orientation.w = 1;
+        CHECK(xrCreateActionSpace(xr->session, &asi, &xr->aim_spaces[h]));
+    }
+    XrSessionActionSetsAttachInfo at = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+    at.countActionSets = 1;
+    at.actionSets = &xr->actions;
+    CHECK(xrAttachSessionActionSets(xr->session, &at));
+    xr->hand = 1;
+    return true;
+}
+
+// Syncs the actions and hands the pointing hand's ray and trigger to the scene.
+static void xr_input(Xr *xr, XrTime time) {
+    if (xr->actions == XR_NULL_HANDLE) return;
+    XrActiveActionSet active = {xr->actions, XR_NULL_PATH};
+    XrActionsSyncInfo sync = {XR_TYPE_ACTIONS_SYNC_INFO};
+    sync.countActiveActionSets = 1;
+    sync.activeActionSets = &active;
+    if (XR_FAILED(xrSyncActions(xr->session, &sync))) return;
+    bool pressed[2] = {false, false};
+    for (int h = 0; h < 2; h++) {
+        XrActionStateGetInfo gi = {XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = xr->trigger;
+        gi.subactionPath = xr->hands[h];
+        XrActionStateBoolean b = {XR_TYPE_ACTION_STATE_BOOLEAN};
+        if (XR_SUCCEEDED(xrGetActionStateBoolean(xr->session, &gi, &b)) && b.isActive) {
+            pressed[h] = b.currentState;
+            if (b.changedSinceLastSync && b.currentState) xr->hand = h;
+        }
+    }
+    int h = xr->hand;
+    XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+    bool tracked = XR_SUCCEEDED(xrLocateSpace(xr->aim_spaces[h], xr->space, time, &loc))
+        && (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+        && (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+    if (!tracked) {
+        xr_scene_pointer(0, 0, 0, 0, 0, -1, false, false);
+        return;
+    }
+    float m[16];
+    pose_matrix(loc.pose, m);
+    // the aim pose points along its -Z
+    xr_scene_pointer(m[12], m[13], m[14], -m[8], -m[9], -m[10], pressed[h], true);
+}
+
 static bool xr_start(Xr *xr, struct android_app *app) {
     PFN_xrInitializeLoaderKHR init_loader = NULL;
     xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR", (PFN_xrVoidFunction *)&init_loader);
@@ -64,7 +173,19 @@ static bool xr_start(Xr *xr, struct android_app *app) {
         li.applicationContext = app->activity->clazz;
         init_loader((XrLoaderInitInfoBaseHeaderKHR *)&li);
     }
-    const char *exts[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME};
+    const char *exts[3] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME};
+    uint32_t ext_count = 2;
+    // the depth layer lets the runtime reproject by depth, when it has the extension
+    XrExtensionProperties props[128];
+    uint32_t nprops = 0;
+    for (int i = 0; i < 128; i++) props[i] = (XrExtensionProperties){XR_TYPE_EXTENSION_PROPERTIES};
+    xrEnumerateInstanceExtensionProperties(NULL, 128, &nprops, props);
+    for (uint32_t i = 0; i < nprops; i++) {
+        if (strcmp(props[i].extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0) {
+            exts[ext_count++] = XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME;
+            xr->depth_layer = true;
+        }
+    }
     XrInstanceCreateInfoAndroidKHR ai = {XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
     ai.applicationVM = app->activity->vm;
     ai.applicationActivity = app->activity->clazz;
@@ -72,7 +193,7 @@ static bool xr_start(Xr *xr, struct android_app *app) {
     ci.next = &ai;
     strcpy(ci.applicationInfo.applicationName, "Eskiu scene");
     ci.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-    ci.enabledExtensionCount = 2;
+    ci.enabledExtensionCount = ext_count;
     ci.enabledExtensionNames = exts;
     CHECK(xrCreateInstance(&ci, &xr->instance));
     XrSystemGetInfo si = {XR_TYPE_SYSTEM_GET_INFO};
@@ -146,7 +267,18 @@ static bool xr_start(Xr *xr, struct android_app *app) {
         CHECK(xrCreateSwapchain(xr->session, &sc, &eye->swapchain));
         for (int i = 0; i < 8; i++) eye->images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
         CHECK(xrEnumerateSwapchainImages(eye->swapchain, 8, &eye->count, (XrSwapchainImageBaseHeader *)eye->images));
+        if (xr->depth_layer) {
+            sc.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            sc.format = VK_FORMAT_D32_SFLOAT;
+            if (XR_FAILED(xrCreateSwapchain(xr->session, &sc, &eye->depth_swapchain))) {
+                xr->depth_layer = false;
+                continue;
+            }
+            for (int i = 0; i < 8; i++) eye->depth_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+            CHECK(xrEnumerateSwapchainImages(eye->depth_swapchain, 8, &eye->depth_count, (XrSwapchainImageBaseHeader *)eye->depth_images));
+        }
     }
+    if (!xr_actions(xr)) LOG("no controller actions");
     LOG("session ready: %ux%u per eye", xr->eyes[0].width, xr->eyes[0].height);
     return true;
 }
@@ -174,8 +306,10 @@ static void xr_frame(Xr *xr, float dt) {
     XrFrameState fs = {XR_TYPE_FRAME_STATE};
     if (XR_FAILED(xrWaitFrame(xr->session, NULL, &fs))) return;
     xrBeginFrame(xr->session, NULL);
+    xr_input(xr, fs.predictedDisplayTime);
     xr_scene_step(dt);
     XrCompositionLayerProjectionView pv[2];
+    XrCompositionLayerDepthInfoKHR depth_info[2];
     XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     const XrCompositionLayerBaseHeader *layers[1] = {(XrCompositionLayerBaseHeader *)&layer};
     uint32_t layer_count = 0;
@@ -195,19 +329,38 @@ static void xr_frame(Xr *xr, float dt) {
             XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
             wi.timeout = XR_INFINITE_DURATION;
             xrWaitSwapchainImage(eye->swapchain, &wi);
+            uint64_t depth_image = 0;
+            if (xr->depth_layer) {
+                uint32_t di = 0;
+                xrAcquireSwapchainImage(eye->depth_swapchain, NULL, &di);
+                xrWaitSwapchainImage(eye->depth_swapchain, &wi);
+                depth_image = (uint64_t)eye->depth_images[di].image;
+            }
             float m[16];
             pose_matrix(views[e].pose, m);
             XrFovf f = views[e].fov;
             xr_scene_render((uint64_t)eye->images[i].image, eye->width, eye->height, WGPU_RGBA8_SRGB, m,
-                            tanf(f.angleLeft), tanf(f.angleRight), tanf(f.angleUp), tanf(f.angleDown), 0, 0, false);
+                            tanf(f.angleLeft), tanf(f.angleRight), tanf(f.angleUp), tanf(f.angleDown),
+                            depth_image, WGPU_DEPTH32FLOAT, false);
             xr_scene_wait();
             xrReleaseSwapchainImage(eye->swapchain, NULL);
+            if (xr->depth_layer) xrReleaseSwapchainImage(eye->depth_swapchain, NULL);
             pv[e] = (XrCompositionLayerProjectionView){XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
             pv[e].pose = views[e].pose;
             pv[e].fov = views[e].fov;
             pv[e].subImage.swapchain = eye->swapchain;
             pv[e].subImage.imageRect.extent.width = (int32_t)eye->width;
             pv[e].subImage.imageRect.extent.height = (int32_t)eye->height;
+            if (xr->depth_layer) {
+                depth_info[e] = (XrCompositionLayerDepthInfoKHR){XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR};
+                depth_info[e].subImage.swapchain = eye->depth_swapchain;
+                depth_info[e].subImage.imageRect = pv[e].subImage.imageRect;
+                depth_info[e].minDepth = 0;
+                depth_info[e].maxDepth = 1;
+                depth_info[e].nearZ = XR_NEAR;
+                depth_info[e].farZ = XR_FAR;
+                pv[e].next = &depth_info[e];
+            }
         }
         layer.space = xr->space;
         layer.viewCount = 2;

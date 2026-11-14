@@ -97,7 +97,9 @@ and far planes.
 ## Headsets: visionOS and Quest
 
 `examples/xr` draws one scene (`xr_scene.esk`: three turning boxes over a lit floor) on two
-headsets, each through the system's own frame loop. The scene exports a few C functions
+headsets, each through the system's own frame loop. Pointing at a box and clicking stops or
+restarts its turn: the scene's `SceneController` (`SCENE_CONTROLLER_POINTER`) takes the ray of
+a Quest controller's aim pose and its trigger, or of a visionOS pinch (`xr_scene_pointer`). The scene exports a few C functions
 (`xr_scene_open`, `xr_scene_step`, `xr_scene_render`, `xr_scene_wait`); for each view the host
 hands over the system's color image, the view's world pose and its field-of-view tangents,
 and the scene wraps the image as a `GpuTexture` and draws with `Scene_render_eye`. Both hosts
@@ -109,7 +111,9 @@ wrap a system image, and an eskiu-gpu that has them (`GPU_DIR`, until a gpu rele
 `examples/xr/visionos` is a full immersive space on Apple Vision Pro. A small SwiftUI window
 opens the space at launch and closes; its `CompositorLayer` runs the frame loop of `host.m`,
 which takes each frame's drawables from CompositorServices and the device's pose at the
-frame's presentation time from ARKit's world tracking. The view's pose is the device anchor
+frame's presentation time from ARKit's world tracking. A pinch arrives through the layer's
+`onSpatialEvent` on the main thread, as a selection ray held down until the pinch ends; the
+render thread hands the queued pinches to the scene before each frame. The view's pose is the device anchor
 times the view's transform; the color texture is wrapped with `Gpu_texture_from_metal`. After
 the views are drawn, the loop waits for the GPU and presents the drawable.
 
@@ -132,7 +136,11 @@ Vulkan, binds an OpenXR session to wgpu's Vulkan device (`XR_KHR_vulkan_enable`,
 objects from `Gpu_vulkan_handles`), makes a swapchain per eye in `R8G8B8A8_SRGB`, and each
 frame wraps the acquired swapchain image with `Gpu_texture_from_vulkan` and draws the eye at
 the pose and field of view `xrLocateViews` gives in the stage space (local space when there
-is no stage).
+is no stage). With `XR_KHR_composition_layer_depth` it also makes a `D32_SFLOAT` depth
+swapchain per eye, writes each eye's depth into it (`SceneDepthWriter`, forward) and chains
+it to the projection view, for the runtime's reprojection. Input is an action set with each
+hand's aim pose and trigger, bound for the Touch controllers and the simple controller; the
+hand whose trigger was pulled last points.
 
 ```sh
 OPENXR_DIR=path/to/openxr_loader_for_android examples/xr/quest/build.sh   # build/EskiuXR.apk
