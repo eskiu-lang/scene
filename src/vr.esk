@@ -509,3 +509,88 @@ void SceneController_show_reticle(*SceneController self, bool show) {
 void SceneController_free(*SceneController self) {
     if (self.has_reticle) SceneReticle_free(&self.reticle);
 }
+
+// Copies the depth of the last frame drawn (Scene_render_eye, Scene_render_to) into a depth
+// texture of the same size that a headset's compositor reads to reproject the frame:
+// visionOS's drawable depth (reverse: 1 at near, 0 at far, with the drawable's depth range
+// set to the eye's far and near) or an OpenXR depth swapchain (forward: 0 at near). The
+// pass also takes the color texture just drawn, untouched, to match the pipeline's target.
+struct SceneDepthWriter {
+    bool made;
+    WGPUTextureFormat color_format;
+    WGPUTextureFormat depth_format;
+    bool reverse;
+    GpuBindLayout layout;
+    GpuPipeline pipe;
+}
+
+SceneDepthWriter scene_depth_writer() {
+    SceneDepthWriter w;
+    return w;
+}
+
+string _scene_depth_copy_wgsl =
+    "@group(0) @binding(0) var depth_tex: texture_depth_2d;\n"
+    "struct V { @builtin(position) pos: vec4<f32> };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    var v: V;\n"
+    "    v.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    return v;\n"
+    "}\n"
+    "struct F { @builtin(frag_depth) depth: f32, @location(0) color: vec4<f32> };\n"
+    "@fragment fn fs_forward(v: V) -> F {\n"
+    "    var f: F;\n"
+    "    f.color = vec4<f32>(0.0);\n"
+    "    f.depth = textureLoad(depth_tex, vec2<i32>(v.pos.xy), 0);\n"
+    "    return f;\n"
+    "}\n"
+    "@fragment fn fs_reverse(v: V) -> F {\n"
+    "    var f: F;\n"
+    "    f.color = vec4<f32>(0.0);\n"
+    "    f.depth = 1.0 - textureLoad(depth_tex, vec2<i32>(v.pos.xy), 0);\n"
+    "    return f;\n"
+    "}\n";
+
+// Writes scene's last depth into depth (a depth texture as large as color, color being the
+// texture that frame was drawn into). reverse writes 1 - d: the same projection with
+// reverse-Z, as visionOS wants.
+Result<int, string> SceneDepthWriter_write(*SceneDepthWriter self, *Scene scene, *GpuTexture color, *GpuTexture depth, bool reverse) {
+    *_SceneRenderer r = &scene._r;
+    if (r.w != color.width || r.h != color.height || depth.width != color.width || depth.height != color.height) {
+        return Err<int, string>("scene: the depth to write is not the size of the last frame");
+    }
+    if (self.made && (self.color_format != color.format || self.depth_format != depth.format || self.reverse != reverse)) {
+        SceneDepthWriter_release(self);
+    }
+    if (!self.made) {
+        self.layout = scene.gpu.bind_layout();
+        self.layout.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_Depth);
+        *GpuBindLayout[1] groups = {&self.layout};
+        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_depth_copy_wgsl, vertex: "vs",
+            fragment: reverse ? "fs_reverse" : "fs_forward", format: color.format, groups: &groups[0], group_count: 1,
+            depth: true, depth_format: depth.format, depth_compare: WGPUCompareFunction_Always, no_color_write: true};
+        self.pipe = scene.gpu.pipeline(&d)?;
+        self.color_format = color.format;
+        self.depth_format = depth.format;
+        self.reverse = reverse;
+        self.made = true;
+    }
+    GpuBindGroup g = self.layout.group()?;
+    defer g.release();
+    g.view(0, &r.depth_view);
+    GpuEncoder enc = scene.gpu.encoder();
+    GpuPassOptions o = GpuPassOptions{load: true, depth: depth};
+    GpuPass pass = enc.pass_with(color.view, &o);
+    pass.set_group(0, &g);
+    pass.draw(&self.pipe, null, 3, 1);
+    pass.end()?;
+    return enc.submit();
+}
+
+void SceneDepthWriter_release(*SceneDepthWriter self) {
+    if (!self.made) return;
+    self.pipe.release();
+    self.layout.release();
+    self.made = false;
+}

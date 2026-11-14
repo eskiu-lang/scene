@@ -23,7 +23,8 @@
 int xr_scene_open(void);
 void xr_scene_step(float dt);
 int xr_scene_render(uint64_t image, uint32_t width, uint32_t height, int format, float *pose,
-                    float left, float right, float top, float bottom);
+                    float left, float right, float top, float bottom,
+                    uint64_t depth_image, int depth_format, bool reverse);
 void xr_scene_wait(void);
 int xr_scene_vulkan(void **instance, void **physical_device, void **device, uint32_t *queue_family, uint32_t *queue_index);
 
@@ -198,7 +199,7 @@ static void xr_frame(Xr *xr, float dt) {
             pose_matrix(views[e].pose, m);
             XrFovf f = views[e].fov;
             xr_scene_render((uint64_t)eye->images[i].image, eye->width, eye->height, WGPU_RGBA8_SRGB, m,
-                            tanf(f.angleLeft), tanf(f.angleRight), tanf(f.angleUp), tanf(f.angleDown));
+                            tanf(f.angleLeft), tanf(f.angleRight), tanf(f.angleUp), tanf(f.angleDown), 0, 0, false);
             xr_scene_wait();
             xrReleaseSwapchainImage(eye->swapchain, NULL);
             pv[e] = (XrCompositionLayerProjectionView){XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};

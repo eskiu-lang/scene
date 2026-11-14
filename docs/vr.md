@@ -78,6 +78,22 @@ then places the reticle and runs its animations. `show_reticle(false)` hides it
 (ViroController's `reticleVisibility`). The controller's 3D model (`controllerVisibility`)
 is the app's to draw at the pose.
 
+## Depth for the compositor
+
+Headset compositors reproject a late frame by its depth. `SceneDepthWriter` copies the depth
+of the last frame drawn into a depth texture as large as that frame, such as the one a
+visionOS drawable hands over (wrapped with `Gpu_texture_from_metal`):
+
+```c
+SceneDepthWriter w = scene_depth_writer();
+defer w.release();
+scene.render_eye(&color, eye)?;
+w.write(&scene, &color, &depth, true)?;   // true: reverse-Z, 1 at near, as visionOS wants
+```
+
+The reversed value is `1 - d`, which is the same projection with reverse-Z for the same near
+and far planes.
+
 ## Headsets: visionOS and Quest
 
 `examples/xr` draws one scene (`xr_scene.esk`: three turning boxes over a lit floor) on two
@@ -103,9 +119,11 @@ xcrun simctl install booted examples/xr/visionos/build/EskiuXR.app
 xcrun simctl launch booted dev.eskiu.scene.xr
 ```
 
-In the simulator the head sits at the world origin, which is the floor on a device, so the
-example lifts it to standing height there. The compositor's depth texture is not written
-yet, so the system cannot reproject the frames by depth.
+Each view's depth goes into the drawable's depth texture (`SceneDepthWriter`, reversed, with
+the drawable's depth range set to the scene's planes; the compositor wants a near plane of
+at least 0.1 m), so the system can reproject the frames. In the simulator the head sits at
+the world origin, which is the floor on a device, so the example lifts it to standing
+height there.
 
 ### Quest
 

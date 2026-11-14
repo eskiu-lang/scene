@@ -17,6 +17,7 @@ Scene xr_scene;
 bool xr_open = false;
 int[3] xr_boxes;
 float xr_time = 0.0;
+SceneDepthWriter xr_depth;
 
 Result<int, string> _xr_build() {
     xr_gpu = gpu_open()?;
@@ -69,18 +70,27 @@ export void xr_scene_step(float dt) {
     }
 }
 
+const float XR_NEAR = 0.1;
+const float XR_FAR = 50.0;
+
+Result<GpuTexture, string> _xr_wrap(uint64 image, uint32 width, uint32 height, int format) {
+#ifdef __APPLE__
+    return xr_gpu.texture_from_metal((*void)image, width, height, (WGPUTextureFormat)format, 1, 0);
+#else
+    return xr_gpu.texture_from_vulkan(image, width, height, (WGPUTextureFormat)format, 1, 0);
+#endif
+}
+
 // Draws one view into the system's color image of width x height: an id<MTLTexture>
 // (visionOS) or a VkImage (Quest) in image, of wgpu format format. pose is the view's world
 // transform, 16 floats column by column; left, right, top and bottom are the tangents of
-// its field of view's half angles. 0 on success.
+// its field of view's half angles. depth_image (0 for none) is the system's depth image of
+// the same size and wgpu format depth_format, which gets the view's depth for reprojection,
+// reversed (1 at near) when reverse is true; the planes are XR_NEAR and XR_FAR. 0 on success.
 export int xr_scene_render(uint64 image, uint32 width, uint32 height, int format, *float pose,
-        float left, float right, float top, float bottom) {
+        float left, float right, float top, float bottom, uint64 depth_image, int depth_format, bool reverse) {
     if (!xr_open) return 1;
-#ifdef __APPLE__
-    Result<GpuTexture, string> t = xr_gpu.texture_from_metal((*void)image, width, height, (WGPUTextureFormat)format, 1, 0);
-#else
-    Result<GpuTexture, string> t = xr_gpu.texture_from_vulkan(image, width, height, (WGPUTextureFormat)format, 1, 0);
-#endif
+    Result<GpuTexture, string> t = _xr_wrap(image, width, height, format);
     if (t.ok == 0) {
         println_err(t.error);
         return 1;
@@ -88,11 +98,21 @@ export int xr_scene_render(uint64 image, uint32 width, uint32 height, int format
     GpuTexture target = t.value;
     SceneEye eye;
     for (i in 0..16) eye.pose.m[i] = pose[i];
-    eye.near = 0.05;
-    eye.far = 50.0;
+    eye.near = XR_NEAR;
+    eye.far = XR_FAR;
     eye.projection = scene_fov_projection(-(float)atan((double)fabs(left)), (float)atan((double)fabs(right)),
         -(float)atan((double)fabs(bottom)), (float)atan((double)fabs(top)), eye.near, eye.far);
     Result<int, string> r = xr_scene.render_eye(&target, eye);
+    if (r.ok != 0 && depth_image != 0) {
+        Result<GpuTexture, string> dt = _xr_wrap(depth_image, width, height, depth_format);
+        if (dt.ok == 0) {
+            r = Err<int, string>(dt.error);
+        } else {
+            GpuTexture depth = dt.value;
+            r = xr_depth.write(&xr_scene, &target, &depth, reverse);
+            depth.release();
+        }
+    }
     target.release();
     if (r.ok == 0) {
         println_err(r.error);

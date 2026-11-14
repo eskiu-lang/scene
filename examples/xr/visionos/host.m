@@ -11,7 +11,13 @@
 int xr_scene_open(void);
 void xr_scene_step(float dt);
 int xr_scene_render(uint64_t image, uint32_t width, uint32_t height, int format, float *pose,
-                    float left, float right, float top, float bottom);
+                    float left, float right, float top, float bottom,
+                    uint64_t depth_image, int depth_format, bool reverse);
+
+// xr_scene.esk's XR_NEAR and XR_FAR; WGPUTextureFormat_Depth32Float
+#define XR_NEAR 0.1f
+#define XR_FAR 50.0f
+#define WGPU_DEPTH32FLOAT 0x30
 void xr_scene_wait(void);
 
 void eskiu_xr_run(cp_layer_renderer_t renderer) {
@@ -70,14 +76,18 @@ void eskiu_xr_run(cp_layer_renderer_t renderer) {
                     // no pose yet: a head 1.5 m above the floor
                     head.columns[3] = simd_make_float4(0, 1.5f, 0, 1);
                 }
+                // the compositor reads the depth texture with these planes, reverse-Z
+                cp_drawable_set_depth_range(drawable, simd_make_float2(XR_FAR, XR_NEAR));
                 for (size_t v = 0; v < cp_drawable_get_view_count(drawable); v++) {
                     cp_view_t view = cp_drawable_get_view(drawable, v);
                     size_t ti = cp_view_texture_map_get_texture_index(cp_view_get_view_texture_map(view));
                     id<MTLTexture> color = cp_drawable_get_color_texture(drawable, ti);
+                    id<MTLTexture> depth = cp_drawable_get_depth_texture(drawable, ti);
                     simd_float4x4 pose = simd_mul(head, cp_view_get_transform(view));
                     simd_float4 tan = cp_view_get_tangents(view);
                     if (xr_scene_render((uint64_t)(__bridge void *)color, (uint32_t)color.width, (uint32_t)color.height,
-                                        format, (float *)&pose, tan[0], tan[1], tan[2], tan[3]) != 0) {
+                                        format, (float *)&pose, tan[0], tan[1], tan[2], tan[3],
+                                        (uint64_t)(__bridge void *)depth, WGPU_DEPTH32FLOAT, true) != 0) {
                         fprintf(stderr, "xr: render failed\n");
                     }
                 }
