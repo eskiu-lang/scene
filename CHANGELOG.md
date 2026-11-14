@@ -25,6 +25,9 @@ All notable changes to this package are documented here. The format follows
   camera with ViroReact's billboard rotation.
 - Frustum culling: nodes wholly outside the camera's view are not drawn (they still cast
   shadows).
+- `<scene/shapes>`: `scene_polygon` (ViroPolygon: holes, uv over the bounds) and
+  `ScenePolyline` (ViroPolyline: camera-facing ribbons with round ends and joins).
+  `docs/shapes.md`.
 - `<scene/particles>`: `SceneParticleEmitter`, ViroParticleEmitter's model and timing:
   rates per second and per meter, bursts, point, box and sphere spawn volumes, color,
   alpha, scale, rotation, velocity and acceleration modifiers over time, distance or
