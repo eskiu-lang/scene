@@ -35,6 +35,9 @@ xcrun -sdk "$SDK" swiftc -target "$triple" -sdk "$sdk" -O -parse-as-library \
     -import-objc-header "$here/bridge.h" "$here/App.swift" "$out/host.o" "$out/xr_scene.o" "$WGPU_LIB" \
     -framework Metal -framework QuartzCore -framework CompositorServices -framework ARKit \
     -framework Foundation -lc++ -o "$out/EskiuXR.app/EskiuXR"
-cp "$here/Info.plist" "$out/EskiuXR.app/Info.plist"
+# the platform the bundle is for: XRSimulator or XROS
+plat=XRSimulator
+[ "$SDK" = xros ] && plat=XROS
+sed "s|<string>XRSimulator</string>|<string>$plat</string>|" "$here/Info.plist" > "$out/EskiuXR.app/Info.plist"
 codesign -f -s - "$out/EskiuXR.app" >/dev/null 2>&1
 echo "$out/EskiuXR.app"
