@@ -40,6 +40,33 @@ float half_to_float(uint16 h) {
     return (h & 0x8000) != 0 ? -v : v;
 }
 
+// Knuth-Plass demerits of a layout's lines (ViroReact's weights): each line's stretch ratio
+// over its spaces (a half space each), badness 100 |r|^3, (10 + badness)^2, 3000 when the
+// fitness class jumps; the last line is free.
+float kp_demerits(*Font f, *_SceneTextLayout l, float width) {
+    float space = (float)f.advance(f.glyph(32)) * f.scale(18.0) * 0.01;
+    float total = 0.0;
+    int prev = 0;
+    for (li in 0..l.lines.size) {
+        _SceneTextLine ln = l.lines.data[li];
+        float lw = 0.0;
+        int spaces = 0;
+        for (k in 0..ln.count) {
+            uint32 c = l.cps.data[ln.start + k];
+            lw += (float)f.advance(f.glyph(c)) * f.scale(18.0) * 0.01;
+            if (c == 32) spaces++;
+        }
+        float r = 0.0;
+        if (li < l.lines.size - 1) r = spaces > 0 ? (width - lw) / ((float)spaces * space * 0.5) : 10000.0;
+        float bad = 100.0 * (r < 0.0 ? -r * r * r : r * r * r);
+        total += (10.0 + bad) * (10.0 + bad);
+        int cls = r < -0.5 ? 0 : (r <= 0.5 ? 1 : (r <= 1.0 ? 2 : 3));
+        if (cls - prev > 1 || prev - cls > 1) total += 3000.0;
+        prev = cls;
+    }
+    return total;
+}
+
 Result<int, string> run() {
     Font f = font_load("tests/data/DejaVuSans-Latin1.ttf")?;
     defer f.free();
@@ -91,7 +118,45 @@ Result<int, string> run() {
     js.line_break = SCENE_TEXT_JUSTIFY;
     SceneText jt = scene.add_text(0, &f, words, js)?;
     *SceneMesh jm = &scene.meshes.data[jt.mesh];
-    check("justified lines reach both sides", jt.lines >= 2 && jm.max.x > 0.45 && jm.min.x < -0.45);
+    check("justified from the left side", jt.lines >= 2 && jm.min.x < -0.45 && jm.max.x <= 0.5 + 1e-4);
+    // ViroReact's Knuth-Plass: every line but the last, with the space it breaks at, spans
+    // the box exactly, its spaces stretched at most to 3 (tolerance 4 of a half-space
+    // stretch), and more evenly than a greedy fill
+    string para = "The quick brown fox jumps over the lazy dog while a small cat watches from the old wooden fence near the river bank";
+    List<uint32> pc;
+    for (i in 0..strlen(para)) List_push(&pc, (uint32)(uint8)para[i]);
+    SceneTextStyle ks = js;
+    ks.width = 2.4;
+    _SceneTextLayout kl;
+    _scene_text_layout(&f, &pc, &ks, &kl);
+    float space = (float)f.advance(f.glyph(32)) * f.scale(18.0) * 0.01;
+    bool exact = kl.lines.size >= 3;
+    float kp_worst = 0.0;
+    for (li in 0..kl.lines.size - 1) {
+        _SceneTextLine ln = kl.lines.data[li];
+        float lw = 0.0;
+        for (k in 0..ln.count) {
+            uint32 c = kl.cps.data[ln.start + k];
+            float a = (float)f.advance(f.glyph(c)) * f.scale(18.0) * 0.01;
+            lw += c == 32 ? a * ln.spacing : a;
+        }
+        if (!near(lw, 2.4, 1e-4) || kl.cps.data[ln.start + ln.count - 1] != 32) exact = false;
+        if (ln.spacing > kp_worst) kp_worst = ln.spacing;
+    }
+    check("justified lines span the box with their break space", exact);
+    check("spaces within the tolerance", kp_worst <= 3.0001 && kl.lines.data[kl.lines.size - 1].spacing == 1.0);
+    // the same breaks a greedy fill would make, stretched the same way
+    SceneTextStyle gs = ks;
+    gs.line_break = SCENE_TEXT_WORD_WRAP;
+    _SceneTextLayout gl;
+    _scene_text_layout(&f, &pc, &gs, &gl);
+    float g_cost = kp_demerits(&f, &gl, 2.4);
+    float k_cost = kp_demerits(&f, &kl, 2.4);
+    printf("  justify: %d lines, worst spacing %.3f, demerits %.0f (greedy %.0f, %d lines)\n", kl.lines.size, (double)kp_worst, (double)k_cost, (double)g_cost, gl.lines.size);
+    check("far fewer demerits than greedy", k_cost * 100.0 < g_cost);
+    _scene_text_free_layout(&kl);
+    _scene_text_free_layout(&gl);
+    pc.free();
 
     // alignment: a left, top aligned word starts at the box's left edge, its first line
     // below the top edge

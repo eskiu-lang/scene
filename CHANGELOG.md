@@ -54,7 +54,8 @@ All notable changes to this package are documented here. The format follows
 - `Scene_set_geometry` writes in place when the new data fits the mesh's buffers.
 - `<scene/text>`: `Scene_add_text` and `SceneText_set` draw TrueType text (eskiu-lang/font,
   now a dependency) from a glyph atlas, laid out as ViroText: points at 0.01 world units, a
-  box, word, character or no wrapping, justification, alignment, clipping, a line cap,
+  box, word, character or no wrapping, justification by ViroReact's Knuth-Plass formatter,
+  alignment, clipping, a line cap,
   `scene_text_size`; ViroText's outer strokes (`SCENE_TEXT_STROKE_OUTLINE` and
   `_DROP_SHADOW`, `stroke_width`, `stroke_color`) and extrusion (`extrusion`: front, back and
   side meshes with their own materials). `docs/text.md`.

@@ -71,7 +71,7 @@ Each test renders small images and reads them back:
 | `tests/portals.esk` | a portal's world only through its window, an outer object covering the window, the portal's sky, walking in and looking back out, a portal that is not passable, a portal inside a portal, each world lit only by its own environment |
 | `tests/shapes.esk` | polygon area with holes and concave outlines, winding, texture coordinates, repeated points; polyline width, round ends and joins; both drawn |
 | `tests/particles.esk` | modifier intervals, the rate per second, the cap, bursts, a cycle without loop, motion, fixed and free particles, spawn volumes, an explosion, additive drawing |
-| `tests/text.esk` | sizes at 0.01 world units a point, word, character and no wrapping, justification, clipping and the line cap, alignment, rebuilding, the glyphs drawn inside their bounds, an outline around a glyph and behind it, a drop shadow's placement, extruded faces at their depths covering the glyph with its holes |
+| `tests/text.esk` | sizes at 0.01 world units a point, word, character and no wrapping, Knuth-Plass justification against a greedy fill, clipping and the line cap, alignment, rebuilding, the glyphs drawn inside their bounds, an outline around a glyph and behind it, a drop shadow's placement, extruded faces at their depths covering the glyph with its holes |
 | `tests/transparency.esk` | back-to-front order of two transparent quads whatever order they were added, an opaque quad between them, each blend mode against its formula, node opacity on opaque and blended materials and down the tree, a texture with a masked quadrant |
 | `tests/post.esk` | each tone mapping operator at three exposures against `scene_tone_map`, sRGB encoding by the shader and by an sRGB target, bloom spreading and fading, its strength and threshold |
 | `tests/sky.esk` | background color, skybox faces by view direction, sky intensity, six-image orientation, image-based lighting from a constant environment against its expected value, a 360 image by direction and turned by `sky_rotation` |
@@ -85,7 +85,6 @@ Each test renders small images and reads them back:
 
 These ViroReact renderer features are planned for later versions:
 
-- Knuth-Plass line breaks for justified text.
 - Post effects beyond ViroReact's (color grading, vignette, depth of field, SSAO).
 - Shader modifiers (user WGSL inserted into the generated shaders).
 - Cascaded shadow maps for large scenes, and shadows from point lights (ViroReact has neither).

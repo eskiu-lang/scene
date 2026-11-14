@@ -42,9 +42,13 @@ The rules are ViroReact's: characters advance by their glyph's advance (no kerni
 line breaks after the last word that fits (`_WORD_WRAP`, a word being its characters and
 the spaces after it), at any character (`_CHAR_WRAP`), or only at newlines
 (`_NO_WRAP`). A word wider than the box gets a line of its own. A newline always starts a
-new line. `_JUSTIFY` wraps each paragraph by words and stretches the spaces of every line
-but the paragraph's last to the box width; ViroReact picks the breaks with Knuth and
-Plass's algorithm, so a justified paragraph may break at other words than here.
+new line. `_JUSTIFY` breaks each paragraph with ViroReact's Knuth and Plass formatter: the
+spaces may stretch by half a space and shrink by a third, the tolerance goes from 2 to 4
+until breaks are found (the paragraph is word wrapped when none are), and the breaks with
+the fewest demerits win (10 a line, 3000 when the looseness of two lines in a row differs
+by more than one class). Every line but the paragraph's last then has its spaces stretched
+to the box width, the space it breaks at included, as ViroReact counts it, so its last
+glyph ends that space's width short of the box's right edge.
 
 Vertical alignment places the first baseline so the line box (the font's line height,
 from its descent below the baseline) sits at the top of the box, around its middle, or so

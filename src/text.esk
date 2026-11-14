@@ -206,6 +206,239 @@ bool _scene_text_words(*Font f, *List<uint32> text, int from, int to, *SceneText
     return more;
 }
 
+
+// ViroReact's Knuth-Plass formatter (VROKnuthPlassFormatter): boxes are words, glue the
+// spaces between them (stretch 1/2 and shrink 1/3 of a space), a last glue of infinite
+// stretch and a forced break end the paragraph.
+const int _KP_INF = 10000;
+const int _KP_BOX = 0;
+const int _KP_GLUE = 1;
+const int _KP_PENALTY = 2;
+
+struct _KpNode {
+    int kind;
+    float width;
+    float stretch;
+    float shrink;
+    int penalty;
+    int flagged;
+    int start;
+    int count;
+    bool space;
+}
+
+struct _KpSum {
+    float width;
+    float stretch;
+    float shrink;
+}
+
+struct _KpBreak {
+    int position;
+    int demerits;
+    float ratio;
+    int line;
+    int fitness;
+    _KpSum totals;
+    int previous;
+}
+
+float _kp_cost(_KpSum s, float length) {
+    if (s.width < length) return s.stretch > 0.0 ? (length - s.width) / s.stretch : (float)_KP_INF;
+    if (s.width > length) return s.shrink > 0.0 ? (length - s.width) / s.shrink : (float)_KP_INF;
+    return 0.0;
+}
+
+_KpSum _kp_sum_from(*List<_KpNode> nodes, _KpSum sum, int at) {
+    _KpSum r = sum;
+    for (i in at..nodes.size) {
+        _KpNode n = nodes.data[i];
+        if (n.kind == _KP_GLUE) {
+            r.width += n.width;
+            r.stretch += n.stretch;
+            r.shrink += n.shrink;
+        } else if (n.kind == _KP_BOX) {
+            break;
+        } else if (n.kind == _KP_PENALTY && n.penalty == -_KP_INF && i > at) {
+            break;
+        }
+    }
+    return r;
+}
+
+void _kp_candidates(*List<_KpNode> nodes, int index, _KpSum sum, *List<_KpBreak> pool, *List<int> active, float length, float tolerance) {
+    _KpNode node = nodes.data[index];
+    int it = 0;
+    while (it < active.size) {
+        int[4] cd = {2147483647, 2147483647, 2147483647, 2147483647};
+        int[4] cp;
+        float[4] cr;
+        while (it < active.size) {
+            int bi = active.data[it];
+            _KpBreak bp = pool.data[bi];
+            int next = it + 1;
+            int line = bp.line + 1;
+            _KpSum d = _KpSum{sum.width - bp.totals.width, sum.stretch - bp.totals.stretch, sum.shrink - bp.totals.shrink};
+            if (node.kind == _KP_PENALTY) d.width += node.width;
+            float ratio = _kp_cost(d, length);
+            if (ratio < -1.0 || (node.kind == _KP_PENALTY && node.penalty == -_KP_INF)) {
+                for (k in it..active.size - 1) active.data[k] = active.data[k + 1];
+                active.size--;
+                next = it;
+            }
+            if (ratio >= -1.0 && ratio <= tolerance) {
+                double r3 = (double)(ratio < 0.0 ? -ratio : ratio);
+                double badness = 100.0 * r3 * r3 * r3;
+                double base = (10.0 + badness) * (10.0 + badness);
+                int dem = 0;
+                if (node.kind == _KP_PENALTY && node.penalty >= 0) dem = (int)(base + (double)node.penalty * (double)node.penalty);
+                else if (node.kind == _KP_PENALTY && node.penalty != -_KP_INF) dem = (int)(base - (double)node.penalty * (double)node.penalty);
+                else dem = (int)base;
+                if (node.kind == _KP_PENALTY && nodes.data[bp.position].kind == _KP_PENALTY) {
+                    dem += 100 * node.flagged * nodes.data[bp.position].flagged;
+                }
+                int cls = 0;
+                if (ratio < -0.5) cls = 0;
+                else if (ratio <= 0.5) cls = 1;
+                else if (ratio <= 1.0) cls = 2;
+                else cls = 3;
+                int gap = cls - bp.fitness;
+                if (gap > 1 || gap < -1) dem += 3000;
+                dem += bp.demerits;
+                if (dem < cd[cls]) {
+                    cd[cls] = dem;
+                    cp[cls] = bi;
+                    cr[cls] = ratio;
+                }
+            }
+            it = next;
+            if (it < active.size && pool.data[active.data[it]].line >= line) break;
+        }
+        _KpSum ns = _kp_sum_from(nodes, sum, index);
+        for (c in 0..4) {
+            if (cd[c] == 2147483647) continue;
+            _KpBreak nb = _KpBreak{index, cd[c], cr[c], pool.data[cp[c]].line + 1, c, ns, cp[c]};
+            List_push(pool, nb);
+            int id = pool.size - 1;
+            if (it < active.size) {
+                List_push(active, 0);
+                int k = active.size - 1;
+                while (k > it) {
+                    active.data[k] = active.data[k - 1];
+                    k--;
+                }
+                active.data[it] = id;
+                it++;
+            } else {
+                // inserted at the end: the position stays the end, as the list iterator does
+                List_push(active, id);
+                it = active.size;
+            }
+        }
+    }
+}
+
+// The breaks of the paragraph text[from, to) at tolerance; empty when none fits.
+void _kp_run(*List<_KpNode> nodes, float length, float tolerance, *List<_KpBreak> pool, *List<int> out) {
+    List<int> active;
+    List_clear(pool);
+    _KpSum sum;
+    List_push(pool, _KpBreak{0, 0, 0.0, 0, 0, sum, -1});
+    List_push(&active, 0);
+    for (i in 0..nodes.size) {
+        _KpNode n = nodes.data[i];
+        if (n.kind == _KP_BOX) {
+            sum.width += n.width;
+        } else if (n.kind == _KP_GLUE) {
+            if (i > 0 && nodes.data[i - 1].kind == _KP_BOX) _kp_candidates(nodes, i, sum, pool, &active, length, tolerance);
+            sum.width += n.width;
+            sum.stretch += n.stretch;
+            sum.shrink += n.shrink;
+        } else if (n.penalty != _KP_INF) {
+            _kp_candidates(nodes, i, sum, pool, &active, length, tolerance);
+        }
+    }
+    List_clear(out);
+    int best = -1;
+    for (k in 0..active.size) {
+        int b = active.data[k];
+        if (best < 0 || pool.data[b].demerits < pool.data[best].demerits) best = b;
+    }
+    List<int> rev;
+    while (best >= 0) {
+        List_push(&rev, best);
+        best = pool.data[best].previous;
+    }
+    for (k in 0..rev.size) List_push(out, rev.data[rev.size - 1 - k]);
+    rev.free();
+    active.free();
+}
+
+// Justifies the paragraph text[from, to) as ViroReact does; false when no tolerance from 2
+// to 4 finds breaks. Each line keeps the space it was broken at, counted when its spaces
+// are stretched, as ViroReact's.
+bool _scene_text_kp(*Font f, *List<uint32> text, int from, int to, *SceneTextStyle st, *_SceneTextLayout out) {
+    float space = _scene_text_adv(f, 32, st.size);
+    List<_KpNode> nodes;
+    defer nodes.free();
+    int i = from;
+    while (i < to) {
+        while (i < to && _scene_text_ws(text.data[i])) i++;
+        if (i >= to) break;
+        int s = i;
+        float w = 0.0;
+        while (i < to && !_scene_text_ws(text.data[i])) {
+            w += _scene_text_adv(f, text.data[i], st.size);
+            i++;
+        }
+        List_push(&nodes, _KpNode{kind: _KP_BOX, width: w, start: s, count: i - s});
+        List_push(&nodes, _KpNode{kind: _KP_GLUE, width: space, stretch: space * 3.0 / 6.0, shrink: space * 3.0 / 9.0, space: true});
+    }
+    if (nodes.size == 0) return false;
+    // the last word's glue: infinite stretch, then the forced break
+    nodes.data[nodes.size - 1] = _KpNode{kind: _KP_GLUE, width: 0.0, stretch: (float)_KP_INF, shrink: 0.0};
+    List_push(&nodes, _KpNode{kind: _KP_PENALTY, width: 0.0, penalty: -_KP_INF, flagged: 1});
+    List<_KpBreak> pool;
+    defer pool.free();
+    List<int> breaks;
+    defer breaks.free();
+    for (tol in 2..5) {
+        _kp_run(&nodes, st.width, (float)tol, &pool, &breaks);
+        if (breaks.size > 0) break;
+    }
+    if (breaks.size == 0) return false;
+    int line_start = 0;
+    List<uint32> line;
+    defer line.free();
+    for (b in 1..breaks.size) {
+        int point = pool.data[breaks.data[b]].position;
+        for (j in line_start..nodes.size) {
+            if (nodes.data[j].kind == _KP_BOX || (nodes.data[j].kind == _KP_PENALTY && nodes.data[j].penalty == -_KP_INF)) {
+                line_start = j;
+                break;
+            }
+        }
+        int spaces = 0;
+        float width = 0.0;
+        for (j in line_start..point + 1) {
+            _KpNode n = nodes.data[j];
+            if (n.kind == _KP_BOX) {
+                for (k in 0..n.count) List_push(&line, text.data[n.start + k]);
+                width += n.width;
+            } else if (n.space) {
+                List_push(&line, 32);
+                width += space;
+                spaces++;
+            }
+        }
+        float ratio = 1.0;
+        if (b < breaks.size - 1 && spaces > 0 && space > 0.0) ratio = 1.0 + (st.width - width) / (float)spaces / space;
+        _scene_text_push(&out.lines, &line, &out.cps, ratio);
+        line_start = point;
+    }
+    return true;
+}
+
 void _scene_text_layout(*Font f, *List<uint32> text, *SceneTextStyle st, *_SceneTextLayout out) {
     float lh = Font_line_height(f, st.size) * SCENE_TEXT_POINT;
     out.line_height = lh;
@@ -253,36 +486,19 @@ void _scene_text_layout(*Font f, *List<uint32> text, *SceneTextStyle st, *_Scene
         }
         if (line.size > 0 && _scene_text_more(out.lines.size, st, lh)) _scene_text_push(&out.lines, &line, &out.cps, 1.0);
     } else {
-        // justify: wrap each paragraph by words, then stretch the spaces of every line
-        // but the paragraph's last to the box width
-        float space = _scene_text_adv(f, 32, st.size);
+        // justify: each paragraph broken by ViroReact's Knuth-Plass formatter (greedy word
+        // wrap when no tolerance fits), the spaces of every line but the paragraph's last
+        // stretched to the box width
         int start = 0;
         while (start <= text.size) {
             int end = start;
             while (end < text.size && text.data[end] != 10) end++;
-            int first = out.lines.size;
             if (end == start) {
                 List<uint32> empty;
                 _scene_text_push(&out.lines, &empty, &out.cps, 1.0);
                 empty.free();
-            } else {
-                SceneTextStyle free_st = *st;
-                free_st.max_lines = 0;
-                free_st.clip = false;
-                _scene_text_words(f, text, start, end, &free_st, lh, out);
-            }
-            for (li in first..out.lines.size - 1) {
-                *_SceneTextLine l = &out.lines.data[li];
-                // drop the trailing spaces, then share the room left among the others
-                while (l.count > 0 && _scene_text_ws(out.cps.data[l.start + l.count - 1])) l.count--;
-                float w = 0.0;
-                int spaces = 0;
-                for (k in 0..l.count) {
-                    uint32 c = out.cps.data[l.start + k];
-                    w += _scene_text_adv(f, c, st.size);
-                    if (c == 32) spaces++;
-                }
-                if (spaces > 0 && space > 0.0) l.spacing = 1.0 + (st.width - w) / (float)spaces / space;
+            } else if (!_scene_text_kp(f, text, start, end, st, out)) {
+                _scene_text_words(f, text, start, end, st, lh, out);
             }
             if (end >= text.size) break;
             start = end + 1;
