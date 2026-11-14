@@ -1,0 +1,407 @@
+// shapes.esk: polygons and polylines (`<scene/shapes>`).
+//
+// scene_polygon is ViroReact's ViroPolygon: a flat shape in the XY plane facing +Z, with
+// holes, triangulated by ear clipping, its texture coordinates spanning its bounds. A
+// ScenePolyline is ViroPolyline: paths drawn as ribbons of a thickness in world units
+// that face the camera, with round ends and, by default, round joins; it is rebuilt toward
+// the camera by ScenePolyline_update each frame.
+//
+//     List<Vec2> outline;   // ...points, counterclockwise or not
+//     List<List<Vec2>> holes;
+//     SceneGeometry g = scene_polygon(&outline, &holes, Vec4{0.0, 0.0, 1.0, 1.0});
+//     int mesh = scene.add_geometry(&g)?;
+//
+//     ScenePolyline line = scene_polyline(&scene, parent, 0.02)?;
+//     line.add_path(&points);
+//     ...each frame: line.update(&scene)?;
+
+import <mem>;
+import <list>;
+import <result>;
+import <libc>;
+import <gpu/math>;
+import <scene>;
+import <scene/geometry>;
+import <scene/material>;
+
+float _shp_cross(Vec2 o, Vec2 a, Vec2 b) {
+    return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+}
+
+float _shp_area(*List<Vec2> ring) {
+    float a = 0.0;
+    int n = ring.size;
+    for (i in 0..n) {
+        Vec2 p = ring.data[i];
+        Vec2 q = ring.data[(i + 1) % n];
+        a += p.x * q.y - q.x * p.y;
+    }
+    return a * 0.5;
+}
+
+bool _shp_in_triangle(Vec2 a, Vec2 b, Vec2 c, Vec2 p) {
+    float d1 = _shp_cross(a, b, p);
+    float d2 = _shp_cross(b, c, p);
+    float d3 = _shp_cross(c, a, p);
+    bool neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    bool pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    return !(neg && pos);
+}
+
+// Points of ring without repeats (ViroReact drops duplicated vertices), into out.
+void _shp_unique(*List<Vec2> ring, *List<Vec2> out) {
+    for (i in 0..ring.size) {
+        Vec2 p = ring.data[i];
+        bool dup = false;
+        for (j in 0..out.size) {
+            if (out.data[j].x == p.x && out.data[j].y == p.y) dup = true;
+        }
+        if (!dup) List_push(out, p);
+    }
+}
+
+// Joins hole (clockwise) into poly (counterclockwise) by a bridge from the hole's
+// rightmost point to a point of poly it can see, as earcut does.
+void _shp_bridge(*List<Vec2> poly, *List<Vec2> hole) {
+    int hm = 0;
+    for (i in 1..hole.size) {
+        if (hole.data[i].x > hole.data[hm].x) hm = i;
+    }
+    Vec2 m = hole.data[hm];
+    // the nearest edge of poly hit by the ray from m toward +x
+    float best = 1e30;
+    int pick = -1;
+    int n = poly.size;
+    for (i in 0..n) {
+        Vec2 a = poly.data[i];
+        Vec2 b = poly.data[(i + 1) % n];
+        if ((a.y > m.y) == (b.y > m.y)) {
+            if (a.y == m.y && a.x >= m.x && a.x - m.x < best) {
+                best = a.x - m.x;
+                pick = i;
+            }
+            continue;
+        }
+        float x = a.x + (m.y - a.y) * (b.x - a.x) / (b.y - a.y);
+        if (x < m.x || x - m.x >= best) continue;
+        best = x - m.x;
+        pick = a.x > b.x ? i : (i + 1) % n;
+    }
+    if (pick < 0) pick = 0;
+    // a reflex vertex inside the triangle (m, hit, pick) would block the bridge: take the
+    // one making the smallest angle with the ray instead
+    Vec2 hit = Vec2{m.x + best, m.y};
+    Vec2 p = poly.data[pick];
+    float best_angle = 1e30;
+    for (i in 0..n) {
+        Vec2 q = poly.data[i];
+        if (i == pick || q.x < m.x) continue;
+        if (_shp_in_triangle(m, hit, p, q) || _shp_in_triangle(m, p, hit, q)) {
+            float ang = (float)fabs((double)(q.y - m.y)) / (q.x - m.x + 1e-9);
+            if (ang < best_angle) {
+                best_angle = ang;
+                pick = i;
+            }
+        }
+    }
+    List<Vec2> merged;
+    for (i in 0..pick + 1) List_push(&merged, poly.data[i]);
+    for (k in 0..hole.size + 1) List_push(&merged, hole.data[(hm + k) % hole.size]);
+    for (i in pick..n) List_push(&merged, poly.data[i]);
+    List_clear(poly);
+    for (i in 0..merged.size) List_push(poly, merged.data[i]);
+    merged.free();
+}
+
+// Triangulates the counterclockwise ring by ear clipping; appends index triples into out
+// (indices into ring).
+void _shp_earclip(*List<Vec2> ring, *List<uint32> out) {
+    List<int> idx;
+    for (i in 0..ring.size) List_push(&idx, i);
+    int guard = 0;
+    while (idx.size > 3 && guard < 100000) {
+        guard++;
+        bool cut = false;
+        int n = idx.size;
+        for (k in 0..n) {
+            int ia = idx.data[(k + n - 1) % n];
+            int ib = idx.data[k];
+            int ic = idx.data[(k + 1) % n];
+            Vec2 a = ring.data[ia];
+            Vec2 b = ring.data[ib];
+            Vec2 c = ring.data[ic];
+            if (_shp_cross(a, b, c) <= 0.0) continue;
+            bool ear = true;
+            for (j in 0..n) {
+                int ij = idx.data[j];
+                if (ij == ia || ij == ib || ij == ic) continue;
+                Vec2 p = ring.data[ij];
+                // a bridge repeats points: a copy of a corner does not block the ear
+                if ((p.x == a.x && p.y == a.y) || (p.x == b.x && p.y == b.y) || (p.x == c.x && p.y == c.y)) continue;
+                if (_shp_in_triangle(a, b, c, p)) {
+                    ear = false;
+                    break;
+                }
+            }
+            if (!ear) continue;
+            List_push(out, (uint32)ia);
+            List_push(out, (uint32)ib);
+            List_push(out, (uint32)ic);
+            List_remove(&idx, k);
+            cut = true;
+            break;
+        }
+        if (!cut) {
+            // degenerate leftovers (collinear points): drop the middle one
+            List_remove(&idx, 0);
+        }
+    }
+    if (idx.size == 3) {
+        Vec2 a = ring.data[idx.data[0]];
+        Vec2 b = ring.data[idx.data[1]];
+        Vec2 c = ring.data[idx.data[2]];
+        if (_shp_cross(a, b, c) > 0.0) {
+            for (k in 0..3) List_push(out, (uint32)idx.data[k]);
+        }
+    }
+    idx.free();
+}
+
+// ViroPolygon: the shape inside path (points in the XY plane, either winding) minus holes,
+// facing +Z, its texture coordinates going from (uv.x, uv.y) at the top left of its bounds
+// to (uv.z, uv.w) at the bottom right. Repeated points are dropped. Free the result.
+SceneGeometry scene_polygon(*List<Vec2> path, *List<List<Vec2>> holes, Vec4 uv) {
+    List<Vec2> ring;
+    _shp_unique(path, &ring);
+    float minx = 1e30;
+    float maxx = -1e30;
+    float miny = 1e30;
+    float maxy = -1e30;
+    for (i in 0..ring.size) {
+        Vec2 p = ring.data[i];
+        if (p.x < minx) minx = p.x;
+        if (p.x > maxx) maxx = p.x;
+        if (p.y < miny) miny = p.y;
+        if (p.y > maxy) maxy = p.y;
+    }
+    if (ring.size >= 3 && _shp_area(&ring) < 0.0) {
+        for (i in 0..ring.size / 2) {
+            Vec2 t = ring.data[i];
+            ring.data[i] = ring.data[ring.size - 1 - i];
+            ring.data[ring.size - 1 - i] = t;
+        }
+    }
+    if (holes != null) {
+        // holes from the rightmost in, each clockwise
+        List<int> order;
+        for (h in 0..holes.size) {
+            if (holes.data[h].size >= 3) List_push(&order, h);
+        }
+        for (i in 1..order.size) {
+            int v = order.data[i];
+            int j = i - 1;
+            float vx = -1e30;
+            for (k in 0..holes.data[v].size) {
+                if (holes.data[v].data[k].x > vx) vx = holes.data[v].data[k].x;
+            }
+            while (j >= 0) {
+                float jx = -1e30;
+                for (k in 0..holes.data[order.data[j]].size) {
+                    if (holes.data[order.data[j]].data[k].x > jx) jx = holes.data[order.data[j]].data[k].x;
+                }
+                if (jx >= vx) break;
+                order.data[j + 1] = order.data[j];
+                j--;
+            }
+            order.data[j + 1] = v;
+        }
+        for (i in 0..order.size) {
+            List<Vec2> hole;
+            _shp_unique(&holes.data[order.data[i]], &hole);
+            if (_shp_area(&hole) > 0.0) {
+                for (k in 0..hole.size / 2) {
+                    Vec2 t = hole.data[k];
+                    hole.data[k] = hole.data[hole.size - 1 - k];
+                    hole.data[hole.size - 1 - k] = t;
+                }
+            }
+            if (hole.size >= 3 && ring.size >= 3) _shp_bridge(&ring, &hole);
+            hole.free();
+        }
+        order.free();
+    }
+    List<uint32> tris;
+    if (ring.size >= 3) _shp_earclip(&ring, &tris);
+    SceneGeometry g = scene_geometry((uint32)ring.size, (uint32)tris.size);
+    float w = maxx - minx;
+    float h = miny - maxy;
+    for (i in 0..ring.size) {
+        Vec2 p = ring.data[i];
+        float u = uv.x + (w != 0.0 ? (p.x - minx) / w : 0.0) * (uv.z - uv.x);
+        float v = uv.y + (h != 0.0 ? (p.y - maxy) / h : 0.0) * (uv.w - uv.y);
+        g.set((uint32)i, Vec3{p.x, p.y, 0.0}, Vec3{0.0, 0.0, 1.0}, Vec2{u, v});
+    }
+    for (i in 0..tris.size) g.indices[i] = tris.data[i];
+    if (ring.size > 0) g.bounds();
+    tris.free();
+    ring.free();
+    return g;
+}
+
+// ViroPolyline's join styles: a round joint at each inner point, or none.
+const int SCENE_JOIN_ROUND = 0;
+const int SCENE_JOIN_NONE = 1;
+
+const int _SCENE_CAP_SEGMENTS = 16;
+
+// A polyline node: node draws mesh with material (unlit white, double-sided), paths are
+// lists of points in the node's space, thickness the ribbon's width in world units.
+struct ScenePolyline {
+    int node;
+    int mesh;
+    int material;
+    float thickness;
+    int join;
+    List<List<Vec3>> paths;
+}
+
+// Adds a polyline node under parent with no paths yet.
+Result<ScenePolyline, string> scene_polyline(*Scene scene, int parent, float thickness) {
+    ScenePolyline l;
+    l.thickness = thickness;
+    l.join = SCENE_JOIN_ROUND;
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.double_sided = true;
+    l.material = Scene_add_material(scene, m);
+    l.node = Scene_add_node(scene, parent, "polyline");
+    Scene_node(scene, l.node).material = l.material;
+    return Ok<ScenePolyline, string>(l);
+}
+
+// Adds a path (copied).
+void ScenePolyline_add_path(*ScenePolyline self, *List<Vec3> points) {
+    List<Vec3> p;
+    for (i in 0..points.size) List_push(&p, points.data[i]);
+    List_push(&self.paths, p);
+}
+
+// Adds a point to the end of the last path (a new path when there is none), as
+// ViroPolyline's appendPoint.
+void ScenePolyline_append(*ScenePolyline self, Vec3 point) {
+    if (self.paths.size == 0) {
+        List<Vec3> p;
+        List_push(&self.paths, p);
+    }
+    List_push(&self.paths.data[self.paths.size - 1], point);
+}
+
+// Removes every path.
+void ScenePolyline_clear(*ScenePolyline self) {
+    for (i in 0..self.paths.size) self.paths.data[i].free();
+    List_clear(&self.paths);
+}
+
+struct _ShpBuild {
+    List<Vec3> pos;
+    List<uint32> idx;
+}
+
+// The stroke offset at world point w for a line along dir (world), rotated by angle about
+// the view ray, ViroReact's polyline shader.
+Vec3 _shp_offset(Vec3 w, Vec3 dir, Vec3 eye, float half, float angle) {
+    Vec3 ray = (w - eye).normalize();
+    Vec3 s = ray.cross(dir);
+    if (s.length() <= 0.0) return Vec3{0.0, 0.0, 0.0};
+    Vec3 o = s.normalize() * half;
+    if (angle > 0.0) o = quat_axis_angle(ray, angle).rotate(o);
+    return o;
+}
+
+void _shp_cap(*_ShpBuild b, Mat4 world, Mat4 inv, Vec3 center, Vec3 dir, Vec3 eye, float half) {
+    Vec3 wc = world.point(center);
+    Vec3 wd = Vec3{world.m[0] * dir.x + world.m[4] * dir.y + world.m[8] * dir.z,
+        world.m[1] * dir.x + world.m[5] * dir.y + world.m[9] * dir.z,
+        world.m[2] * dir.x + world.m[6] * dir.y + world.m[10] * dir.z};
+    uint32 c = (uint32)b.pos.size;
+    List_push(&b.pos, center);
+    for (i in 0.._SCENE_CAP_SEGMENTS + 1) {
+        float a = (float)i * 6.28318530718 / (float)_SCENE_CAP_SEGMENTS;
+        List_push(&b.pos, inv.point(wc + _shp_offset(wc, wd, eye, half, a)));
+    }
+    for (i in 0.._SCENE_CAP_SEGMENTS) {
+        List_push(&b.idx, c);
+        List_push(&b.idx, c + 1 + (uint32)i);
+        List_push(&b.idx, c + 2 + (uint32)i);
+    }
+}
+
+void _shp_quad(*_ShpBuild b, Mat4 world, Mat4 inv, Vec3 p, Vec3 q, Vec3 eye, float half) {
+    Vec3 wp = world.point(p);
+    Vec3 wq = world.point(q);
+    Vec3 dir = wq - wp;
+    if (dir.length() <= 0.0) return;
+    dir = dir.normalize();
+    uint32 base = (uint32)b.pos.size;
+    Vec3 op = _shp_offset(wp, dir, eye, half, 0.0);
+    Vec3 oq = _shp_offset(wq, dir, eye, half, 0.0);
+    List_push(&b.pos, inv.point(wp - op));
+    List_push(&b.pos, inv.point(wp + op));
+    List_push(&b.pos, inv.point(wq - oq));
+    List_push(&b.pos, inv.point(wq + oq));
+    uint32[6] t = {base, base + 1, base + 3, base, base + 3, base + 2};
+    for (k in 0..6) List_push(&b.idx, t[k]);
+}
+
+// Rebuilds the ribbons toward the scene's camera. Call it after the camera or the node
+// moves, and after changing the paths or the thickness.
+Result<int, string> ScenePolyline_update(*ScenePolyline self, *Scene scene) {
+    Scene_update(scene);
+    Mat4 world = Scene_node(scene, self.node).world;
+    Mat4 inv = world.inverse();
+    Vec3 eye = Vec3{0.0, 0.0, 0.0};
+    if (scene.camera >= 0 && scene.camera < scene.nodes.size) {
+        Mat4 c = scene.nodes.data[scene.camera].world;
+        eye = Vec3{c.m[12], c.m[13], c.m[14]};
+    }
+    float half = self.thickness / 2.0;
+    _ShpBuild b;
+    for (pi in 0..self.paths.size) {
+        *List<Vec3> path = &self.paths.data[pi];
+        if (path.size == 0) continue;
+        Vec3 last_dir = Vec3{1.0, 0.0, 0.0};
+        for (i in 1..path.size) {
+            Vec3 p = path.data[i - 1];
+            Vec3 q = path.data[i];
+            if (i == 1 || self.join == SCENE_JOIN_ROUND) _shp_cap(&b, world, inv, p, last_dir, eye, half);
+            _shp_quad(&b, world, inv, p, q, eye, half);
+            if ((q - p).length() > 0.0) last_dir = (q - p).normalize();
+        }
+        _shp_cap(&b, world, inv, path.data[path.size - 1], last_dir, eye, half);
+    }
+    if (b.idx.size == 0) {
+        Scene_node(scene, self.node).mesh = 0;
+        b.pos.free();
+        b.idx.free();
+        return Ok<int, string>(0);
+    }
+    SceneGeometry g = scene_geometry((uint32)b.pos.size, (uint32)b.idx.size);
+    defer g.free();
+    for (i in 0..b.pos.size) g.set((uint32)i, b.pos.data[i], Vec3{0.0, 0.0, 1.0}, Vec2{0.0, 0.0});
+    for (i in 0..b.idx.size) g.indices[i] = b.idx.data[i];
+    g.bounds();
+    b.pos.free();
+    b.idx.free();
+    if (self.mesh > 0) {
+        if (!Scene_set_geometry(scene, self.mesh, &g)) return Err<int, string>("scene: polyline upload failed");
+    } else {
+        self.mesh = Scene_add_geometry(scene, &g)?;
+    }
+    Scene_node(scene, self.node).mesh = self.mesh;
+    return Ok<int, string>((int)(g.index_count / 3));
+}
+
+// Frees the paths (the node, mesh and material stay in the scene).
+void ScenePolyline_free(*ScenePolyline self) {
+    ScenePolyline_clear(self);
+    self.paths.free();
+}

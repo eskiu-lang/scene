@@ -1,0 +1,183 @@
+// Polygons and polylines: triangulated area of convex, concave and holed polygons, winding
+// toward +Z, texture coordinates over the bounds, repeated points; a polyline's ribbon width,
+// round ends and joins facing the camera, and a pixel check of both.
+import <io>;
+import <mem>;
+import <list>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/shapes>;
+
+const int N = 32;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b, float tol) {
+    return a - b < tol && b - a < tol;
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+// The summed area of g's triangles, and whether all face +Z.
+float area(*SceneGeometry g, *bool up) {
+    float a = 0.0;
+    *up = true;
+    for (t in 0..g.index_count / 3) {
+        Vec3 p = g.position(g.indices[t * 3]);
+        Vec3 q = g.position(g.indices[t * 3 + 1]);
+        Vec3 r = g.position(g.indices[t * 3 + 2]);
+        float z = (q - p).cross(r - p).z;
+        if (z < 0.0) *up = false;
+        a += z * 0.5;
+    }
+    return a;
+}
+
+List<Vec2> square(float x0, float y0, float x1, float y1, bool clockwise) {
+    List<Vec2> s;
+    List_push(&s, Vec2{x0, y0});
+    if (clockwise) {
+        List_push(&s, Vec2{x0, y1});
+        List_push(&s, Vec2{x1, y1});
+        List_push(&s, Vec2{x1, y0});
+    } else {
+        List_push(&s, Vec2{x1, y0});
+        List_push(&s, Vec2{x1, y1});
+        List_push(&s, Vec2{x0, y1});
+    }
+    return s;
+}
+
+void polygons() {
+    Vec4 uv = Vec4{0.0, 0.0, 1.0, 1.0};
+    List<Vec2> sq = square(-1.0, -1.0, 1.0, 1.0, true);
+    SceneGeometry g = scene_polygon(&sq, null, uv);
+    bool up = false;
+    check("square: area 4, facing +Z whatever the winding", near(area(&g, &up), 4.0, 1e-5) && up && g.index_count == 6);
+    // texture coordinates: (u0, v0) at the top left of the bounds
+    bool uv_ok = true;
+    for (i in 0..g.vertex_count) {
+        *float v = g.vertices + (int64)i * SCENE_VERTEX_FLOATS;
+        float u_want = (v[0] + 1.0) / 2.0;
+        float v_want = (1.0 - v[1]) / 2.0;
+        if (!near(v[6], u_want, 1e-6) || !near(v[7], v_want, 1e-6)) uv_ok = false;
+    }
+    check("texture coordinates over the bounds", uv_ok);
+    g.free();
+
+    // an L: concave
+    List<Vec2> l;
+    Vec2[6] lp = {Vec2{0.0, 0.0}, Vec2{2.0, 0.0}, Vec2{2.0, 1.0}, Vec2{1.0, 1.0}, Vec2{1.0, 2.0}, Vec2{0.0, 2.0}};
+    for (i in 0..6) List_push(&l, lp[i]);
+    List_push(&l, Vec2{0.0, 0.0});
+    g = scene_polygon(&l, null, uv);
+    check("L shape: area 3, a repeated point dropped", near(area(&g, &up), 3.0, 1e-5) && up && g.vertex_count == 6);
+    g.free();
+
+    // a square with two square holes
+    List<List<Vec2>> holes;
+    List_push(&holes, square(-0.5, -0.5, 0.0, 0.0, false));
+    List_push(&holes, square(0.25, 0.25, 0.75, 0.75, true));
+    g = scene_polygon(&sq, &holes, uv);
+    check("holes cut out: area 4 - 0.25 - 0.25", near(area(&g, &up), 3.5, 1e-4) && up);
+    g.free();
+    for (i in 0..holes.size) holes.data[i].free();
+    holes.free();
+    sq.free();
+    l.free();
+}
+
+Result<int, string> run() {
+    polygons();
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    int cam = scene.add_camera(0, scene_orthographic(2.0, 0.1, 10.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+
+    // a horizontal line seen from the front: a ribbon thickness wide, round ends past its
+    // points by half the thickness
+    ScenePolyline line = scene_polyline(&scene, 0, 0.2)?;
+    List<Vec3> pts;
+    List_push(&pts, Vec3{-0.5, 0.0, 0.0});
+    List_push(&pts, Vec3{0.5, 0.0, 0.0});
+    line.add_path(&pts);
+    line.update(&scene)?;
+    *SceneMesh m = &scene.meshes.data[line.mesh];
+    check("ribbon height is the thickness", near(m.min.y, -0.1, 1e-4) && near(m.max.y, 0.1, 1e-4));
+    check("round ends reach half the thickness past the ends", near(m.min.x, -0.6, 1e-3) && near(m.max.x, 0.6, 1e-3));
+    // the round ends turn about the ray from the camera to each point, as in ViroReact,
+    // so off the axis they lean a little toward the camera
+    check("faces the camera: nearly flat in z", near(m.min.z, 0.0, 0.02) && near(m.max.z, 0.0, 0.02));
+    // a corner: the joint is round, so the outer corner is covered
+    line.append(Vec3{0.5, 0.5, 0.0});
+    line.update(&scene)?;
+    m = &scene.meshes.data[line.mesh];
+    check("a second segment and its joint", near(m.max.y, 0.6, 1e-3) && near(m.max.x, 0.6, 1e-3));
+
+    // drawn: the polygon (red, with a hole) and the line (white)
+    line.clear();
+    List<Vec3> mid;
+    List_push(&mid, Vec3{-0.8, -0.8, 0.1});
+    List_push(&mid, Vec3{0.8, -0.8, 0.1});
+    line.add_path(&mid);
+    line.update(&scene)?;
+    List<Vec2> outer = square(-0.8, -0.4, 0.8, 0.8, false);
+    List<List<Vec2>> hole;
+    List_push(&hole, square(-0.2, 0.0, 0.2, 0.4, false));
+    SceneGeometry pg = scene_polygon(&outer, &hole, Vec4{0.0, 0.0, 1.0, 1.0});
+    int pmesh = scene.add_geometry(&pg)?;
+    pg.free();
+    SceneMaterial red = scene_material(SCENE_CONSTANT);
+    red.diffuse = Vec4{1.0, 0.0, 0.0, 1.0};
+    scene.add_object(0, pmesh, scene.add_material(red));
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    // pixel (x, y) sees world (x + 0.5) / 16 - 1, 1 - (y + 0.5) / 16
+    float body = half_to_float(px[(8 * N + 4) * 4]);
+    float in_hole = half_to_float(px[(12 * N + 16) * 4]);
+    float stroke = half_to_float(px[(28 * N + 16) * 4 + 1]);
+    check("polygon drawn", near(body, 1.0, 0.01));
+    check("its hole is empty", near(in_hole, 0.0, 0.01));
+    check("line drawn", near(stroke, 1.0, 0.01));
+    line.free();
+    pts.free();
+    mid.free();
+    outer.free();
+    hole.data[0].free();
+    hole.free();
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("shapes: ok\n");
+    return 0;
+}
