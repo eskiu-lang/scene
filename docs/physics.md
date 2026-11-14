@@ -60,8 +60,15 @@ node by hand, `ScenePhysicsWorld_refresh(&scene, id)` takes the new transform.
 | `scene_physics_auto(&scene, node)` | no shape given: a box around the node's mesh, in its scale |
 | `scene_physics_auto_compound(&scene, node)` | `Compound` without parts: a box per mesh in the node and its descendants |
 | `scene_physics_compound()` + `_add_box(size, offset)`, `_add_sphere(r, offset)` | `Compound` with authored parts, weighted by volume for the center of mass |
+| `scene_physics_triangles(corners, count)`, `scene_physics_geometry(&geometry)` | the world mesh and depth mesh bodies: triangles (three corners each) for static and kinematic bodies |
 
 ViroReact's automatic shape is a sphere for sphere geometry; here it is always a box.
+
+A triangle mesh is for what does not move under the simulation: the real world's mesh in AR
+(arscene's `ArWorldMesh.physics`), the depth image as a mesh (`ArDepthCollider`), or a level's
+ground. Spheres meet it triangle by triangle at the closest point, boxes by separating axes
+per triangle, and rays by Moller-Trumbore. Two meshes do not collide, and a dynamic body with
+a mesh shape moves as the box around it.
 
 ## Forces and velocities
 
@@ -96,4 +103,4 @@ and `findCollisionsWithShapeAsync`.
 ViroReact runs Bullet. This module is its own solver: contact manifolds from separating axes
 and face clipping (exact for spheres), sequential impulses with friction and restitution,
 and sleeping. Bodies come to rest, stack and bounce as they do there, but a simulation is
-not step-for-step identical, and triangle mesh shapes are not supported.
+not step-for-step identical.

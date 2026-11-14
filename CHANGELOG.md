@@ -8,6 +8,9 @@ All notable changes to this package are documented here. The format follows
 
 ### Added
 
+- Triangle mesh bodies: `scene_physics_triangles` and `scene_physics_geometry` for static and
+  kinematic bodies (the real world's mesh and depth in AR), with sphere and box contacts and
+  ray tests.
 - Instancing: `Scene_set_instances` draws a node's mesh at many transforms in one draw call,
   with shadows, shader modifiers and culling over every instance.
 - Semantic masks (ViroReact's): `scene_semantic_mask`, `scene_semantic_label`, the

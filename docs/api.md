@@ -2771,6 +2771,7 @@ struct ScenePhysicsPart {
     Vec3 size;
     Vec3 offset;
     Quat rotation;
+    *_PhTriangles tris;
 }
 ```
 
@@ -2812,6 +2813,24 @@ ScenePhysicsShape scene_physics_compound()
 ```
 
 An empty compound shape; add parts with ScenePhysicsShape_add_box and _add_sphere.
+
+### scene_physics_triangles
+
+```eskiu
+ScenePhysicsShape scene_physics_triangles(*Vec3 corners, int count)
+```
+
+A triangle mesh: `count` corners (three a triangle) in the node's space, for a static or
+kinematic body: the real world's mesh or depth to land on and bump into (ViroReact's
+physics against the world mesh). A dynamic body with it moves as the box around it.
+
+### scene_physics_geometry
+
+```eskiu
+ScenePhysicsShape scene_physics_geometry(*SceneGeometry g)
+```
+
+A triangle mesh from a geometry's triangles (its positions and indices).
 
 ### ScenePhysicsShape_add_box
 

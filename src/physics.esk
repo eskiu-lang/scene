@@ -35,6 +35,7 @@ const int SCENE_BODY_DYNAMIC = 2;
 
 const int _PH_BOX = 0;
 const int _PH_SPHERE = 1;
+const int _PH_MESH = 2;
 
 // The fixed step and the most steps one update takes (ViroReact's).
 const double SCENE_PHYSICS_STEP = 0.016666666666666666;
@@ -47,6 +48,12 @@ struct ScenePhysicsPart {
     Vec3 size;
     Vec3 offset;
     Quat rotation;
+    *_PhTriangles tris;
+}
+
+// A triangle mesh part's triangles, three corners each, around the part's offset.
+struct _PhTriangles {
+    List<Vec3> corners;
 }
 
 // A collision shape: one or more parts. compound weighs parts by volume for the center of
@@ -75,6 +82,41 @@ ScenePhysicsShape scene_physics_compound() {
     ScenePhysicsShape s;
     s.by_volume = true;
     return s;
+}
+
+// A triangle mesh: `count` corners (three a triangle) in the node's space, for a static or
+// kinematic body: the real world's mesh or depth to land on and bump into (ViroReact's
+// physics against the world mesh). A dynamic body with it moves as the box around it.
+ScenePhysicsShape scene_physics_triangles(*Vec3 corners, int count) {
+    ScenePhysicsShape s;
+    if (count < 3) return s;
+    Vec3 lo = corners[0];
+    Vec3 hi = corners[0];
+    for (i in 1..count) {
+        Vec3 c = corners[i];
+        lo = Vec3{c.x < lo.x ? c.x : lo.x, c.y < lo.y ? c.y : lo.y, c.z < lo.z ? c.z : lo.z};
+        hi = Vec3{c.x > hi.x ? c.x : hi.x, c.y > hi.y ? c.y : hi.y, c.z > hi.z ? c.z : hi.z};
+    }
+    Vec3 mid = (lo + hi) * 0.5;
+    *_PhTriangles t = alloc<_PhTriangles>(1);
+    for (i in 0..count / 3 * 3) List_push(&t.corners, corners[i] - mid);
+    Vec3 size = hi - lo;
+    if (size.x < 0.001) size.x = 0.001;
+    if (size.y < 0.001) size.y = 0.001;
+    if (size.z < 0.001) size.z = 0.001;
+    List_push(&s.parts, ScenePhysicsPart{_PH_MESH, size, mid, quat_identity(), t});
+    return s;
+}
+
+// A triangle mesh from a geometry's triangles (its positions and indices).
+ScenePhysicsShape scene_physics_geometry(*SceneGeometry g) {
+    *Vec3 corners = alloc<Vec3>((int64)g.index_count + 1);
+    defer free((*void)corners);
+    for (i in 0..(int)g.index_count) {
+        *float v = g.vertices + (int64)g.indices[i] * SCENE_VERTEX_FLOATS;
+        corners[i] = Vec3{v[0], v[1], v[2]};
+    }
+    return scene_physics_triangles(corners, (int)g.index_count);
 }
 
 // Adds a box of size at offset to a compound.
@@ -411,6 +453,12 @@ int ScenePhysicsWorld_add(*ScenePhysicsWorld self, *Scene scene, int node, int t
         } else {
             p.size = Vec3{p.size.x * s.x, p.size.y * s.y, p.size.z * s.z};
         }
+        if (p.tris != null) {
+            for (k in 0..p.tris.corners.size) {
+                Vec3 c = p.tris.corners.data[k];
+                p.tris.corners.data[k] = Vec3{c.x * s.x, c.y * s.y, c.z * s.z};
+            }
+        }
         p.offset = Vec3{p.offset.x * s.x, p.offset.y * s.y, p.offset.z * s.z};
     }
     b.shape = shape;
@@ -431,7 +479,18 @@ int ScenePhysicsWorld_add(*ScenePhysicsWorld self, *Scene scene, int node, int t
 // Removes a body from the simulation (its id is not reused).
 void ScenePhysicsWorld_remove(*ScenePhysicsWorld self, int id) {
     *ScenePhysicsBody b = ScenePhysicsWorld_body(self, id);
-    if (b != null) b.alive = false;
+    if (b == null) return;
+    b.alive = false;
+    // a mesh rebuilt often (the world's) leaves no triangles behind
+    for (k in 0..b.shape.parts.size) {
+        *_PhTriangles t = b.shape.parts.data[k].tris;
+        if (t != null) {
+            t.corners.free();
+            free((*void)t);
+            b.shape.parts.data[k].tris = null;
+        }
+    }
+    List_clear(&b.shape.parts);
 }
 
 // Takes the node's current transform into the body (after moving a dynamic body's node by
@@ -519,6 +578,7 @@ struct _PhPart {
     Quat rot;
     Vec3 half;
     float radius;
+    *_PhTriangles tris;
 }
 
 _PhPart _ph_world_part(*ScenePhysicsBody b, *ScenePhysicsPart p) {
@@ -528,6 +588,7 @@ _PhPart _ph_world_part(*ScenePhysicsBody b, *ScenePhysicsPart p) {
     w.center = b._pos + b._rot.rotate(p.offset - b._com);
     w.half = p.size * 0.5;
     w.radius = p.size.x;
+    w.tris = p.tris;
     return w;
 }
 
@@ -761,6 +822,126 @@ void _ph_box_box(*ScenePhysicsWorld self, int a, int b, _PhPart pa, _PhPart pb) 
     }
 }
 
+// The closest point to p on triangle abc (Ericson's region tests).
+Vec3 _ph_closest_on_triangle(Vec3 p, Vec3 a, Vec3 b, Vec3 c) {
+    Vec3 ab = b - a;
+    Vec3 ac = c - a;
+    Vec3 ap = p - a;
+    float d1 = ab.dot(ap);
+    float d2 = ac.dot(ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return a;
+    Vec3 bp = p - b;
+    float d3 = ab.dot(bp);
+    float d4 = ac.dot(bp);
+    if (d3 >= 0.0 && d4 <= d3) return b;
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) return a + ab * (d1 / (d1 - d3));
+    Vec3 cp = p - c;
+    float d5 = ab.dot(cp);
+    float d6 = ac.dot(cp);
+    if (d6 >= 0.0 && d5 <= d6) return c;
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) return a + ac * (d2 / (d2 - d6));
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0) return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    float denom = 1.0 / (va + vb + vc);
+    return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
+// sphere a against triangle mesh b: a contact per triangle it reaches
+void _ph_sphere_mesh(*ScenePhysicsWorld self, int a, int b, _PhPart s, _PhPart m) {
+    Quat inv = m.rot.conjugate();
+    Vec3 c = inv.rotate(s.center - m.center);
+    float r = s.radius;
+    for (t in 0..m.tris.corners.size / 3) {
+        Vec3 v0 = m.tris.corners.data[t * 3];
+        Vec3 v1 = m.tris.corners.data[t * 3 + 1];
+        Vec3 v2 = m.tris.corners.data[t * 3 + 2];
+        Vec3 q = _ph_closest_on_triangle(c, v0, v1, v2);
+        Vec3 d = c - q;
+        float dist = d.length();
+        if (dist >= r) continue;
+        Vec3 n = dist > 1e-6 ? d / dist : (v1 - v0).cross(v2 - v0).normalize();
+        _ph_add_contact(self, a, b, m.center + m.rot.rotate(q), m.rot.rotate(n), r - dist);
+    }
+}
+
+// box a against triangle mesh b: separating axes per triangle (the box's three, the
+// triangle's normal and the nine edge crosses); a contact at the box's deepest corner
+void _ph_box_mesh(*ScenePhysicsWorld self, int a, int b, _PhPart bx, _PhPart m) {
+    // the triangles in the box's space
+    Quat to_box = bx.rot.conjugate();
+    Vec3 h = bx.half;
+    float reach = h.length();
+    for (t in 0..m.tris.corners.size / 3) {
+        Vec3[3] v;
+        for (k in 0..3) v[k] = to_box.rotate(m.center + m.rot.rotate(m.tris.corners.data[t * 3 + k]) - bx.center);
+        Vec3 tn = (v[1] - v[0]).cross(v[2] - v[0]);
+        float tl = tn.length();
+        if (tl < 1e-9) continue;
+        tn = tn / tl;
+        // quick rejection: the triangle's plane farther than the box's reach
+        float pd = tn.dot(v[0]);
+        if (pd > reach || pd < -reach) continue;
+        Vec3[3] edges = {v[1] - v[0], v[2] - v[1], v[0] - v[2]};
+        Vec3[13] axes;
+        int n = 0;
+        axes[n] = Vec3{1.0, 0.0, 0.0};
+        n++;
+        axes[n] = Vec3{0.0, 1.0, 0.0};
+        n++;
+        axes[n] = Vec3{0.0, 0.0, 1.0};
+        n++;
+        axes[n] = tn;
+        n++;
+        for (i in 0..3) {
+            Vec3 e = i == 0 ? Vec3{1.0, 0.0, 0.0} : (i == 1 ? Vec3{0.0, 1.0, 0.0} : Vec3{0.0, 0.0, 1.0});
+            for (j in 0..3) {
+                Vec3 x = e.cross(edges[j]);
+                float l = x.length();
+                if (l < 1e-6) continue;
+                axes[n] = x / l;
+                n++;
+            }
+        }
+        float best = 1e30;
+        Vec3 best_axis;
+        bool separated = false;
+        for (k in 0..n) {
+            Vec3 ax = axes[k];
+            float br = h.x * (ax.x < 0.0 ? -ax.x : ax.x) + h.y * (ax.y < 0.0 ? -ax.y : ax.y) + h.z * (ax.z < 0.0 ? -ax.z : ax.z);
+            float p0 = ax.dot(v[0]);
+            float p1 = ax.dot(v[1]);
+            float p2 = ax.dot(v[2]);
+            float lo = p0 < p1 ? (p0 < p2 ? p0 : p2) : (p1 < p2 ? p1 : p2);
+            float hi = p0 > p1 ? (p0 > p2 ? p0 : p2) : (p1 > p2 ? p1 : p2);
+            if (lo > br || hi < -br) {
+                separated = true;
+                break;
+            }
+            // push the box along +ax (the triangle under it) or -ax
+            float up = hi + br;
+            float down = br - lo;
+            // the triangle's own normal is preferred: it is how a surface pushes back
+            float bias = k == 3 ? 0.0 : 1e-4;
+            if (up + bias < best) {
+                best = up + bias;
+                best_axis = ax;
+            }
+            if (down + bias < best) {
+                best = down + bias;
+                best_axis = -ax;
+            }
+        }
+        if (separated) continue;
+        // the deepest corner of the box against the axis
+        Vec3 corner = Vec3{best_axis.x > 0.0 ? -h.x : h.x, best_axis.y > 0.0 ? -h.y : h.y, best_axis.z > 0.0 ? -h.z : h.z};
+        Vec3 normal = bx.rot.rotate(best_axis);
+        Vec3 point = bx.center + bx.rot.rotate(corner);
+        _ph_add_contact(self, a, b, point, normal, best);
+    }
+}
+
 void _ph_collide(*ScenePhysicsWorld self, int a, int b) {
     *ScenePhysicsBody ba = &self.bodies.data[a];
     *ScenePhysicsBody bb = &self.bodies.data[b];
@@ -768,7 +949,15 @@ void _ph_collide(*ScenePhysicsWorld self, int a, int b) {
         _PhPart pa = _ph_world_part(ba, &ba.shape.parts.data[i]);
         for (j in 0..bb.shape.parts.size) {
             _PhPart pb = _ph_world_part(bb, &bb.shape.parts.data[j]);
-            if (pa.kind == _PH_SPHERE && pb.kind == _PH_SPHERE) _ph_sphere_sphere(self, a, b, pa, pb);
+            if (pa.kind == _PH_MESH && pb.kind == _PH_MESH) {
+                // two meshes do not collide (static and kinematic bodies)
+            } else if (pb.kind == _PH_MESH) {
+                if (pa.kind == _PH_SPHERE) _ph_sphere_mesh(self, a, b, pa, pb);
+                else _ph_box_mesh(self, a, b, pa, pb);
+            } else if (pa.kind == _PH_MESH) {
+                if (pb.kind == _PH_SPHERE) _ph_sphere_mesh(self, b, a, pb, pa);
+                else _ph_box_mesh(self, b, a, pb, pa);
+            } else if (pa.kind == _PH_SPHERE && pb.kind == _PH_SPHERE) _ph_sphere_sphere(self, a, b, pa, pb);
             else if (pa.kind == _PH_SPHERE) _ph_sphere_box(self, a, b, pa, pb, false);
             else if (pb.kind == _PH_SPHERE) _ph_sphere_box(self, b, a, pb, pa, true);
             else _ph_box_box(self, a, b, pa, pb);
@@ -1040,6 +1229,37 @@ int ScenePhysicsWorld_update(*ScenePhysicsWorld self, *Scene scene, double time)
 
 // The distance along from + dir * t (dir unit) to where the ray enters part p, or -1.
 float _ph_ray_part(_PhPart p, Vec3 from, Vec3 dir, float max_t, *Vec3 normal) {
+    if (p.kind == _PH_MESH) {
+        // Moller-Trumbore against each triangle, in the part's space
+        Quat inv = p.rot.conjugate();
+        Vec3 o = inv.rotate(from - p.center);
+        Vec3 d = inv.rotate(dir);
+        float best = -1.0;
+        for (t in 0..p.tris.corners.size / 3) {
+            Vec3 v0 = p.tris.corners.data[t * 3];
+            Vec3 e1 = p.tris.corners.data[t * 3 + 1] - v0;
+            Vec3 e2 = p.tris.corners.data[t * 3 + 2] - v0;
+            Vec3 pv = d.cross(e2);
+            float det = e1.dot(pv);
+            if (det > -1e-9 && det < 1e-9) continue;
+            float id = 1.0 / det;
+            Vec3 tv = o - v0;
+            float u = tv.dot(pv) * id;
+            if (u < 0.0 || u > 1.0) continue;
+            Vec3 qv = tv.cross(e1);
+            float w = d.dot(qv) * id;
+            if (w < 0.0 || u + w > 1.0) continue;
+            float tt = e2.dot(qv) * id;
+            if (tt < 0.0 || tt > max_t) continue;
+            if (best < 0.0 || tt < best) {
+                best = tt;
+                Vec3 nn = e1.cross(e2).normalize();
+                if (nn.dot(d) > 0.0) nn = -nn;
+                *normal = p.rot.rotate(nn);
+            }
+        }
+        return best;
+    }
     if (p.kind == _PH_SPHERE) {
         Vec3 m = from - p.center;
         float b = m.dot(dir);
@@ -1195,6 +1415,13 @@ bool ScenePhysicsWorld_shape_test(*ScenePhysicsWorld self, Vec3 from, Vec3 to, S
 void ScenePhysicsWorld_free(*ScenePhysicsWorld self) {
     for (i in 0..self.bodies.size) {
         *ScenePhysicsBody b = &self.bodies.data[i];
+        for (k in 0..b.shape.parts.size) {
+            *_PhTriangles t = b.shape.parts.data[k].tris;
+            if (t != null) {
+                t.corners.free();
+                free((*void)t);
+            }
+        }
         b.shape.parts.free();
         b._forces.free();
         b._force_at.free();

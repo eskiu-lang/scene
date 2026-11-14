@@ -1,0 +1,110 @@
+// Bodies against triangle meshes (the real world's mesh in AR): a sphere and a box dropped on
+// a floor of two triangles come to rest on it, a sphere rolls down a ramp, a ray hits the
+// mesh where it should, and a geometry's triangles make the same floor.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/physics>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b, float tol) {
+    float d = a - b;
+    return d < tol && d > -tol;
+}
+
+double run_for(*ScenePhysicsWorld w, *Scene scene, double t0, double seconds) {
+    int frames = (int)(seconds * 60.0 + 0.5);
+    for (i in 1..frames + 1) w.update(scene, t0 + (double)i / 60.0);
+    return t0 + (double)frames / 60.0;
+}
+
+Vec3 hit_point;
+Vec3 hit_normal;
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+
+    // a 10 x 10 floor at y = 0, two triangles facing up
+    Vec3[6] floor_tris = {Vec3{-5.0, 0.0, -5.0}, Vec3{-5.0, 0.0, 5.0}, Vec3{5.0, 0.0, 5.0},
+                          Vec3{-5.0, 0.0, -5.0}, Vec3{5.0, 0.0, 5.0}, Vec3{5.0, 0.0, -5.0}};
+    ScenePhysicsWorld w = scene_physics();
+    int floor = scene.add_node(0, "floor");
+    int fb = w.add(&scene, floor, SCENE_BODY_STATIC, 0.0, scene_physics_triangles(&floor_tris[0], 6));
+    w.body(fb).tag = "world";
+    int ball = scene.add_node(0, "ball");
+    scene.node(ball).position = Vec3{1.0, 2.0, 1.0};
+    w.add(&scene, ball, SCENE_BODY_DYNAMIC, 1.0, scene_physics_sphere(0.25));
+    int box = scene.add_node(0, "box");
+    scene.node(box).position = Vec3{-1.0, 3.0, 0.5};
+    scene.node(box).rotation = quat_axis_angle(Vec3{0.3, 1.0, 0.2}.normalize(), 0.7);
+    w.add(&scene, box, SCENE_BODY_DYNAMIC, 1.0, scene_physics_box(Vec3{0.5, 0.4, 0.3}));
+    w.update(&scene, 0.0);
+    run_for(&w, &scene, 0.0, 5.0);
+    printf("ball y %.3f box y %.3f\n", (double)scene.node(ball).position.y, (double)scene.node(box).position.y);
+    check("a sphere rests on the mesh", near(scene.node(ball).position.y, 0.25, 0.02));
+    // the box lies on a face: its center between 0.15 and 0.25 above the floor
+    float by = scene.node(box).position.y;
+    check("a box rests on the mesh", by > 0.13 && by < 0.27);
+    // a ray from above meets the floor
+    bool hit = w.ray_test(Vec3{2.0, 5.0, -3.0}, Vec3{2.0, -5.0, -3.0}, true, "probe");
+    check("a ray hits the mesh", hit);
+    w.free();
+
+    // a ramp falling 1 in 2 toward +x: a sphere on it rolls down
+    Vec3[6] ramp = {Vec3{-5.0, 2.5, -5.0}, Vec3{-5.0, 2.5, 5.0}, Vec3{5.0, -2.5, 5.0},
+                    Vec3{-5.0, 2.5, -5.0}, Vec3{5.0, -2.5, 5.0}, Vec3{5.0, -2.5, -5.0}};
+    w = scene_physics();
+    int r = scene.add_node(0, "ramp");
+    w.add(&scene, r, SCENE_BODY_STATIC, 0.0, scene_physics_triangles(&ramp[0], 6));
+    int rb = scene.add_node(0, "roller");
+    scene.node(rb).position = Vec3{-2.0, 2.0, 0.0};
+    w.add(&scene, rb, SCENE_BODY_DYNAMIC, 1.0, scene_physics_sphere(0.3));
+    w.update(&scene, 0.0);
+    run_for(&w, &scene, 0.0, 1.5);
+    printf("roller x %.3f y %.3f\n", (double)scene.node(rb).position.x, (double)scene.node(rb).position.y);
+    float rx = scene.node(rb).position.x;
+    float ry = scene.node(rb).position.y;
+    // on the ramp: y = -x/2 + radius / cos
+    check("down the ramp, on it", rx > -1.0 && near(ry, -rx * 0.5 + 0.3 * 1.118, 0.05));
+    w.free();
+
+    // a geometry's triangles: the plane makes the same floor
+    SceneGeometry g = scene_plane(10.0, 10.0);
+    w = scene_physics();
+    int gf = scene.add_node(0, "plane");
+    w.add(&scene, gf, SCENE_BODY_STATIC, 0.0, scene_physics_geometry(&g));
+    g.free();
+    int gb = scene.add_node(0, "ball2");
+    scene.node(gb).position = Vec3{0.0, 1.0, 0.0};
+    w.add(&scene, gb, SCENE_BODY_DYNAMIC, 1.0, scene_physics_sphere(0.2));
+    w.update(&scene, 0.0);
+    run_for(&w, &scene, 0.0, 3.0);
+    check("a geometry's floor", near(scene.node(gb).position.y, 0.2, 0.02));
+    w.free();
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("physics_mesh: ok\n");
+    return 0;
+}
