@@ -1442,6 +1442,51 @@ A touch on a view showing the scene at width x height pixels: one finger points,
 presses, drags and clicks; a second finger ends that press and starts a pinch and a
 rotation, which end when either finger lifts.
 
+### SceneOrbit
+
+```eskiu
+struct SceneOrbit {
+    Vec3 target;
+    float distance;
+    float yaw;
+    float pitch;
+    float min_distance;
+    float max_distance;
+    float min_pitch;
+    float max_pitch;
+    float rotate_speed;
+}
+```
+
+An orbit camera (ViroReact's ViroOrbitCamera): the camera node stays distance away from
+target, turned yaw radians about the world Y axis and pitch radians up or down, looking
+at target. SceneOrbit_touch turns it with one finger (a drag across the view turns it
+by rotate_speed radians a pixel) and zooms with two (the pinch scales the distance).
+
+### scene_orbit
+
+```eskiu
+SceneOrbit scene_orbit(Vec3 target, Vec3 position)
+```
+
+An orbit around target from a camera at position.
+
+### SceneOrbit_apply
+
+```eskiu
+void SceneOrbit_apply(*SceneOrbit self, *Scene scene, int cam)
+```
+
+Places camera node cam on the orbit, looking at the target.
+
+### SceneOrbit_touch
+
+```eskiu
+void SceneOrbit_touch(*SceneOrbit self, GpuTouch t)
+```
+
+Turns and zooms the orbit with a touch (then call SceneOrbit_apply).
+
 
 ## `<scene/light>`
 

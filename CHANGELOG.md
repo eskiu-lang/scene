@@ -25,6 +25,8 @@ All notable changes to this package are documented here. The format follows
   camera with ViroReact's billboard rotation.
 - Frustum culling: nodes wholly outside the camera's view are not drawn (they still cast
   shadows).
+- `SceneOrbit` (ViroOrbitCamera): a camera circling a target, turned by a drag and
+  zoomed by a pinch.
 - Post effects: `ScenePost.effects`, ViroReact's postProcessEffects (grayscale, sepia,
   sincity, barrel and pincushion distortion, thermal vision, crosshatch, pixelated,
   toonify, inverted) with its formulas, chained in order inside the tone mapping pass;

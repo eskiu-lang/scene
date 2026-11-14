@@ -104,3 +104,20 @@ plane_normal, max_distance)` chooses how it follows the pointer:
 A node that takes `SCENE_ON_FUSE` counts down while `SceneInput_gaze` stays on it, over
 `SceneInput_set_fuse_time` seconds (2 by default). Call `SceneInput_gaze` once a frame
 with the ray through the image's center, or a headset's forward ray.
+
+## Orbit camera
+
+`SceneOrbit` is ViroReact's `ViroOrbitCamera`: the camera circles a target, looking at it.
+
+```c
+SceneOrbit orbit = scene_orbit(Vec3{0.0, 0.5, 0.0}, Vec3{0.0, 1.0, 3.0});  // target, start
+...for each GpuTouch: orbit.touch(t);
+...each frame: orbit.apply(&scene, camera);
+```
+
+`scene_orbit(target, position)` starts the orbit where a camera at `position` is. One
+finger dragging across the view turns it (`rotate_speed` radians a pixel, 0.01: across,
+about the world Y axis; up and down, its pitch), two fingers pinching scale its distance.
+`yaw`, `pitch` and `distance` can be set directly; `min_pitch`, `max_pitch` (±1.5 radians),
+`min_distance` and `max_distance` bound them. `SceneOrbit_apply` places the camera node and
+turns it toward the target.

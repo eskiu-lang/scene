@@ -51,7 +51,7 @@ macOS; on Linux and Windows, an SDL3 build from your package manager or libsdl.o
 | `<scene/particles>` | `SceneParticleEmitter`, modifiers, bursts, spawn volumes |
 | `<scene/text>` | `SceneText`, `SceneTextStyle`, layout and glyph atlases over eskiu-lang/font |
 | `<scene/animation>` | `SceneAnimations`: groups, easing curves, chains, playback |
-| `<scene/input>` | screen rays, hit tests, `SceneInput` and node events |
+| `<scene/input>` | screen rays, hit tests, `SceneInput` and node events, `SceneOrbit` |
 
 ## Tests
 
