@@ -145,7 +145,24 @@ int scene_key_blend(int key) {
 
 // Whether a material key is double-sided.
 bool scene_key_double_sided(int key) {
-    return key >= 256;
+    return (key / 256) % 2 == 1;
+}
+
+// The key of a material drawn on a node faded by its opacity (SceneNode.opacity below 1):
+// blended over what is behind it with its alpha times the node's opacity, whatever the
+// material's own alpha mode.
+int scene_key_fade(int key) {
+    return scene_key_faded(key) ? key : key + 512;
+}
+
+// Whether a key is faded (scene_key_fade).
+bool scene_key_faded(int key) {
+    return (key / 512) % 2 == 1;
+}
+
+// Whether a key draws blended: a BLEND material, or a faded one.
+bool scene_key_blended(int key) {
+    return scene_key_alpha(key) == SCENE_ALPHA_BLEND || scene_key_faded(key);
 }
 
 // Morph targets and skinning, shared by the scene and shadow vertex shaders: draw.morph is
@@ -391,11 +408,15 @@ void scene_material_shader(int key, *String out) {
     String_append(out, _scene_fs_head);
     if (alpha == SCENE_ALPHA_MASK) String_append(out, "    if (s.base.a < mat.emissive.w) { discard; }\n");
     String_append(out, "    var color = shade(s) + mat.emissive.rgb * e_s;\n");
-    if (alpha != SCENE_ALPHA_BLEND) {
+    if (!scene_key_blended(key)) {
         String_append(out, "    return vec4<f32>(color, 1.0);\n}\n");
         return;
     }
-    String_append(out, "    let alpha = clamp(s.base.a, 0.0, 1.0);\n");
+    if (alpha == SCENE_ALPHA_BLEND) {
+        String_append(out, "    let alpha = clamp(s.base.a * draw.info.w, 0.0, 1.0);\n");
+    } else {
+        String_append(out, "    let alpha = clamp(draw.info.w, 0.0, 1.0);\n");
+    }
     if (blend == SCENE_BLEND_MULTIPLY) String_append(out, "    color = mix(vec3<f32>(1.0), color, alpha);\n");
     if (blend == SCENE_BLEND_SCREEN) String_append(out, "    color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)) * alpha;\n");
     String_append(out, "    return vec4<f32>(color, alpha);\n}\n");

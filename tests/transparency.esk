@@ -4,6 +4,7 @@
 //   must still blend back to front; moving red behind blue flips the result;
 //   an opaque quad between them hides the far one.
 // - each blend mode over a gray background against its formula.
+// - node opacity on opaque and blended materials, multiplied down the tree.
 // - a texture with a cut-out quadrant under the MASK alpha mode.
 import <io>;
 import <mem>;
@@ -119,6 +120,30 @@ Result<int, string> run() {
         expect("background around the quad", pixel(px, 2, 2), Vec3{0.5, 0.5, 0.5});
         scene.remove(n);
     }
+
+    // node opacity over the gray background: an opaque red quad faded to 0.5, then under a
+    // parent at 0.5 (0.25 in all), a blended material at alpha 0.5 on a node at 0.5, and 0
+    int faded = scene.add_object(0, quad, flat(&scene, Vec4{1.0, 0.0, 0.0, 1.0}, SCENE_ALPHA_OPAQUE, 0));
+    scene.node(faded).opacity = 0.5;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("opaque material on a node at opacity 0.5", pixel(px, 16, 16), Vec3{0.75, 0.25, 0.25});
+    int holder = scene.add_node(0, "holder");
+    scene.node(holder).opacity = 0.5;
+    scene.set_parent(faded, holder);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("opacity multiplies down the tree", pixel(px, 16, 16), Vec3{0.625, 0.375, 0.375});
+    scene.node(holder).opacity = 1.0;
+    scene.node(faded).material = flat(&scene, Vec4{1.0, 0.0, 0.0, 0.5}, SCENE_ALPHA_BLEND, SCENE_BLEND_ALPHA);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("material alpha times node opacity", pixel(px, 16, 16), Vec3{0.625, 0.375, 0.375});
+    scene.node(faded).opacity = 0.0;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("opacity 0 is not drawn", pixel(px, 16, 16), Vec3{0.5, 0.5, 0.5});
+    scene.remove(holder);
 
     // an 8x8 texture in quadrants: red, cut out (alpha 0), blue, white
     uint8[256] texels;

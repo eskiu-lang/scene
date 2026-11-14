@@ -83,7 +83,9 @@ SceneCamera scene_orthographic(float height, float near, float far) {
 // Scene_update or render. A node that is not visible hides its whole subtree. mesh,
 // material and camera are ids (0, 0 and -1 when it has none); casts_shadows and
 // receives_shadows choose its part in shadows, and light_mask the lights that reach it
-// (SceneLight.influence). ignore_events keeps the node's mesh out of hit tests
+// (SceneLight.influence). opacity (1) fades the node and its subtree: it multiplies down
+// the tree, a node below 1 is drawn blended (after the opaque surfaces, sorted back to
+// front, casting no shadow), and one at 0 is not drawn. ignore_events keeps the node's mesh out of hit tests
 // (<scene/input>): rays pass through it. alive is false once the node is removed. Change
 // parent and children through Scene_set_parent and Scene_remove, not by hand.
 struct SceneNode {
@@ -101,6 +103,7 @@ struct SceneNode {
     bool casts_shadows;
     bool receives_shadows;
     uint32 light_mask;
+    float opacity;
     bool ignore_events;
     Mat4 world;
     List<Mat4> joints;
@@ -167,6 +170,7 @@ struct _SceneDraw {
     float depth;
     Vec3 center;
     float radius;
+    float opacity;
 }
 
 struct _SceneLightRec {
@@ -278,6 +282,7 @@ int _scene_new_node(*Scene self, int parent, string name) {
     n.casts_shadows = true;
     n.receives_shadows = true;
     n.light_mask = 1;
+    n.opacity = 1.0;
     n.world = mat4_identity();
     List_push(&self.nodes, n);
     _SceneNodeGpu g;
@@ -1054,7 +1059,7 @@ Result<*GpuPipeline, string> _scene_pipeline(*Scene self, int key) {
     defer layout.release();
     _scene_vertex_layout(&layout);
     *GpuBindLayout[3] groups = {&r.frame_layout, &r.draw_layout, &r.mat_layout};
-    bool blend = scene_key_alpha(key) == SCENE_ALPHA_BLEND;
+    bool blend = scene_key_blended(key);
     WGPUBlendState bs = _scene_blend_state(scene_key_blend(key));
     GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: "fs",
         format: WGPUTextureFormat_RGBA16Float, layout: &layout, groups: &groups[0], group_count: 3,
@@ -1188,9 +1193,11 @@ float _scene_max_scale(Mat4 m) {
     return s > sz ? s : sz;
 }
 
-void _scene_collect(*Scene self, int id) {
+void _scene_collect(*Scene self, int id, float parent_opacity) {
     *SceneNode n = &self.nodes.data[id];
     if (!n.alive || !n.visible) return;
+    float opacity = parent_opacity * (n.opacity < 0.0 ? 0.0 : (n.opacity > 1.0 ? 1.0 : n.opacity));
+    if (opacity <= 0.0) return;
     if (n.mesh > 0 && n.mesh < self.meshes.size && self.meshes.data[n.mesh].index_count > 0) {
         *SceneMesh mesh = &self.meshes.data[n.mesh];
         _SceneDraw d;
@@ -1198,14 +1205,16 @@ void _scene_collect(*Scene self, int id) {
         d.mesh = n.mesh;
         d.material = n.material > 0 && n.material < self.materials.size ? n.material : 0;
         d.key = scene_material_key(&self.materials.data[d.material]);
-        d.blend = scene_key_alpha(d.key) == SCENE_ALPHA_BLEND;
+        if (opacity < 1.0) d.key = scene_key_fade(d.key);
+        d.blend = scene_key_blended(d.key);
+        d.opacity = opacity;
         Vec3 mid = (mesh.min + mesh.max) * 0.5;
         d.center = n.world.point(mid);
         d.radius = ((mesh.max - mesh.min) * 0.5).length() * _scene_max_scale(n.world);
         d.depth = (d.center - self._r.eye).dot(self._r.forward);
         List_push(&self._r.draws, d);
     }
-    for (i in 0..n.children.size) _scene_collect(self, n.children.data[i]);
+    for (i in 0..n.children.size) _scene_collect(self, n.children.data[i], opacity);
 }
 
 int _scene_draw_order(*_SceneDraw a, *_SceneDraw b) {
@@ -1443,7 +1452,7 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     Scene_update(self);
     _scene_camera(self, width, height);
     List_clear(&r.draws);
-    _scene_collect(self, 0);
+    _scene_collect(self, 0, 1.0);
     if (r.draws.size > 1) sort<_SceneDraw>(r.draws.data, r.draws.size, _scene_draw_order);
 
     Vec3 ambient;
@@ -1531,6 +1540,7 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
         bool skinned = false;
         int targets = _scene_node_deform(self, d.node, d.mesh, &skinned)?;
         u.info[2] = skinned ? 1.0 : 0.0;
+        u.info[3] = d.opacity;
         u.morph[0] = (float)self.meshes.data[d.mesh].vertex_count;
         u.morph[1] = (float)targets;
         r.nodes.data[d.node].uniforms.write(0, &u, sizeof(_SceneDrawU));
