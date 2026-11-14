@@ -1,0 +1,138 @@
+// Post-process effects against ViroReact's formulas: grayscale, sepia, sincity, inverted
+// and thermal on a flat color, the order of a chain, crosshatch lines at their pixels,
+// toonify's black edge, and barrel and pincushion distortion moving an edge.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 64;
+int fails = 0;
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+Vec3 pixel(*uint16 px, int x, int y) {
+    *uint16 p = px + (y * N + x) * 4;
+    return Vec3{half_to_float(p[0]), half_to_float(p[1]), half_to_float(p[2])};
+}
+
+void expect(string what, Vec3 got, Vec3 want) {
+    Vec3 d = got - want;
+    if (d.x > 0.004 || d.x < -0.004 || d.y > 0.004 || d.y < -0.004 || d.z > 0.004 || d.z < -0.004) {
+        printf("FAIL %s: got %.4f %.4f %.4f, want %.4f %.4f %.4f\n", what, (double)got.x, (double)got.y, (double)got.z,
+            (double)want.x, (double)want.y, (double)want.z);
+        fails++;
+    }
+}
+
+void effects(*Scene scene, int a, int b) {
+    for (k in 0..8) scene.post.effects[k] = SCENE_EFFECT_NONE;
+    scene.post.effects[0] = a;
+    scene.post.effects[1] = b;
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    scene.post.tone_mapping = SCENE_TONE_NONE;
+    scene.background = Vec4{0.0, 0.0, 0.0, 1.0};
+    SceneGeometry q = scene_quad(2.0, 2.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    int cam = scene.add_camera(0, scene_orthographic(2.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    GpuTexture t = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer t.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = Vec4{0.6, 0.3, 0.1, 1.0};
+    int flat = scene.add_object(0, quad, scene.add_material(m));
+
+    check_one(&scene, &t, px, SCENE_EFFECT_GRAYSCALE, Vec3{0.34934, 0.34934, 0.34934}, "grayscale")?;
+    check_one(&scene, &t, px, SCENE_EFFECT_SEPIA, Vec3{0.49686, 0.41880, 0.31285}, "sepia")?;
+    check_one(&scene, &t, px, SCENE_EFFECT_SINCITY, Vec3{0.36277, 0.33277, 0.31277}, "sincity")?;
+    check_one(&scene, &t, px, SCENE_EFFECT_INVERTED, Vec3{0.4, 0.7, 0.9}, "inverted")?;
+    check_one(&scene, &t, px, SCENE_EFFECT_THERMAL, Vec3{0.66667, 0.66667, 0.33333}, "thermal")?;
+    check_one(&scene, &t, px, SCENE_EFFECT_PIXELATED, Vec3{0.6, 0.3, 0.1}, "pixelated over a flat color")?;
+    check_one(&scene, &t, px, SCENE_EFFECT_TOONIFY, Vec3{0.6, 0.3, 0.1}, "toonify without edges")?;
+    // a chain runs in order: sepia, then inverted
+    effects(&scene, SCENE_EFFECT_SEPIA, SCENE_EFFECT_INVERTED);
+    scene.render_to(&t)?;
+    t.read(px)?;
+    expect("sepia then inverted", pixel(px, 32, 32), Vec3{0.50314, 0.58120, 0.68715});
+    // crosshatch: ViroReact's lines where (x + y) or (x - y) of the bottom-left pixel center
+    // is a multiple of 10 (the length of the color is 0.678, under 1 and 0.7)
+    effects(&scene, SCENE_EFFECT_CROSSHATCH, SCENE_EFFECT_NONE);
+    scene.render_to(&t)?;
+    t.read(px)?;
+    expect("crosshatch line", pixel(px, 16, 10), Vec3{0.0, 0.0, 0.0});
+    expect("crosshatch paper", pixel(px, 16, 11), Vec3{1.0, 1.0, 1.0});
+    check("names", scene_effect_named("BarallelDistortion") == SCENE_EFFECT_BARREL && scene_effect_named("thermalvision") == SCENE_EFFECT_THERMAL && scene_effect_named("glow") == SCENE_EFFECT_NONE);
+
+    // an edge: red from uv x 0.625 rightward, black to its left
+    scene.remove(flat);
+    SceneMaterial rm = scene_material(SCENE_CONSTANT);
+    rm.diffuse = Vec4{1.0, 0.0, 0.0, 1.0};
+    int right = scene.add_object(0, quad, scene.add_material(rm));
+    scene.node(right).position = Vec3{1.25, 0.0, 0.0};
+    effects(&scene, SCENE_EFFECT_NONE, SCENE_EFFECT_NONE);
+    scene.render_to(&t)?;
+    t.read(px)?;
+    expect("no effect: x 0.7 is red", pixel(px, 44, 32), Vec3{1.0, 0.0, 0.0});
+    expect("no effect: x 0.6 is black", pixel(px, 38, 32), Vec3{0.0, 0.0, 0.0});
+    effects(&scene, SCENE_EFFECT_BARREL, SCENE_EFFECT_NONE);
+    scene.render_to(&t)?;
+    t.read(px)?;
+    expect("barrel pulls x 0.7 toward the center: black", pixel(px, 44, 32), Vec3{0.0, 0.0, 0.0});
+    effects(&scene, SCENE_EFFECT_PINCUSHION, SCENE_EFFECT_NONE);
+    scene.render_to(&t)?;
+    t.read(px)?;
+    expect("pincushion pushes x 0.6 outward: red", pixel(px, 38, 32), Vec3{1.0, 0.0, 0.0});
+    effects(&scene, SCENE_EFFECT_TOONIFY, SCENE_EFFECT_NONE);
+    scene.render_to(&t)?;
+    t.read(px)?;
+    expect("toonify: the edge is black", pixel(px, 40, 32), Vec3{0.0, 0.0, 0.0});
+    expect("toonify: inside stays red", pixel(px, 52, 32), Vec3{1.0, 0.0, 0.0});
+    return Ok<int, string>(0);
+}
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+Result<int, string> check_one(*Scene scene, *GpuTexture t, *uint16 px, int effect, Vec3 want, string what) {
+    effects(scene, effect, SCENE_EFFECT_NONE);
+    scene.render_to(t)?;
+    t.read(px)?;
+    expect(what, pixel(px, 32, 32), want);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("effects: ok\n");
+    return 0;
+}
