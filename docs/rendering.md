@@ -55,11 +55,17 @@ with a uniform scale, since their normals turn with them; hit tests see the node
 | `SCENE_TONE_REINHARD` | `c / (1 + c)` |
 | `SCENE_TONE_EXPOSURE` | `1 - exp(-c)` |
 | `SCENE_TONE_HABLE` | `hable(c) / hable(white_point)`, the Uncharted 2 filmic curve, `white_point` 11.2 by default |
+| `SCENE_TONE_HABLE_LUMINANCE` | ViroReact's HableLuminanceOnly: the curve on the luminance, the color scaled by the same factor (hues keep their saturation), clamped to 1 |
 
-Each works on red, green and blue separately. `scene_tone_map` and `scene_srgb` compute the
+Each but the last works on red, green and blue separately. `scene_tone_map` and `scene_srgb` compute the
 same on the CPU. `exposure` is in stops for every operator, so its zero value keeps the
 brightness. With `gamma` off and an RGBA16Float or RGBA32Float target, the output is linear,
 which is how the tests read exact values.
+
+`gamma22` encodes with a power of 1/2.2 instead of the sRGB curve, as ViroReact's software
+gamma pass does. `backdrop`, when its alpha is above 0, is a color shown as it is where the
+scene leaves the picture uncovered (give the scene a `background` of alpha 0): ViroReact's
+clear color, which skips its tone mapping and gamma.
 
 ## Bloom
 

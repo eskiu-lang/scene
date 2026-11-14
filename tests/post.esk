@@ -4,7 +4,8 @@
 // sRGB-encoded by the shader in an RGBA8Unorm target, and by the GPU in an
 // RGBA8UnormSrgb one. Then bloom: a small bright square on black spreads light
 // to pixels around it that stay black without bloom, fading with distance; a
-// square below the threshold spreads nothing.
+// square below the threshold spreads nothing. ViroReact's luminance-only Hable, its 1/2.2
+// gamma and its clear color as a backdrop.
 import <io>;
 import <mem>;
 import <libc>;
@@ -39,6 +40,10 @@ int to_byte(float v) {
     return (int)(scene_srgb(v) * 255.0 + 0.5);
 }
 
+bool near_i(int a, int b) {
+    return a - b <= 2 && b - a <= 2;
+}
+
 Result<int, string> run() {
     Gpu gpu = gpu_open()?;
     defer gpu.release();
@@ -66,12 +71,12 @@ Result<int, string> run() {
     int node = scene.add_object(0, quad, mat);
     Vec3[2] colors = {Vec3{0.25, 1.0, 3.0}, Vec3{8.0, 0.05, 0.6}};
     float[3] exposures = {0.0, 1.0, -1.5};
-    string[4] names = {"none", "reinhard", "exposure", "hable"};
-    for (op in 0..4) {
+    string[5] names = {"none", "reinhard", "exposure", "hable", "hable luminance"};
+    for (op in 0..5) {
         for (e in 0..3) {
             for (c in 0..2) {
                 scene.material(mat).diffuse = Vec4{colors[c].x, colors[c].y, colors[c].z, 1.0};
-                scene.post = ScenePost{tone_mapping: op, exposure: exposures[e], white_point: op == SCENE_TONE_HABLE && e == 1 ? 6.0 : 0.0};
+                scene.post = ScenePost{tone_mapping: op, exposure: exposures[e], white_point: op >= SCENE_TONE_HABLE && e == 1 ? 6.0 : 0.0};
                 Vec3 want = scene_tone_map(colors[c], &scene.post);
                 float[3] w = {want.x, want.y, want.z};
                 scene.render_to(&ft)?;
@@ -143,6 +148,20 @@ Result<int, string> run() {
     scene.render_to(&ft)?;
     ft.read(fp)?;
     check("below the threshold nothing glows", fpix(fp, 32 + 6, 32, 0) == 0.0);
+
+    // ViroReact's output: gamma as a power of 1/2.2, and its clear color as a backdrop shown
+    // where the scene leaves the picture uncovered, untouched by tone mapping or gamma
+    scene.post = ScenePost{tone_mapping: SCENE_TONE_NONE, gamma: true, gamma22: true, backdrop: Vec4{0.1, 0.2, 0.3, 1.0}};
+    scene.background = Vec4{0.0, 0.0, 0.0, 0.0};
+    scene.material(mat).diffuse = Vec4{0.5, 0.25, 0.0, 1.0};
+    scene.node(node).scale = Vec3{0.5, 0.5, 0.5};
+    scene.render_to(&bt)?;
+    bt.read(bp)?;
+    *uint8 mid = bp + (32 * N + 32) * 4;
+    *uint8 edge = bp + (2 * N + 2) * 4;
+    printf("gamma 2.2 %d %d, backdrop %d %d %d\n", (int)mid[0], (int)mid[1], (int)edge[0], (int)edge[1], (int)edge[2]);
+    check("gamma 2.2", near_i((int)mid[0], 186) && near_i((int)mid[1], 136));
+    check("the backdrop", near_i((int)edge[0], 26) && near_i((int)edge[1], 51) && near_i((int)edge[2], 77));
     return Ok<int, string>(0);
 }
 

@@ -3092,6 +3092,15 @@ NONE keeps c; REINHARD is c / (1 + c); EXPOSURE is 1 - exp(-c); HABLE is the fil
 curve of Uncharted 2 (A 0.15, B 0.50, C 0.10, D 0.20, E 0.02, F 0.30) divided by its
 value at white_point. Each works on the red, green and blue channels separately.
 
+### SCENE_TONE_HABLE_LUMINANCE
+
+```eskiu
+const int SCENE_TONE_HABLE_LUMINANCE = 4;
+```
+
+ViroReact's HableLuminanceOnly: Hable's curve on the luminance, the color scaled with it, so
+hues keep their saturation; normalized by white_point's and clamped to 1.
+
 ### ScenePost
 
 ```eskiu
@@ -3107,6 +3116,8 @@ struct ScenePost {
     int[8] effects;
     float time;
     Vec4 window;
+    bool gamma22;
+    Vec4 backdrop;
 }
 ```
 
@@ -3122,6 +3133,10 @@ encoding off (Gpu_scene turns gamma on):
 - effects: SCENE_EFFECT_* in order. time (seconds, set each frame) drives the swirl, and
   window (left, bottom, right, top in 0..1 from the bottom left; all 0 is the whole
   image) is where the swirl and the zoom happen, as ViroReact's window mask.
+- gamma22 encodes with a power of 1/2.2 instead of the sRGB curve (ViroReact's software
+  gamma pass). backdrop, when its alpha is above 0, is a display color shown where the scene
+  leaves the picture uncovered (give the scene a background of alpha 0), untouched by tone
+  mapping and gamma, as ViroReact's clear color.
 
 ### SCENE_EFFECT_NONE, SCENE_EFFECT_GRAYSCALE, SCENE_EFFECT_SEPIA, SCENE_EFFECT_SINCITY, SCENE_EFFECT_BARREL, SCENE_EFFECT_PINCUSHION, SCENE_EFFECT_THERMAL, SCENE_EFFECT_CROSSHATCH, SCENE_EFFECT_PIXELATED, SCENE_EFFECT_TOONIFY, SCENE_EFFECT_INVERTED
 

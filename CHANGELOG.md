@@ -8,6 +8,8 @@ All notable changes to this package are documented here. The format follows
 
 ### Added
 
+- ViroReact's output pipeline in `ScenePost`: `SCENE_TONE_HABLE_LUMINANCE` (HableLuminanceOnly),
+  `gamma22` (a 1/2.2 power) and `backdrop` (a clear color that skips tone mapping and gamma).
 - `<scene/vr>`: `Scene_render_eye` (an eye's pose in the head and its projection, folded into
   the projection so the camera node stays the head), `scene_fov_projection` from OpenXR-style
   angles, `SceneCardboard` (both eyes side by side through Cardboard's lens polynomial),

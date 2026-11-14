@@ -30,6 +30,9 @@ const int SCENE_TONE_NONE = 0;
 const int SCENE_TONE_REINHARD = 1;
 const int SCENE_TONE_EXPOSURE = 2;
 const int SCENE_TONE_HABLE = 3;
+// ViroReact's HableLuminanceOnly: Hable's curve on the luminance, the color scaled with it, so
+// hues keep their saturation; normalized by white_point's and clamped to 1.
+const int SCENE_TONE_HABLE_LUMINANCE = 4;
 
 // The final pass's settings; the zero value is no tone mapping, no bloom and sRGB
 // encoding off (Gpu_scene turns gamma on):
@@ -43,6 +46,10 @@ const int SCENE_TONE_HABLE = 3;
 // - effects: SCENE_EFFECT_* in order. time (seconds, set each frame) drives the swirl, and
 //   window (left, bottom, right, top in 0..1 from the bottom left; all 0 is the whole
 //   image) is where the swirl and the zoom happen, as ViroReact's window mask.
+// - gamma22 encodes with a power of 1/2.2 instead of the sRGB curve (ViroReact's software
+//   gamma pass). backdrop, when its alpha is above 0, is a display color shown where the scene
+//   leaves the picture uncovered (give the scene a background of alpha 0), untouched by tone
+//   mapping and gamma, as ViroReact's clear color.
 struct ScenePost {
     int tone_mapping;
     float exposure;
@@ -55,6 +62,8 @@ struct ScenePost {
     int[8] effects;
     float time;
     Vec4 window;
+    bool gamma22;
+    Vec4 backdrop;
 }
 
 // Post-process effects (ScenePost.effects, applied in order, 0 for an empty slot):
@@ -121,6 +130,14 @@ float _scene_tone1(float c, *ScenePost p) {
 // A linear color through p's tone mapping operator and exposure (no bloom, no gamma), as
 // the final pass computes it.
 Vec3 scene_tone_map(Vec3 c, *ScenePost p) {
+    if (p.tone_mapping == SCENE_TONE_HABLE_LUMINANCE) {
+        Vec3 h = c * (float)pow(2.0, (double)p.exposure);
+        float l = h.x * 0.2126 + h.y * 0.7152 + h.z * 0.0722;
+        float w = p.white_point > 0.0 ? p.white_point : 11.2;
+        if (l <= 0.0) return Vec3{0.0, 0.0, 0.0};
+        float k = fmax(_scene_hable(l), 0.0) / l / _scene_hable(w);
+        return Vec3{fmin(h.x * k, 1.0), fmin(h.y * k, 1.0), fmin(h.z * k, 1.0)};
+    }
     return Vec3{_scene_tone1(c.x, p), _scene_tone1(c.y, p), _scene_tone1(c.z, p)};
 }
 
@@ -139,7 +156,7 @@ float scene_linear(float c) {
 }
 
 string _scene_post_wgsl =
-    "struct Post { a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32> };\n"
+    "struct Post { a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>, e: vec4<f32> };\n"
     "@group(0) @binding(0) var<uniform> post: Post;\n"
     "@group(0) @binding(1) var src: texture_2d<f32>;\n"
     "@group(0) @binding(2) var samp: sampler;\n"
@@ -187,12 +204,20 @@ string _scene_post_wgsl =
     "    if (op == 1u) { m = h / (1.0 + h); }\n"
     "    if (op == 2u) { m = 1.0 - exp(-h); }\n"
     "    if (op == 3u) { m = max(hable(h), vec3<f32>(0.0)) / hable(vec3<f32>(post.a.z)); }\n"
+    "    if (op == 4u) {\n"
+    "        let l = dot(h, vec3<f32>(0.2126, 0.7152, 0.0722));\n"
+    "        let hl = max(hable(vec3<f32>(l)).x, 0.0) / max(l, 1e-6);\n"
+    "        m = clamp(h * hl / hable(vec3<f32>(post.a.z)), vec3<f32>(0.0), vec3<f32>(1.0));\n"
+    "    }\n"
     "    return m;\n"
     "}\n"
     // what the viewer sees at uv (top-left origin): encoded when gamma is on, whatever the target
     "fn fx0(uv: vec2<f32>) -> vec3<f32> {\n"
     "    let m = tone(uv);\n"
-    "    if (post.b.x > 0.5 || post.b.y > 0.5) { return srgb(m); }\n"
+    "    if (post.b.x > 0.5 || post.b.y > 0.5) {\n"
+    "        if (post.b.z > 0.5) { return pow(clamp(m, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2)); }\n"
+    "        return srgb(m);\n"
+    "    }\n"
     "    return m;\n"
     "}\n"
     "fn glmod(a: f32, b: f32) -> f32 { return a - b * floor(a / b); }\n";
@@ -308,6 +333,11 @@ void _scene_post_shader(*int effects, *String out) {
         "        let a = clamp(textureSampleLevel(src, samp, v.uv, 0.0).a, 0.0, 1.0);\n"
         "        e = e + textureSampleLevel(camera_tex, samp, v.uv, 0.0).rgb * (1.0 - a);\n"
         "    }\n");
+    // the backdrop where the scene left the picture uncovered, as shown
+    out.append("    if (post.e.w > 0.0) {\n"
+        "        let a = clamp(textureSampleLevel(src, samp, v.uv, 0.0).a, 0.0, 1.0);\n"
+        "        e = e + post.e.rgb * (1.0 - a);\n"
+        "    }\n");
     // an sRGB target encodes what it is given: hand it back the linear value
     out.append("    if (post.b.y > 0.5) { return vec4<f32>(linear(e), 1.0); }\n");
     out.append("    return vec4<f32>(e, 1.0);\n}\n");
@@ -362,10 +392,10 @@ Result<int, string> _scene_post_make(*_ScenePostGpu self, *Gpu gpu) {
     GpuTextureDesc bd = GpuTextureDesc{width: 1, height: 1, format: WGPUTextureFormat_RGBA16Float};
     self.black = gpu.texture_with(&bd)?;
     self.black.write_level(0, 0, &zero)?;
-    self.u_bright = gpu.uniform(null, 64)?;
-    self.u_h = gpu.uniform(null, 64)?;
-    self.u_v = gpu.uniform(null, 64)?;
-    self.u_tone = gpu.uniform(null, 64)?;
+    self.u_bright = gpu.uniform(null, 80)?;
+    self.u_h = gpu.uniform(null, 80)?;
+    self.u_v = gpu.uniform(null, 80)?;
+    self.u_tone = gpu.uniform(null, 80)?;
     self.g_bright = self.layout.group()?;
     self.g_h = self.layout.group()?;
     self.g_v = self.layout.group()?;
@@ -467,9 +497,10 @@ Result<int, string> _scene_post_run(*_ScenePostGpu self, *GpuEncoder enc, *GpuTe
     bool srgb_target = _scene_is_srgb(format) && p.gamma;
     Vec4 win = p.window;
     if (win.x == 0.0 && win.y == 0.0 && win.z == 0.0 && win.w == 0.0) win = Vec4{0.0, 0.0, 1.0, 1.0};
-    float[16] ut = {(float)p.tone_mapping, p.exposure, white, strength, encode ? 1.0 : 0.0, srgb_target ? 1.0 : 0.0, 0.0, 0.0,
-        (float)hdr.width, (float)hdr.height, p.time * 2.0, background != null ? 1.0 : 0.0, win.x, win.y, win.z, win.w};
-    self.u_tone.write(0, &ut, 64);
+    float[20] ut = {(float)p.tone_mapping, p.exposure, white, strength, encode ? 1.0 : 0.0, srgb_target ? 1.0 : 0.0,
+        p.gamma22 ? 1.0 : 0.0, 0.0, (float)hdr.width, (float)hdr.height, p.time * 2.0, background != null ? 1.0 : 0.0, win.x, win.y,
+        win.z, win.w, p.backdrop.x, p.backdrop.y, p.backdrop.z, p.backdrop.w};
+    self.u_tone.write(0, &ut, 80);
     *GpuPipeline tone = _scene_post_tone_pipe(self, format, &p.effects[0])?;
     GpuPass tp = enc.pass(view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
     tp.set_group(0, &self.g_tone);
