@@ -2132,6 +2132,7 @@ struct ScenePost {
     float bloom_threshold;
     float bloom_strength;
     int bloom_passes;
+    int[8] effects;
 }
 ```
 
@@ -2144,6 +2145,36 @@ encoding off (Gpu_scene turns gamma on):
 - bloom: add a blur of the bright parts; bloom_threshold is the luminance where it
   starts (0 is 1.0), bloom_strength scales it (0 is 1.0), bloom_passes is the number of
   horizontal and vertical blur pairs at half size (0 is 4; more spreads wider).
+
+### SCENE_EFFECT_NONE, SCENE_EFFECT_GRAYSCALE, SCENE_EFFECT_SEPIA, SCENE_EFFECT_SINCITY, SCENE_EFFECT_BARREL, SCENE_EFFECT_PINCUSHION, SCENE_EFFECT_THERMAL, SCENE_EFFECT_CROSSHATCH, SCENE_EFFECT_PIXELATED, SCENE_EFFECT_TOONIFY, SCENE_EFFECT_INVERTED
+
+```eskiu
+const int SCENE_EFFECT_NONE = 0;
+const int SCENE_EFFECT_GRAYSCALE = 1;
+const int SCENE_EFFECT_SEPIA = 2;
+const int SCENE_EFFECT_SINCITY = 3;
+const int SCENE_EFFECT_BARREL = 4;
+const int SCENE_EFFECT_PINCUSHION = 5;
+const int SCENE_EFFECT_THERMAL = 6;
+const int SCENE_EFFECT_CROSSHATCH = 7;
+const int SCENE_EFFECT_PIXELATED = 8;
+const int SCENE_EFFECT_TOONIFY = 9;
+const int SCENE_EFFECT_INVERTED = 10;
+```
+
+Post-process effects (ScenePost.effects, applied in order, 0 for an empty slot):
+ViroReact's postProcessEffects with its formulas, on the displayed (tone mapped and,
+with gamma, sRGB-encoded) image.
+
+### scene_effect_named
+
+```eskiu
+int scene_effect_named(string name)
+```
+
+The effect ViroReact names name ("grayscale", "sepia", "sincity", "baralleldistortion",
+"pincushiondistortion", "thermalvision", "crosshatch", "pixelated", "toonify",
+"inverted"; any case), or SCENE_EFFECT_NONE.
 
 ### scene_tone_map
 

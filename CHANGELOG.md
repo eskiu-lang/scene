@@ -25,6 +25,10 @@ All notable changes to this package are documented here. The format follows
   camera with ViroReact's billboard rotation.
 - Frustum culling: nodes wholly outside the camera's view are not drawn (they still cast
   shadows).
+- Post effects: `ScenePost.effects`, ViroReact's postProcessEffects (grayscale, sepia,
+  sincity, barrel and pincushion distortion, thermal vision, crosshatch, pixelated,
+  toonify, inverted) with its formulas, chained in order inside the tone mapping pass;
+  `scene_effect_named`.
 - Portals: `SceneNode.portal`, `portal_entrance`, `passable`, `portal_sky` and
   `Scene.active_portal` (ViroPortalScene and ViroPortal): a portal's world drawn only
   through its window with the stencil buffer, its own sky, walking in through a passable

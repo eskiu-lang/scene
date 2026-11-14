@@ -66,6 +66,35 @@ blur is a 9-tap Gaussian (separable, with a step of one half-size texel), and th
 added to the HDR image before tone mapping, times `bloom_strength`. Emissive materials and
 lights brighter than 1 are what glow.
 
+## Effects
+
+`scene.post.effects` lists up to eight post-process effects, applied in order to the image
+as it is displayed (tone mapped, and sRGB-encoded when `gamma` is on), with ViroReact's
+`postProcessEffects` formulas:
+
+| Constant | ViroReact | What it does |
+|---|---|---|
+| `SCENE_EFFECT_GRAYSCALE` | `grayscale` | luminance (0.2126, 0.7152, 0.0722) |
+| `SCENE_EFFECT_SEPIA` | `sepia` | the sepia matrix at strength 0.9 |
+| `SCENE_EFFECT_SINCITY` | `sincity` | gray, keeping strongly red parts |
+| `SCENE_EFFECT_BARREL` | `baralleldistortion` | the image bulges from the center (radius to the power 1.75) |
+| `SCENE_EFFECT_PINCUSHION` | `pincushiondistortion` | the image pinches toward the center (power 0.5) |
+| `SCENE_EFFECT_THERMAL` | `thermalvision` | brightness mapped blue, yellow, red |
+| `SCENE_EFFECT_CROSSHATCH` | `crosshatch` | black diagonal lines on white, denser in darker parts |
+| `SCENE_EFFECT_PIXELATED` | `pixelated` | blocks of 2% of the image |
+| `SCENE_EFFECT_TOONIFY` | `toonify` | black where the brightness changes sharply |
+| `SCENE_EFFECT_INVERTED` | `inverted` | one minus the color |
+
+```eskiu
+scene.post.effects[0] = SCENE_EFFECT_SEPIA;
+scene.post.effects[1] = scene_effect_named("pixelated");
+```
+
+`scene_effect_named` maps ViroReact's names. The effects are composed into the tone
+mapping pass, one shader per list, so they add no render pass. ViroReact's
+`swirldistortion` and `zoomindistortion`, which animate over a window of the image, are not
+here.
+
 ## Background, skybox and image-based lighting
 
 `Scene.background` (linear RGBA) clears the image. A cube map drawn behind the scene
