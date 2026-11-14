@@ -258,6 +258,8 @@ struct Scene {
     int camera_texture;
     Mat4 camera_image_transform;
     int camera_background;
+    int occlusion_depth;
+    Mat4 occlusion_transform;
 }
 ```
 
@@ -274,7 +276,11 @@ coordinates): an AR session sets them each frame. camera_background (a texture i
 none) is shown behind what the scene draws, as it is (not tone mapped): the scene goes over
 it as premultiplied color (with a background of alpha 0), so opaque surfaces cover it,
 blended ones mix with it and additive ones glow on it: the AR camera picture, already
-fitted to the view.
+fitted to the view. occlusion_depth (a texture id, 0 for none) is the real world's depth,
+in meters, in its red channel (R32Float or R16Float, 0 where unknown), as an AR session
+measures it: virtual content farther than the real surface at a pixel is hidden there
+(ViroReact's DepthBased occlusion). occlusion_transform maps the view's coordinates (x, y
+from 0 to 1, from the top left) to the depth image's.
 
 ### Gpu_scene
 

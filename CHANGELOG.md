@@ -76,6 +76,8 @@ All notable changes to this package are documented here. The format follows
   `Scene.camera_image_transform`); geometry modifiers apply to the shadow maps.
   `docs/modifiers.md`.
 - `SceneMaterial.chroma_key` and `chroma_key_color` (ViroReact's `chromaKeyFilteringColor`).
+- AR occlusion: `Scene.occlusion_depth` and `occlusion_transform` hide virtual content
+  behind real surfaces from the AR session's depth (ViroReact's DepthBased occlusion).
 - AR rendering: `SceneMaterial.shadow_catcher` (ViroReact's `arShadowReceiver`), a surface
   that shows only the shadows it receives; `Scene.camera_background` shows the camera picture behind the scene as it
   is (the scene over it as premultiplied color), and `scene_projection` /

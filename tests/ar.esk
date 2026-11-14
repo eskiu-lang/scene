@@ -193,6 +193,51 @@ Result<int, string> chroma(*Gpu gpu) {
     return Ok<int, string>(0);
 }
 
+// Depth occlusion: a red wall 5 m away behind a real surface 1 m away on the left half and
+// 10 m away on the right half: hidden on the left, seen on the right; then turned (the
+// transform) so the near half is on the right.
+Result<int, string> occlusion(*Gpu gpu) {
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.tone_mapping = SCENE_TONE_NONE;
+    scene.post.gamma = false;
+    scene.background = Vec4{0.0, 0.0, 1.0, 1.0};
+    SceneGeometry q = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = Vec4{1.0, 0.0, 0.0, 1.0};
+    int wall = scene.add_object(0, quad, scene.add_material(m));
+    scene.node(wall).position = Vec3{0.0, 0.0, -5.0};
+    scene.node(wall).scale = Vec3{40.0, 40.0, 1.0};
+    int cam = scene.add_camera(0, scene_perspective(1.0, 0.1, 50.0));
+    scene.set_camera(cam);
+    GpuTextureDesc dd = GpuTextureDesc{width: 2, height: 1, format: WGPUTextureFormat_R32Float,
+        usage: WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst};
+    GpuTexture depth = gpu.texture_with(&dd)?;
+    float[2] meters = {1.0, 10.0};
+    depth.write_level(0, 0, &meters[0])?;
+    scene.occlusion_depth = scene.add_texture(depth);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA8Unorm)?;
+    defer target.release();
+    *uint8 px = alloc<uint8>(N * N * 4);
+    defer free(px);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("behind a nearer real surface: hidden", at(px, 6, 16)[0] < 3 && at(px, 6, 16)[2] > 250);
+    check("in front of a farther one: seen", at(px, 26, 16)[0] > 250);
+    // mirrored: view x maps to 1 - x in the depth image
+    scene.occlusion_transform = mat4_trs(Vec3{1.0, 0.0, 0.0}, quat_identity(), Vec3{-1.0, 1.0, 1.0});
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("the transform maps the view to the depth image", at(px, 6, 16)[0] > 250 && at(px, 26, 16)[0] < 3);
+    scene.occlusion_depth = 0;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("no occlusion without depth", at(px, 26, 16)[0] > 250 && at(px, 6, 16)[0] > 250);
+    return Ok<int, string>(0);
+}
+
 int main() {
     Result<int, string> r = run();
     if (r.ok) {
@@ -201,6 +246,7 @@ int main() {
             Gpu gpu = g.value;
             r = catcher(&gpu);
             if (r.ok) r = chroma(&gpu);
+            if (r.ok) r = occlusion(&gpu);
             gpu.release();
         }
     }

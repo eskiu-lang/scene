@@ -152,6 +152,18 @@ scene.background = Vec4{0.0, 0.0, 0.0, 0.0};
 *scene.camera(cam) = scene_projection(*(*Mat4)&frame.projection(w, h, 0.02, 100.0), 0.02, 100.0);
 ```
 
+## AR: occlusion by the real world
+
+`Scene.occlusion_depth` (a texture id) hides virtual content behind real surfaces, as
+ViroReact's `occlusionMode` `DepthBased` does. It holds the depth of the real world in meters
+in its red channel (`R32Float` or `R16Float`, 0 where unknown), the AR session's depth image
+uploaded as it comes, and `occlusion_transform` maps the view's coordinates (x and y from 0
+to 1 from the top left) to the image's: eskiu-lang/ar's `ArFrame_display_transform`. Before
+the scene is drawn, a full-screen pass writes that depth, converted with the camera's
+projection, into the depth buffer, so a virtual surface farther than the real one at a pixel
+fails the depth test there and the camera picture shows instead. Nothing in the materials
+changes; a texel of 0 occludes nothing.
+
 ## Formats
 
 The scene renders into any color target: a surface frame (BGRA8Unorm or its sRGB twin), an
