@@ -168,6 +168,12 @@ struct _SceneMatGpu {
     GpuBuffer uniforms;
     GpuBindGroup group;
     int[6] bound;
+    int sampler;
+}
+
+struct _SceneSampler {
+    int key;
+    GpuSampler samp;
 }
 
 struct _ScenePipe {
@@ -236,6 +242,7 @@ struct _SceneRenderer {
     uint32 h;
     List<_SceneNodeGpu> nodes;
     List<_SceneMatGpu> mats;
+    List<_SceneSampler> samplers;
     List<_SceneDraw> draws;
     List<_SceneLightRec> recs;
     _ScenePostGpu post;
@@ -421,6 +428,8 @@ void Scene_release(*Scene self) {
         }
     }
     for (i in 0..r.pipes.size) r.pipes.data[i].pipe.release();
+    for (i in 0..r.samplers.size) r.samplers.data[i].samp.release();
+    List_free(&r.samplers);
     for (i in 0..r.shadow_views.size) r.shadow_views.data[i].release();
     for (i in 0..r.shadow_groups.size) r.shadow_groups.data[i].release();
     for (i in 0..r.shadow_bufs.size) r.shadow_bufs.data[i].release();
@@ -1028,6 +1037,28 @@ void _scene_gltf_node(*Scene self, *Gltf g, *SceneGltf out, int gi, int parent, 
     for (c in 0..gn.children.size) _scene_gltf_node(self, g, out, gn.children.data[c], id, default_mat);
 }
 
+// The sampler of glTF texture tex as the material's wrap and filters (one sampler serves
+// all of a material's textures here: the base color texture's).
+void _scene_gltf_sampler(*Gltf g, int tex, *SceneMaterial m) {
+    if (tex < 0 || tex >= g.textures.size) return;
+    int s = g.textures.data[tex].sampler;
+    if (s < 0 || s >= g.samplers.size) return;
+    *GltfSampler gs = &g.samplers.data[s];
+    int[2] wraps = {gs.wrap_s, gs.wrap_t};
+    int[2] modes;
+    for (i in 0..2) {
+        modes[i] = SCENE_WRAP_REPEAT;
+        if (wraps[i] == 33071) modes[i] = SCENE_WRAP_CLAMP;
+        if (wraps[i] == 33648) modes[i] = SCENE_WRAP_MIRROR;
+    }
+    m.wrap_s = modes[0];
+    m.wrap_t = modes[1];
+    if (gs.mag_filter == 9728) m.filter = SCENE_FILTER_NEAREST;
+    // NEAREST and LINEAR minification use no mipmaps; the *_MIPMAP_NEAREST ones pick the
+    // nearest level
+    if (gs.min_filter == 9728 || gs.min_filter == 9729 || gs.min_filter == 9984 || gs.min_filter == 9985) m.mip_filter = SCENE_FILTER_NEAREST;
+}
+
 // Adds a glTF model (from gltf_load, `<gpu/gltf>`, or obj_load) under parent: its images
 // as textures, its materials as PBR materials (CONSTANT for KHR_materials_unlit), its
 // triangle primitives as meshes, and its scene's node tree, each primitive a child node of
@@ -1055,6 +1086,7 @@ Result<SceneGltf, string> Scene_add_gltf(*Scene self, *Gltf g, int parent) {
         m.occlusion_texture = _scene_gltf_texture(self, g, &out, gm.occlusion_texture.texture, false);
         m.occlusion_strength = gm.occlusion_texture.scale;
         m.emissive_texture = _scene_gltf_texture(self, g, &out, gm.emissive_texture.texture, true);
+        _scene_gltf_sampler(g, gm.base_color_texture.texture, &m);
         _scene_gltf_material_sync(&m, gm);
         List_push(&out.materials, Scene_add_material(self, m));
     }
@@ -1201,6 +1233,32 @@ Result<*GpuPipeline, string> _scene_pipeline(*Scene self, int key) {
     return &self.textures.data[id];
 }
 
+int _scene_sampler_key(*SceneMaterial m) {
+    int ws = m.wrap_s < 0 || m.wrap_s > SCENE_WRAP_MIRROR ? 0 : m.wrap_s;
+    int wt = m.wrap_t < 0 || m.wrap_t > SCENE_WRAP_MIRROR ? 0 : m.wrap_t;
+    return ws + wt * 3 + (m.filter == SCENE_FILTER_NEAREST ? 9 : 0) + (m.mip_filter == SCENE_FILTER_NEAREST ? 18 : 0);
+}
+
+WGPUAddressMode _scene_wrap_mode(int w) {
+    if (w == SCENE_WRAP_CLAMP) return WGPUAddressMode_ClampToEdge;
+    if (w == SCENE_WRAP_MIRROR) return WGPUAddressMode_MirrorRepeat;
+    return WGPUAddressMode_Repeat;
+}
+
+// The sampler of a material sampler key (0 is the scene's default sampler).
+Result<*GpuSampler, string> _scene_sampler(*Scene self, int key) {
+    *_SceneRenderer r = &self._r;
+    if (key == 0) return Ok<*GpuSampler, string>(&r.samp);
+    for (i in 0..r.samplers.size) {
+        if (r.samplers.data[i].key == key) return Ok<*GpuSampler, string>(&r.samplers.data[i].samp);
+    }
+    GpuSamplerOptions o = GpuSamplerOptions{wrap_u: _scene_wrap_mode(key % 3), wrap_v: _scene_wrap_mode((key / 3) % 3),
+        nearest: (key / 9) % 2 == 1, mipmaps: (key / 18) % 2 == 0, anisotropy: 8};
+    GpuSampler s = self.gpu.sampler_with(&o)?;
+    List_push(&r.samplers, _SceneSampler{key, s});
+    return Ok<*GpuSampler, string>(&r.samplers.data[r.samplers.size - 1].samp);
+}
+
 Result<int, string> _scene_material_gpu(*Scene self, int id) {
     *_SceneMatGpu g = &self._r.mats.data[id];
     *SceneMaterial m = &self.materials.data[id];
@@ -1214,8 +1272,15 @@ Result<int, string> _scene_material_gpu(*Scene self, int id) {
         g.group = bg.value;
         g.group.buffer(0, &g.uniforms);
         g.group.sampler(1, &self._r.samp);
+        g.sampler = 0;
         for (k in 0..6) g.bound[k] = -1;
         g.made = true;
+    }
+    int skey = _scene_sampler_key(m);
+    if (g.sampler != skey) {
+        *GpuSampler smp = _scene_sampler(self, skey)?;
+        g.group.sampler(1, smp);
+        g.sampler = skey;
     }
     int[6] ids = {m.diffuse_texture, m.specular_texture, m.normal_texture, m.emissive_texture,
         m.metal_rough_texture, m.occlusion_texture};
