@@ -169,6 +169,7 @@ struct SceneNode {
     Mat4 world;
     List<Mat4> joints;
     List<float> weights;
+    List<Mat4> instances;
 }
 ```
 
@@ -730,6 +731,17 @@ bool Scene_set_uniform_texture(*Scene self, int material, string name, int textu
 ```
 
 Binds texture (an id, 0 for white) to material's sampler2D uniform name.
+
+### Scene_set_instances
+
+```eskiu
+void Scene_set_instances(*Scene self, int node, *Mat4 transforms, int count)
+```
+
+Draws node's mesh once per transform (each under the node's own), in one draw call:
+many copies of a mesh (ViroReact's instancing). The transforms are copied; an empty list
+draws the mesh once again. Instances should be rigid with a uniform scale, as their
+normals turn with them.
 
 ### Scene_camera_matrices
 

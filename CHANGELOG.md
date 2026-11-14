@@ -8,6 +8,8 @@ All notable changes to this package are documented here. The format follows
 
 ### Added
 
+- Instancing: `Scene_set_instances` draws a node's mesh at many transforms in one draw call,
+  with shadows, shader modifiers and culling over every instance.
 - Semantic masks (ViroReact's): `scene_semantic_mask`, `scene_semantic_label`, the
   `SCENE_SEMANTIC_*` modes, and `Scene.semantic_texture`, `semantic_confidence_texture` and
   `semantic_transform`; modifier bodies see `viewport_size`.

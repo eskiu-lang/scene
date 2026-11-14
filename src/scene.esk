@@ -153,6 +153,7 @@ struct SceneNode {
     Mat4 world;
     List<Mat4> joints;
     List<float> weights;
+    List<Mat4> instances;
 }
 
 // A mesh on the GPU: its vertex and index buffers, the index count and the bounds of its
@@ -191,6 +192,7 @@ struct _SceneNodeGpu {
     GpuBindGroup group;
     GpuBuffer joints;
     GpuBuffer weights;
+    GpuBuffer instances;
     int bound_mesh;
 }
 
@@ -435,7 +437,7 @@ Result<int, string> _scene_renderer_make(*Scene s) {
     r.frame_layout.sampler(7, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
     r.draw_layout = g.bind_layout();
     r.draw_layout.uniform(0, 0);
-    for (b in 1..4) r.draw_layout.storage((uint32)b, WGPUShaderStage_Vertex, true);
+    for (b in 1..5) r.draw_layout.storage((uint32)b, WGPUShaderStage_Vertex, true);
     r.mat_layout = g.bind_layout();
     r.mat_layout.uniform(0, WGPUShaderStage_Fragment);
     r.mat_layout.sampler(1, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
@@ -530,6 +532,7 @@ void Scene_release(*Scene self) {
         }
         r.nodes.data[i].joints.release();
         r.nodes.data[i].weights.release();
+        r.nodes.data[i].instances.release();
     }
     for (i in 0..r.mats.size) {
         if (r.mats.data[i].made) {
@@ -722,6 +725,7 @@ void _scene_kill(*Scene self, int node) {
     }
     g.joints.release();
     g.weights.release();
+    g.instances.release();
     for (i in 0..n.children.size) _scene_kill(self, n.children.data[i]);
 }
 
@@ -1763,6 +1767,59 @@ bool Scene_set_uniform_texture(*Scene self, int material, string name, int textu
     return true;
 }
 
+// How many times a node's mesh is drawn: once per instance, or once.
+uint32 _scene_instance_count(*Scene self, int id) {
+    int n = self.nodes.data[id].instances.size;
+    return n > 0 ? (uint32)n : (uint32)1;
+}
+
+// Uploads a node's instance transforms; true when it has any.
+Result<bool, string> _scene_node_instances(*Scene self, int id) {
+    *SceneNode n = &self.nodes.data[id];
+    if (n.instances.size == 0) return Ok<bool, string>(false);
+    *_SceneNodeGpu g = &self._r.nodes.data[id];
+    uint64 bytes = (uint64)n.instances.size * 64;
+    if (g.instances.handle == null || g.instances.size < bytes) {
+        g.instances.release();
+        g.instances = self.gpu.buffer(bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+        g.group.buffer(4, &g.instances);
+    }
+    g.instances.write(0, n.instances.data, bytes);
+    return Ok<bool, string>(true);
+}
+
+// A sphere around every instance of a node's mesh (its middle `mid` and half diagonal `r` in
+// the mesh's space), for culling.
+void _scene_instance_bounds(*SceneNode n, Vec3 mid, float r, *Vec3 center, *float radius) {
+    Vec3 lo = Vec3{1e30, 1e30, 1e30};
+    Vec3 hi = Vec3{-1e30, -1e30, -1e30};
+    float grow = 0.0;
+    for (i in 0..n.instances.size) {
+        Mat4 m = n.world * n.instances.data[i];
+        Vec3 c = m.point(mid);
+        float s = r * _scene_max_scale(m);
+        if (s > grow) grow = s;
+        if (c.x < lo.x) lo.x = c.x;
+        if (c.y < lo.y) lo.y = c.y;
+        if (c.z < lo.z) lo.z = c.z;
+        if (c.x > hi.x) hi.x = c.x;
+        if (c.y > hi.y) hi.y = c.y;
+        if (c.z > hi.z) hi.z = c.z;
+    }
+    *center = (lo + hi) * 0.5;
+    *radius = ((hi - lo) * 0.5).length() + grow;
+}
+
+// Draws node's mesh once per transform (each under the node's own), in one draw call:
+// many copies of a mesh (ViroReact's instancing). The transforms are copied; an empty list
+// draws the mesh once again. Instances should be rigid with a uniform scale, as their
+// normals turn with them.
+void Scene_set_instances(*Scene self, int node, *Mat4 transforms, int count) {
+    *SceneNode n = &self.nodes.data[node];
+    List_clear(&n.instances);
+    for (i in 0..count) List_push(&n.instances, transforms[i]);
+}
+
 Result<int, string> _scene_node_gpu(*Scene self, int id) {
     *_SceneNodeGpu g = &self._r.nodes.data[id];
     if (g.made) return Ok<int, string>(0);
@@ -1774,7 +1831,7 @@ Result<int, string> _scene_node_gpu(*Scene self, int id) {
     }
     g.group = bg.value;
     g.group.buffer(0, &g.uniforms);
-    for (b in 1..4) g.group.buffer((uint32)b, &self._r.no_storage);
+    for (b in 1..5) g.group.buffer((uint32)b, &self._r.no_storage);
     g.bound_mesh = -1;
     g.made = true;
     return Ok<int, string>(0);
@@ -1876,6 +1933,7 @@ void _scene_collect(*Scene self, int id, float parent_opacity, int world, int fr
         Vec3 mid = (mesh.min + mesh.max) * 0.5;
         d.center = n.world.point(mid);
         d.radius = ((mesh.max - mesh.min) * 0.5).length() * _scene_max_scale(n.world);
+        if (n.instances.size > 0) _scene_instance_bounds(n, mid, ((mesh.max - mesh.min) * 0.5).length(), &d.center, &d.radius);
         d.depth = (d.center - self._r.eye).dot(self._r.forward);
         d.in_view = _scene_sphere_in_view(self._r.view_proj, d.center, d.radius);
         List_push(&self._r.draws, d);
@@ -2152,7 +2210,7 @@ void _scene_draw(*Scene self, *GpuPass pass, *_SceneDraw d, *GpuPipeline pipe) {
     pass.set_group(1, &r.nodes.data[d.node].group);
     pass.set_group(2, &r.mats.data[d.material].group);
     if (r.mats.data[d.material].mod_made && scene_key_shader(d.key) > 0) pass.set_group(3, &r.mats.data[d.material].mod_group);
-    pass.draw_indexed(pipe, &mesh.vertices, &mesh.indices, mesh.index_count, 1);
+    pass.draw_indexed(pipe, &mesh.vertices, &mesh.indices, mesh.index_count, _scene_instance_count(self, d.node));
 }
 
 // Records the scene into enc: shadow maps, the scene in HDR, then bloom and tone mapping
@@ -2303,6 +2361,8 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
         u.info[3] = d.opacity;
         u.morph[0] = (float)self.meshes.data[d.mesh].vertex_count;
         u.morph[1] = (float)targets;
+        bool instanced = _scene_node_instances(self, d.node)?;
+        u.morph[2] = instanced ? 1.0 : 0.0;
         r.nodes.data[d.node].uniforms.write(0, &u, sizeof(_SceneDrawU));
     }
     for (i in 0..self.materials.size) {
@@ -2329,7 +2389,7 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
                 sp.set_group(2, &r.mats.data[d.material].group);
                 sp.set_group(3, &r.mats.data[d.material].mod_group);
             }
-            sp.draw_indexed(shp, &mesh.vertices, &mesh.indices, mesh.index_count, 1);
+            sp.draw_indexed(shp, &mesh.vertices, &mesh.indices, mesh.index_count, _scene_instance_count(self, d.node));
         }
         sp.end()?;
     }

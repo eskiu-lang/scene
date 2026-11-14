@@ -1,0 +1,89 @@
+// Instancing: one node drawn at three transforms in one draw call (three red squares on blue
+// with gaps between), an instance far from the node's own mesh still drawn (culling covers
+// every instance), the instances turning with the node, and an empty list drawing the mesh
+// once again.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 64;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+*uint8 at(*uint8 px, int x, int y) {
+    return &px[(y * N + x) * 4];
+}
+
+bool red(*uint8 p) {
+    return (int)p[0] > 200 && (int)p[2] < 50;
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.tone_mapping = SCENE_TONE_NONE;
+    scene.post.gamma = false;
+    scene.background = Vec4{0.0, 0.0, 1.0, 1.0};
+    SceneGeometry q = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = Vec4{1.0, 0.0, 0.0, 1.0};
+    int node = scene.add_object(0, quad, scene.add_material(m));
+    scene.node(node).position = Vec3{0.0, 0.0, -10.0};
+    // an orthographic view 8 units wide: a unit is 8 pixels
+    int cam = scene.add_camera(0, scene_orthographic(8.0, 0.1, 50.0));
+    scene.set_camera(cam);
+    Mat4[3] t = {mat4_translate(Vec3{-2.5, 0.0, 0.0}), mat4_identity(), mat4_translate(Vec3{2.5, 0.0, 0.0})};
+    scene.set_instances(node, &t[0], 3);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA8Unorm)?;
+    defer target.release();
+    *uint8 px = alloc<uint8>(N * N * 4);
+    defer free(px);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("three copies", red(at(px, 12, 32)) && red(at(px, 32, 32)) && red(at(px, 52, 32)));
+    check("with gaps between", !red(at(px, 22, 32)) && !red(at(px, 42, 32)) && (int)at(px, 22, 32)[2] > 200);
+    // the node's own mesh out of view, one instance in it
+    Mat4[1] far = {mat4_translate(Vec3{30.0, 0.0, 0.0})};
+    scene.node(node).position = Vec3{-30.0, 0.0, -10.0};
+    scene.set_instances(node, &far[0], 1);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("an instance far from the node's mesh is drawn", red(at(px, 32, 32)));
+    // the node turned a quarter: the instances turn with it
+    scene.node(node).position = Vec3{0.0, 0.0, -10.0};
+    scene.node(node).rotation = quat_axis_angle(Vec3{0.0, 0.0, 1.0}, 1.5707963);
+    Mat4[2] up = {mat4_translate(Vec3{2.5, 0.0, 0.0}), mat4_translate(Vec3{-2.5, 0.0, 0.0})};
+    scene.set_instances(node, &up[0], 2);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("the instances turn with the node", red(at(px, 32, 12)) && red(at(px, 32, 52)) && !red(at(px, 12, 32)) && !red(at(px, 32, 32)));
+    scene.set_instances(node, null, 0);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("no instances: the mesh once", red(at(px, 32, 32)) && !red(at(px, 32, 12)));
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("instancing: ok\n");
+    return 0;
+}

@@ -36,6 +36,15 @@ result in one submission. `Scene_render_to(&texture)` renders into a texture, to
 back (`GpuTexture_read`) or sample it. The scene's internal images follow the target's
 size and are remade when it changes.
 
+## Instancing
+
+`Scene_set_instances(node, transforms, count)` draws a node's mesh once per transform, each
+under the node's own, in one draw call (ViroReact's instancing): a forest, a crowd, a field of
+markers for the cost of one object. The transforms are copied; an empty list draws the mesh
+once again. The instances cast shadows, take shader modifiers (`_transforms.model_matrix` is
+the instance's) and are culled together, by a sphere around all of them. They should be rigid
+with a uniform scale, since their normals turn with them; hit tests see the node's own mesh.
+
 ## Tone mapping and gamma
 
 `Scene.post` is a `ScenePost`. With `c = color * 2^exposure`:
