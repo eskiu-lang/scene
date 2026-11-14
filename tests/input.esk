@@ -271,7 +271,35 @@ Result<int, string> run() {
     g.free();
     rays(&scene, box);
     events(&scene, box);
+    orbit(&scene);
     return Ok<int, string>(0);
+}
+
+void orbit(*Scene scene) {
+    int cam = scene.add_camera(0, scene_perspective(1.0, 0.1, 100.0));
+    SceneOrbit o = scene_orbit(Vec3{0.0, 1.0, 0.0}, Vec3{0.0, 1.0, 4.0});
+    check("orbit from a position: distance 4, level", near(o.distance, 4.0, 1e-5) && near(o.pitch, 0.0, 1e-5) && near(o.yaw, 0.0, 1e-5));
+    o.apply(scene, cam);
+    check("placed where it was", near3(scene.node(cam).position, Vec3{0.0, 1.0, 4.0}, 1e-4));
+    // drag 157 pixels left: a quarter turn (0.01 radians a pixel) to the +X side
+    o.touch(GpuTouch{1, GPU_TOUCH_DOWN, 200.0, 200.0, 0.0});
+    o.touch(GpuTouch{1, GPU_TOUCH_MOVE, 42.92, 200.0, 0.1});
+    o.touch(GpuTouch{1, GPU_TOUCH_UP, 42.92, 200.0, 0.2});
+    o.apply(scene, cam);
+    check("dragged a quarter turn", near3(scene.node(cam).position, Vec3{4.0, 1.0, 0.0}, 1e-3));
+    Mat4 w = scene.world(cam);
+    Vec3 ahead = Vec3{-w.m[8], -w.m[9], -w.m[10]};
+    check("still looking at the target", near3(ahead.normalize(), Vec3{-1.0, 0.0, 0.0}, 1e-3));
+    // pinch the fingers twice as far apart: half the distance
+    o.touch(GpuTouch{1, GPU_TOUCH_DOWN, 100.0, 100.0, 1.0});
+    o.touch(GpuTouch{2, GPU_TOUCH_DOWN, 200.0, 100.0, 1.0});
+    o.touch(GpuTouch{2, GPU_TOUCH_MOVE, 300.0, 100.0, 1.1});
+    o.apply(scene, cam);
+    check("pinch zooms in", near(o.distance, 2.0, 1e-4));
+    o.pitch = 3.0;
+    o.apply(scene, cam);
+    check("pitch clamped", near(o.pitch, 1.5, 1e-6));
+    scene.remove(cam);
 }
 
 int main() {

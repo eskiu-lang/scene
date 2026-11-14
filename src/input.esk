@@ -714,3 +714,99 @@ void SceneInput_touch(*SceneInput self, *Scene scene, GpuTouch t, uint32 width, 
     self.fingers--;
     if (self.fingers < 0) self.fingers = 0;
 }
+
+// An orbit camera (ViroReact's ViroOrbitCamera): the camera node stays distance away from
+// target, turned yaw radians about the world Y axis and pitch radians up or down, looking
+// at target. SceneOrbit_touch turns it with one finger (a drag across the view turns it
+// by rotate_speed radians a pixel) and zooms with two (the pinch scales the distance).
+struct SceneOrbit {
+    Vec3 target;
+    float distance;
+    float yaw;
+    float pitch;
+    float min_distance;
+    float max_distance;
+    float min_pitch;
+    float max_pitch;
+    float rotate_speed;
+    int _fingers;
+    float[2] _x;
+    float[2] _y;
+    int[2] _id;
+    float _pinch;
+    float _start_distance;
+}
+
+// An orbit around target from a camera at position.
+SceneOrbit scene_orbit(Vec3 target, Vec3 position) {
+    SceneOrbit o;
+    o.target = target;
+    Vec3 d = position - target;
+    o.distance = d.length();
+    o.yaw = (float)atan2((double)d.x, (double)d.z);
+    float flat = Vec3{d.x, 0.0, d.z}.length();
+    o.pitch = (float)atan2((double)d.y, (double)flat);
+    o.min_distance = 0.0;
+    o.max_distance = 1e30;
+    o.min_pitch = -1.5;
+    o.max_pitch = 1.5;
+    o.rotate_speed = 0.01;
+    o._id[0] = -1;
+    o._id[1] = -1;
+    return o;
+}
+
+// Places camera node cam on the orbit, looking at the target.
+void SceneOrbit_apply(*SceneOrbit self, *Scene scene, int cam) {
+    if (self.pitch < self.min_pitch) self.pitch = self.min_pitch;
+    if (self.pitch > self.max_pitch) self.pitch = self.max_pitch;
+    if (self.distance < self.min_distance) self.distance = self.min_distance;
+    if (self.distance > self.max_distance) self.distance = self.max_distance;
+    float cp = (float)cos((double)self.pitch);
+    Vec3 off = Vec3{(float)sin((double)self.yaw) * cp, (float)sin((double)self.pitch), (float)cos((double)self.yaw) * cp};
+    Scene_node(scene, cam).position = self.target + off * self.distance;
+    Scene_update(scene);
+    Scene_look_at(scene, cam, self.target, Vec3{0.0, 1.0, 0.0});
+}
+
+// Turns and zooms the orbit with a touch (then call SceneOrbit_apply).
+void SceneOrbit_touch(*SceneOrbit self, GpuTouch t) {
+    int slot = -1;
+    for (k in 0..2) {
+        if (self._id[k] == t.id) slot = k;
+    }
+    if (t.phase == GPU_TOUCH_DOWN) {
+        if (slot >= 0 || self._fingers >= 2) return;
+        slot = self._id[0] < 0 ? 0 : 1;
+        self._id[slot] = t.id;
+        self._x[slot] = t.x;
+        self._y[slot] = t.y;
+        self._fingers++;
+        if (self._fingers == 2) {
+            float dx = self._x[1] - self._x[0];
+            float dy = self._y[1] - self._y[0];
+            self._pinch = (float)sqrt((double)(dx * dx + dy * dy));
+            self._start_distance = self.distance;
+        }
+        return;
+    }
+    if (slot < 0) return;
+    if (t.phase == GPU_TOUCH_MOVE) {
+        if (self._fingers == 1) {
+            self.yaw -= (t.x - self._x[slot]) * self.rotate_speed;
+            self.pitch += (t.y - self._y[slot]) * self.rotate_speed;
+        }
+        self._x[slot] = t.x;
+        self._y[slot] = t.y;
+        if (self._fingers == 2 && self._pinch > 0.0) {
+            float dx = self._x[1] - self._x[0];
+            float dy = self._y[1] - self._y[0];
+            float d = (float)sqrt((double)(dx * dx + dy * dy));
+            if (d > 0.0) self.distance = self._start_distance * self._pinch / d;
+        }
+        return;
+    }
+    self._id[slot] = -1;
+    self._fingers--;
+    if (self._fingers < 0) self._fingers = 0;
+}
