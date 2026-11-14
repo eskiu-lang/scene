@@ -193,6 +193,35 @@ Result<int, string> run() {
     target.read(px)?;
     expect("without ibl or lights a PBR surface is dark", pixel(px, 16, 16), Vec3{0.0, 0.0, 0.0}, 0.001);
     scene.node(lit).visible = false;
+
+    // a 360 image of three columns, red, green, blue (linear texels): straight ahead is the
+    // middle column's center, 120 degrees to either side the others'; turning the sky moves them
+    uint8[24] pano = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255,
+                      255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255};
+    GpuImageOptions lo = GpuImageOptions{srgb: false};
+    GpuTexture pt = gpu.image_with(3, 2, &pano[0], &lo)?;
+    defer pt.release();
+    scene.set_sky_360(&pt);
+    scene.sky_intensity = 1.0;
+    *SceneCamera narrow = scene.camera(cam);
+    narrow.fov = 0.1;
+    scene.set_camera(cam);
+    scene.node(cam).position = Vec3{0.0, 0.0, 0.0};
+    scene.update();
+    Vec3[3] dirs = {Vec3{0.0, 0.0, -1.0}, Vec3{0.8660254, 0.0, 0.5}, Vec3{-0.8660254, 0.0, 0.5}};
+    Vec3[3] want = {Vec3{0.0, 1.0, 0.0}, Vec3{0.0, 0.0, 1.0}, Vec3{1.0, 0.0, 0.0}};
+    string[3] what = {"360: ahead is the middle", "360: 120 degrees right is the right third", "360: 120 degrees left is the left third"};
+    for (i in 0..3) {
+        scene.look_at(cam, dirs[i], Vec3{0.0, 1.0, 0.0});
+        scene.render_to(&target)?;
+        target.read(px)?;
+        expect(what[i], pixel(px, 16, 16), want[i], 0.02);
+    }
+    scene.sky_rotation = quat_axis_angle(Vec3{0.0, 1.0, 0.0}, 1.5707963);
+    scene.look_at(cam, Vec3{-1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0});
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("360 turned a quarter left: the middle is at -X", pixel(px, 16, 16), Vec3{0.0, 1.0, 0.0}, 0.02);
     return Ok<int, string>(0);
 }
 
