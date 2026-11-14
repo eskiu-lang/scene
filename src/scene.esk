@@ -78,6 +78,15 @@ SceneCamera scene_orthographic(float height, float near, float far) {
     return SceneCamera{SCENE_ORTHOGRAPHIC, 0.0, near, far, height, 0.0};
 }
 
+// The depth format of the scene pass: with a stencil, for portals.
+const WGPUTextureFormat SCENE_DEPTH_FORMAT = WGPUTextureFormat_Depth24PlusStencil8;
+
+// Pipeline key bits beyond the material's (scene_material_key): drawn only where the
+// stencil equals the pass's reference (a portal's world), or into the stencil (a portal's
+// window).
+const int _SCENE_KEY_MASKED = 4096;
+const int _SCENE_KEY_SILHOUETTE = 8192;
+
 // How a node turns to face the camera (SceneNode.billboard), ViroReact's
 // transformBehaviors: not at all; fully (its +Z toward the camera); or only about the
 // world X, Y or Z axis.
@@ -97,7 +106,10 @@ const int SCENE_BILLBOARD_Z = 4;
 // front, casting no shadow), and one at 0 is not drawn. rendering_order (0) draws the node
 // before (lower) or after (higher) others whatever its distance, ahead of every other
 // ordering; with a material that skips the depth test it puts a panel on top. billboard
-// (SCENE_BILLBOARD_*) turns the node to face the camera. ignore_events keeps the node's mesh out of hit tests
+// (SCENE_BILLBOARD_*) turns the node to face the camera. portal makes the node's subtree a
+// world of its own, seen through the meshes of its descendants marked portal_entrance
+// (ViroPortalScene and ViroPortal), with portal_sky (a texture id: a cube, or a 360 image
+// with portal_sky_pano) behind it; passable lets the camera walk in. ignore_events keeps the node's mesh out of hit tests
 // (<scene/input>): rays pass through it. alive is false once the node is removed. Change
 // parent and children through Scene_set_parent and Scene_remove, not by hand.
 struct SceneNode {
@@ -118,6 +130,11 @@ struct SceneNode {
     float opacity;
     int rendering_order;
     int billboard;
+    bool portal;
+    bool portal_entrance;
+    bool passable;
+    int portal_sky;
+    bool portal_sky_pano;
     bool ignore_events;
     Mat4 world;
     List<Mat4> joints;
@@ -193,6 +210,13 @@ struct _SceneDraw {
     float opacity;
     int order;
     bool in_view;
+    int world;
+    int frame;
+}
+
+struct _ScenePortalRec {
+    int node;
+    int outer;
 }
 
 struct _SceneLightRec {
@@ -243,6 +267,11 @@ struct _SceneRenderer {
     List<_SceneNodeGpu> nodes;
     List<_SceneMatGpu> mats;
     List<_SceneSampler> samplers;
+    List<_ScenePortalRec> portals;
+    Vec3 last_eye;
+    bool has_eye;
+    GpuPipeline depth_reset;
+    bool depth_reset_made;
     List<_SceneDraw> draws;
     List<_SceneLightRec> recs;
     _ScenePostGpu post;
@@ -282,6 +311,7 @@ struct Scene {
     *GpuIbl ibl;
     ScenePost post;
     uint32 shadow_size;
+    int active_portal;
     _SceneRenderer _r;
 }
 
@@ -432,6 +462,8 @@ void Scene_release(*Scene self) {
         }
     }
     for (i in 0..r.pipes.size) r.pipes.data[i].pipe.release();
+    if (r.depth_reset_made) r.depth_reset.release();
+    List_free(&r.portals);
     for (i in 0..r.samplers.size) r.samplers.data[i].samp.release();
     List_free(&r.samplers);
     for (i in 0..r.shadow_views.size) r.shadow_views.data[i].release();
@@ -1262,10 +1294,23 @@ Result<*GpuPipeline, string> _scene_pipeline(*Scene self, int key) {
     WGPUBlendState bs = _scene_blend_state(scene_key_blend(key));
     GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: "fs",
         format: WGPUTextureFormat_RGBA16Float, layout: &layout, groups: &groups[0], group_count: 3,
-        depth: true, depth_format: WGPUTextureFormat_Depth32Float, depth_read_only: scene_key_skips_depth_write(key),
+        depth: true, depth_format: SCENE_DEPTH_FORMAT, depth_read_only: scene_key_skips_depth_write(key),
         cull: scene_key_double_sided(key) ? WGPUCullMode_None : WGPUCullMode_Back};
     if (scene_key_skips_depth_test(key)) d.depth_compare = WGPUCompareFunction_Always;
     if (blend) d.blend_state = &bs;
+    if ((key / _SCENE_KEY_MASKED) % 2 == 1) {
+        // drawn only where a portal's window set the stencil to the pass's reference
+        d.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_Equal};
+    }
+    if ((key / _SCENE_KEY_SILHOUETTE) % 2 == 1) {
+        // a portal's window into the stencil: no color, depth tested but not written
+        d.no_color_write = true;
+        d.blend_state = null;
+        d.depth_read_only = true;
+        d.depth_compare = WGPUCompareFunction_LessEqual;
+        d.cull = WGPUCullMode_None;
+        d.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_Always, pass: WGPUStencilOperation_Replace};
+    }
     GpuPipeline p = self.gpu.pipeline(&d)?;
     List_push(&r.pipes, _ScenePipe{key, p});
     return Ok<*GpuPipeline, string>(&r.pipes.data[r.pipes.size - 1].pipe);
@@ -1445,9 +1490,23 @@ bool _scene_sphere_in_view(Mat4 m, Vec3 c, float r) {
     return true;
 }
 
-void _scene_collect(*Scene self, int id, float parent_opacity) {
+void _scene_collect(*Scene self, int id, float parent_opacity, int world, int frame) {
     *SceneNode n = &self.nodes.data[id];
     if (!n.alive || !n.visible) return;
+    if (n.portal && id != 0) {
+        List_push(&self._r.portals, _ScenePortalRec{id, world});
+        // the portal's contents are its own world; its entrance stays in the outer one
+        for (i in 0..n.children.size) {
+            int c = n.children.data[i];
+            *SceneNode cn = &self.nodes.data[c];
+            bool entrance = cn.portal_entrance;
+            float op = parent_opacity * (n.opacity < 0.0 ? 0.0 : (n.opacity > 1.0 ? 1.0 : n.opacity));
+            if (entrance) _scene_collect(self, c, op, world, id);
+            else _scene_collect(self, c, op, id, 0);
+            n = &self.nodes.data[id];
+        }
+        return;
+    }
     float opacity = parent_opacity * (n.opacity < 0.0 ? 0.0 : (n.opacity > 1.0 ? 1.0 : n.opacity));
     if (opacity <= 0.0) return;
     if (n.mesh > 0 && n.mesh < self.meshes.size && self.meshes.data[n.mesh].index_count > 0) {
@@ -1461,6 +1520,8 @@ void _scene_collect(*Scene self, int id, float parent_opacity) {
         d.blend = scene_key_blended(d.key);
         d.opacity = opacity;
         d.order = n.rendering_order;
+        d.world = world;
+        d.frame = frame;
         Vec3 mid = (mesh.min + mesh.max) * 0.5;
         d.center = n.world.point(mid);
         d.radius = ((mesh.max - mesh.min) * 0.5).length() * _scene_max_scale(n.world);
@@ -1468,7 +1529,7 @@ void _scene_collect(*Scene self, int id, float parent_opacity) {
         d.in_view = _scene_sphere_in_view(self._r.view_proj, d.center, d.radius);
         List_push(&self._r.draws, d);
     }
-    for (i in 0..n.children.size) _scene_collect(self, n.children.data[i], opacity);
+    for (i in 0..n.children.size) _scene_collect(self, n.children.data[i], opacity, world, frame);
 }
 
 int _scene_draw_order(*_SceneDraw a, *_SceneDraw b) {
@@ -1700,14 +1761,16 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
         r.hdr.release();
         r.depth.release();
         r.hdr = self.gpu.target_with(width, height, WGPUTextureFormat_RGBA16Float)?;
-        r.depth = self.gpu.texture(width, height, WGPUTextureFormat_Depth32Float, WGPUTextureUsage_RenderAttachment)?;
+        r.depth = self.gpu.texture(width, height, SCENE_DEPTH_FORMAT, WGPUTextureUsage_RenderAttachment)?;
         r.w = width;
         r.h = height;
     }
     Scene_update(self);
     _scene_camera(self, width, height);
     List_clear(&r.draws);
-    _scene_collect(self, 0, 1.0);
+    List_clear(&r.portals);
+    _scene_collect(self, 0, 1.0, 0, 0);
+    _scene_portal_crossing(self);
     if (r.draws.size > 1) sort<_SceneDraw>(r.draws.data, r.draws.size, _scene_draw_order);
 
     Vec3 ambient;
@@ -1824,20 +1887,171 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     GpuPassOptions mo = GpuPassOptions{clear: GpuColor{(double)self.background.x, (double)self.background.y,
         (double)self.background.z, (double)self.background.w}, depth: &r.depth};
     GpuPass pass = enc.pass_with(r.hdr.view, &mo);
+    int active = _scene_active_world(self);
+    // the world the camera is in, with the entrances that lead out of it
+    _scene_world_pass(self, &pass, active, active, 0, false)?;
+    // every world seen through a window: the window into the stencil, the depth behind it
+    // cleared, then that world's sky and contents only there, and the window's own frame
+    // over them
+    uint32 reference = 0;
+    for (k in 0..r.portals.size) {
+        _ScenePortalRec pr = r.portals.data[k];
+        int other = -1;
+        if (pr.outer == active) other = pr.node;
+        else if (pr.node == active) other = pr.outer;
+        if (other < 0 || reference >= 255) continue;
+        reference++;
+        pass.set_stencil_reference(reference);
+        bool any = false;
+        for (i in 0..r.draws.size) {
+            *_SceneDraw d = &r.draws.data[i];
+            if (d.frame != pr.node || !d.in_view) continue;
+            *GpuPipeline sp = _scene_pipeline(self, d.key + _SCENE_KEY_SILHOUETTE)?;
+            _scene_draw(self, &pass, d, sp);
+            any = true;
+        }
+        if (!any) continue;
+        _scene_depth_reset(self, &pass)?;
+        _scene_world_pass(self, &pass, other, -1, pr.node, true)?;
+        if (other == pr.node) {
+            for (i in 0..r.draws.size) {
+                *_SceneDraw d = &r.draws.data[i];
+                if (d.frame != pr.node || !d.in_view) continue;
+                *GpuPipeline fp = _scene_pipeline(self, d.key + _SCENE_KEY_MASKED)?;
+                _scene_draw(self, &pass, d, fp);
+            }
+        }
+    }
+    pass.end()?;
+    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post);
+}
+
+// The node of the world the camera is in: 0 (the root) or a portal node.
+int _scene_active_world(*Scene self) {
+    int a = self.active_portal;
+    if (a <= 0 || a >= self.nodes.size || !self.nodes.data[a].alive || !self.nodes.data[a].portal) return 0;
+    return a;
+}
+
+// Draws world (0 for the root's, else a portal node's contents) in draw order, its sky
+// before its first blended surface; frames_of adds the entrances of that portal (the
+// frames seen from inside it) and skip_frames_of leaves out the window being looked
+// through. masked draws only where the stencil holds the reference.
+Result<int, string> _scene_world_pass(*Scene self, *GpuPass pass, int world, int frames_of, int skip_frames_of, bool masked) {
+    *_SceneRenderer r = &self._r;
+    *GpuTexture sky = self.skybox;
+    bool pano = self.sky_pano;
+    bool flip = self.sky_flip;
+    if (world > 0) {
+        *SceneNode pn = &self.nodes.data[world];
+        sky = Scene_texture(self, pn.portal_sky);
+        pano = pn.portal_sky_pano;
+        flip = false;
+    }
     bool sky_drawn = false;
+    int extra = masked ? _SCENE_KEY_MASKED : 0;
     for (i in 0..r.draws.size) {
         *_SceneDraw d = &r.draws.data[i];
+        bool mine = d.world == world || (frames_of > 0 && d.frame == frames_of);
+        if (!mine || (skip_frames_of > 0 && d.frame == skip_frames_of)) continue;
         if (d.blend && !sky_drawn) {
-            if (self.skybox != null) _scene_sky_draw(&r.sky, &pass, self.skybox, self.sky_pano, r.view_proj, self.sky_rotation, self.sky_intensity, self.sky_flip);
+            if (sky != null) _scene_sky_draw(&r.sky, pass, sky, pano, r.view_proj, self.sky_rotation, self.sky_intensity, flip, masked);
             sky_drawn = true;
         }
         if (!d.in_view) continue;
-        *GpuPipeline p = _scene_pipeline(self, d.key)?;
-        _scene_draw(self, &pass, d, p);
+        *GpuPipeline p = _scene_pipeline(self, d.key + extra)?;
+        _scene_draw(self, pass, d, p);
     }
-    if (!sky_drawn && self.skybox != null) _scene_sky_draw(&r.sky, &pass, self.skybox, self.sky_pano, r.view_proj, self.sky_rotation, self.sky_intensity, self.sky_flip);
-    pass.end()?;
-    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post);
+    if (!sky_drawn && sky != null) _scene_sky_draw(&r.sky, pass, sky, pano, r.view_proj, self.sky_rotation, self.sky_intensity, flip, masked);
+    return Ok<int, string>(0);
+}
+
+string _scene_depth_reset_wgsl =
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;\n"
+    "    return vec4<f32>(p, 1.0, 1.0);\n"
+    "}\n"
+    "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }\n";
+
+// Sets the depth to the far plane where the stencil holds the reference: what lies behind
+// a portal's window no longer hides that portal's world.
+Result<int, string> _scene_depth_reset(*Scene self, *GpuPass pass) {
+    *_SceneRenderer r = &self._r;
+    if (!r.depth_reset_made) {
+        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_depth_reset_wgsl, vertex: "vs", fragment: "fs",
+            format: WGPUTextureFormat_RGBA16Float, depth: true, depth_format: SCENE_DEPTH_FORMAT,
+            depth_compare: WGPUCompareFunction_Always, no_color_write: true,
+            stencil_front: GpuStencilFace{compare: WGPUCompareFunction_Equal}};
+        r.depth_reset = self.gpu.pipeline(&d)?;
+        r.depth_reset_made = true;
+    }
+    pass.draw(&r.depth_reset, null, 3, 1);
+    return Ok<int, string>(0);
+}
+
+// Whether the segment from a to b (world) crosses the box lo..hi of a node with world
+// matrix m.
+bool _scene_segment_crosses(Mat4 m, Vec3 lo, Vec3 hi, Vec3 a, Vec3 b) {
+    Mat4 inv = m.inverse();
+    Vec3 o = inv.point(a);
+    Vec3 d = inv.point(b) - o;
+    float t0 = 0.0;
+    float t1 = 1.0;
+    float[3] os = {o.x, o.y, o.z};
+    float[3] ds = {d.x, d.y, d.z};
+    float[3] ls = {lo.x, lo.y, lo.z};
+    float[3] hs = {hi.x, hi.y, hi.z};
+    for (k in 0..3) {
+        float eps = 1e-5;
+        if (ds[k] > -1e-12 && ds[k] < 1e-12) {
+            if (os[k] < ls[k] - eps || os[k] > hs[k] + eps) return false;
+            continue;
+        }
+        float ta = (ls[k] - eps - os[k]) / ds[k];
+        float tb = (hs[k] + eps - os[k]) / ds[k];
+        if (ta > tb) {
+            float t = ta;
+            ta = tb;
+            tb = t;
+        }
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+        if (t0 > t1) return false;
+    }
+    return true;
+}
+
+// Walks the camera through passable portals: when it moved through the bounds of a
+// passable portal's entrance since the last frame, the world it is in switches between
+// that portal and the one around it (ViroReact's passable portals).
+void _scene_portal_crossing(*Scene self) {
+    *_SceneRenderer r = &self._r;
+    Vec3 eye = r.eye;
+    if (!r.has_eye) {
+        r.last_eye = eye;
+        r.has_eye = true;
+        return;
+    }
+    Vec3 last = r.last_eye;
+    r.last_eye = eye;
+    if ((eye - last).length() <= 0.0) return;
+    int active = _scene_active_world(self);
+    for (k in 0..r.portals.size) {
+        _ScenePortalRec pr = r.portals.data[k];
+        if (!self.nodes.data[pr.node].passable) continue;
+        if (pr.outer != active && pr.node != active) continue;
+        bool crossed = false;
+        for (i in 0..r.draws.size) {
+            *_SceneDraw d = &r.draws.data[i];
+            if (d.frame != pr.node) continue;
+            *SceneMesh mesh = &self.meshes.data[d.mesh];
+            if (_scene_segment_crosses(self.nodes.data[d.node].world, mesh.min, mesh.max, last, eye)) crossed = true;
+        }
+        if (crossed) {
+            self.active_portal = active == pr.node ? pr.outer : pr.node;
+            return;
+        }
+    }
 }
 
 // Scene_render_in with an encoder of its own, submitted at the end.

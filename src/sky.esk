@@ -100,12 +100,14 @@ struct _SceneSkyGpu {
     WGPUTextureView bound;
     GpuBindLayout layout360;
     GpuPipeline pipe360;
+    GpuPipeline pipe_masked;
+    GpuPipeline pipe360_masked;
     GpuBindGroup group360;
     GpuSampler samp360;
     WGPUTextureView bound360;
 }
 
-Result<GpuPipeline, string> _scene_sky_pipe(*Gpu gpu, *GpuBindLayout layout, string body) {
+Result<GpuPipeline, string> _scene_sky_pipe(*Gpu gpu, *GpuBindLayout layout, string body, bool masked) {
     String src;
     defer src.free();
     src.append(_scene_sky_head);
@@ -113,8 +115,9 @@ Result<GpuPipeline, string> _scene_sky_pipe(*Gpu gpu, *GpuBindLayout layout, str
     *GpuBindLayout[1] groups = {layout};
     GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: "fs",
         format: WGPUTextureFormat_RGBA16Float, groups: &groups[0], group_count: 1, depth: true,
-        depth_format: WGPUTextureFormat_Depth32Float, depth_compare: WGPUCompareFunction_LessEqual,
+        depth_format: WGPUTextureFormat_Depth24PlusStencil8, depth_compare: WGPUCompareFunction_LessEqual,
         depth_read_only: true};
+    if (masked) d.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_Equal};
     return gpu.pipeline(&d);
 }
 
@@ -123,12 +126,14 @@ Result<int, string> _scene_sky_make(*_SceneSkyGpu self, *Gpu gpu) {
     self.layout.uniform(0, WGPUShaderStage_Fragment);
     self.layout.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_Cube);
     self.layout.sampler(2, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
-    self.pipe = _scene_sky_pipe(gpu, &self.layout, _scene_sky_cube_wgsl)?;
+    self.pipe = _scene_sky_pipe(gpu, &self.layout, _scene_sky_cube_wgsl, false)?;
+    self.pipe_masked = _scene_sky_pipe(gpu, &self.layout, _scene_sky_cube_wgsl, true)?;
     self.layout360 = gpu.bind_layout();
     self.layout360.uniform(0, WGPUShaderStage_Fragment);
     self.layout360.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_2D);
     self.layout360.sampler(2, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
-    self.pipe360 = _scene_sky_pipe(gpu, &self.layout360, _scene_sky_360_wgsl)?;
+    self.pipe360 = _scene_sky_pipe(gpu, &self.layout360, _scene_sky_360_wgsl, false)?;
+    self.pipe360_masked = _scene_sky_pipe(gpu, &self.layout360, _scene_sky_360_wgsl, true)?;
     self.uniforms = gpu.uniform(null, 144)?;
     GpuSamplerOptions so360 = GpuSamplerOptions{mipmaps: true, wrap_u: WGPUAddressMode_Repeat,
         wrap_v: WGPUAddressMode_ClampToEdge};
@@ -149,7 +154,7 @@ Result<int, string> _scene_sky_make(*_SceneSkyGpu self, *Gpu gpu) {
 // Draws the sky: tex is a cube map, or an equirectangular 2D image when pano. rotation
 // turns the sky in the world.
 void _scene_sky_draw(*_SceneSkyGpu self, *GpuPass pass, *GpuTexture tex, bool pano, Mat4 view_proj, Quat rotation,
-                     float intensity, bool flip) {
+                     float intensity, bool flip, bool masked) {
     float[36] u;
     Mat4 inv = view_proj.inverse();
     Mat4 rot = mat4_trs(Vec3{0.0, 0.0, 0.0}, rotation.conjugate(), Vec3{1.0, 1.0, 1.0});
@@ -164,7 +169,7 @@ void _scene_sky_draw(*_SceneSkyGpu self, *GpuPass pass, *GpuTexture tex, bool pa
             self.bound360 = tex.view;
         }
         pass.set_group(0, &self.group360);
-        pass.draw(&self.pipe360, null, 3, 1);
+        pass.draw(masked ? &self.pipe360_masked : &self.pipe360, null, 3, 1);
         return;
     }
     if (self.bound != tex.view) {
@@ -172,7 +177,7 @@ void _scene_sky_draw(*_SceneSkyGpu self, *GpuPass pass, *GpuTexture tex, bool pa
         self.bound = tex.view;
     }
     pass.set_group(0, &self.group);
-    pass.draw(&self.pipe, null, 3, 1);
+    pass.draw(masked ? &self.pipe_masked : &self.pipe, null, 3, 1);
 }
 
 void _scene_sky_release(*_SceneSkyGpu self) {
@@ -185,6 +190,8 @@ void _scene_sky_release(*_SceneSkyGpu self) {
     self.group360.release();
     self.samp360.release();
     self.pipe360.release();
+    self.pipe_masked.release();
+    self.pipe360_masked.release();
     self.layout360.release();
     self.made = false;
 }
