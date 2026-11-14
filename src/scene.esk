@@ -787,11 +787,25 @@ Result<int, string> Scene_add_geometry(*Scene self, *SceneGeometry geometry) {
 }
 
 // Replaces mesh's vertices and indices with geometry (a text that changed, a shape built
-// again). Its morph targets are dropped. False, changing nothing, for an unknown mesh or
+// again, particles each frame): written in place when they fit in the mesh's buffers,
+// else in new ones. Its morph targets are dropped. False, changing nothing, for an unknown mesh or
 // an empty geometry, or when the upload fails.
 bool Scene_set_geometry(*Scene self, int mesh, *SceneGeometry geometry) {
     if (mesh <= 0 || mesh >= self.meshes.size) return false;
     if (geometry.vertex_count == 0 || geometry.index_count < 3) return false;
+    *SceneMesh old = &self.meshes.data[mesh];
+    uint64 vbytes = (uint64)geometry.vertex_count * SCENE_VERTEX_FLOATS * 4;
+    uint64 ibytes = (uint64)geometry.index_count * 4;
+    if (old.targets == 0 && old.vertices.handle != null && vbytes <= old.vertices.size && ibytes <= old.indices.size) {
+        // it fits: write in place (a mesh rebuilt every frame, like particles)
+        old.vertices.write(0, geometry.vertices, vbytes);
+        old.indices.write(0, geometry.indices, ibytes);
+        old.index_count = geometry.index_count;
+        old.vertex_count = geometry.vertex_count;
+        old.min = geometry.min;
+        old.max = geometry.max;
+        return true;
+    }
     Result<GpuBuffer, string> vb = self.gpu.vertices(geometry.vertices, (uint64)geometry.vertex_count * SCENE_VERTEX_FLOATS * 4);
     if (!vb.ok) return false;
     Result<GpuBuffer, string> ib = self.gpu.indices(geometry.indices, (uint64)geometry.index_count);
