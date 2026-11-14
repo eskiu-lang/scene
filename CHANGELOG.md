@@ -8,6 +8,8 @@ All notable changes to this package are documented here. The format follows
 
 ### Added
 
+- `SCENE_PBR_VIRO`: virocore's physically based lighting (physical omni and spot lights,
+  Schlick-GGX, ambient without metal), matched pixel for pixel by eskiu-lang/viro's golden check.
 - ViroReact's output pipeline in `ScenePost`: `SCENE_TONE_HABLE_LUMINANCE` (HableLuminanceOnly),
   `gamma22` (a 1/2.2 power) and `backdrop` (a clear color that skips tone mapping and gamma).
 - `<scene/vr>`: `Scene_render_eye` (an eye's pose in the head and its projection, folded into

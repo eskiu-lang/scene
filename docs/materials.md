@@ -43,6 +43,7 @@ the sum of the scene's ambient lights.
 | `SCENE_PHONG` | Lambert plus `sum(radiance * max(v.reflect(-l, n), 0)^shininess) * specular` |
 | `SCENE_BLINN` | Lambert plus `sum(radiance * max(n.normalize(v + l), 0)^shininess) * specular` |
 | `SCENE_PBR` | glTF's metallic-roughness model, below |
+| `SCENE_PBR_VIRO` | virocore's physically based model, for ViroReact's own scenes: omni and spot lights are physical (intensity x 1000 / pi, the inverse square of the distance windowed smoothly to `attenuation_end`), directional ones are not, Schlick-GGX geometry, and the constant ambient lights only the share that is not metal |
 
 `specular` is the material's `specular` color times `specular_texture`. A highlight is only
 added where `n.l > 0`. Every model then adds `emissive * emissive_texture`.

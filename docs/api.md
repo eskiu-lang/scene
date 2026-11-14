@@ -2048,6 +2048,18 @@ reflection of the light, or around the half vector); PBR is the metallic-roughne
 model (GGX, Smith visibility, Fresnel-Schlick) with image-based ambient light when the
 scene has an environment.
 
+### SCENE_PBR_VIRO
+
+```eskiu
+const int SCENE_PBR_VIRO = 5;
+```
+
+ViroReact's physically based model as virocore computes it: omni and spot lights are
+physical (intensity x 1000 / pi, the scene's intensities being ViroReact's lumens / 1000,
+falling off with the inverse square of the distance, windowed smoothly to attenuation_end),
+directional ones are not; Schlick-GGX geometry; the constant ambient lights only what is not
+metal.
+
 ### SCENE_ALPHA_OPAQUE, SCENE_ALPHA_MASK, SCENE_ALPHA_BLEND
 
 ```eskiu

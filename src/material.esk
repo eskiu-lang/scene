@@ -33,6 +33,12 @@ const int SCENE_LAMBERT = 1;
 const int SCENE_PHONG = 2;
 const int SCENE_BLINN = 3;
 const int SCENE_PBR = 4;
+// ViroReact's physically based model as virocore computes it: omni and spot lights are
+// physical (intensity x 1000 / pi, the scene's intensities being ViroReact's lumens / 1000,
+// falling off with the inverse square of the distance, windowed smoothly to attenuation_end),
+// directional ones are not; Schlick-GGX geometry; the constant ambient lights only what is not
+// metal.
+const int SCENE_PBR_VIRO = 5;
 
 // Alpha modes (SceneMaterial.alpha_mode): the surface is opaque (alpha ignored), cut out
 // where alpha is below alpha_cutoff, or blended with what is behind it (drawn after the
@@ -155,7 +161,7 @@ const int SCENE_KEY_SHADER = 131072;
 // (only for blended materials) and the sidedness, packed in one int. Materials with the
 // same key share a pipeline.
 int scene_material_key(*SceneMaterial m) {
-    int lighting = m.lighting < 0 || m.lighting > SCENE_PBR ? SCENE_BLINN : m.lighting;
+    int lighting = m.lighting < 0 || m.lighting > SCENE_PBR_VIRO ? SCENE_BLINN : m.lighting;
     int alpha = m.alpha_mode < 0 || m.alpha_mode > SCENE_ALPHA_BLEND ? SCENE_ALPHA_OPAQUE : m.alpha_mode;
     int blend = 0;
     if (alpha == SCENE_ALPHA_BLEND) {
@@ -435,6 +441,60 @@ string _scene_pbr_wgsl =
     "    return color;\n"
     "}\n";
 
+string _scene_pbr_viro_wgsl =
+    "fn viro_g1(x: f32, r: f32) -> f32 {\n"
+    "    let k = (r + 1.0) * (r + 1.0) / 8.0;\n"
+    "    return x / (x * (1.0 - k) + k);\n"
+    "}\n"
+    "fn shade(s: Surf) -> vec3<f32> {\n"
+    "    let r = s.rough;\n"
+    "    let a = r * r;\n"
+    "    let a2 = a * a;\n"
+    "    let f0 = mix(vec3<f32>(0.04), s.base.rgb, s.metal);\n"
+    "    let nv = max(dot(s.n, s.v), 0.0);\n"
+    "    var color = vec3<f32>(0.0);\n"
+    "    let count = u32(draw.info.x);\n"
+    "    for (var k = 0u; k < count; k++) {\n"
+    "        let i = draw_light(k);\n"
+    "        let li = lights[i];\n"
+    "        var l = -normalize(li.direction.xyz);\n"
+    "        var att = li.color.w;\n"
+    "        if (li.position.w > 1.5) {\n"
+    "            let to = li.position.xyz - s.pos;\n"
+    "            l = normalize(to);\n"
+    "            let d2 = dot(to, to);\n"
+    "            let f = d2 / max(li.atten.y * li.atten.y, 1e-6);\n"
+    "            let sm = clamp(1.0 - f * f, 0.0, 1.0);\n"
+    "            att = li.color.w * 1000.0 / PI / max(d2, 1e-4) * sm * sm;\n"
+    "            if (li.position.w > 2.5) {\n"
+    "                let theta = dot(l, -normalize(li.direction.xyz));\n"
+    "                att = att * clamp((theta - li.spot.y) / max(li.spot.x - li.spot.y, 1e-4), 0.0, 1.0);\n"
+    "            }\n"
+    "        }\n"
+    "        let radiance = li.color.rgb * att * shadow_at(i, s.pos, s.geo_n);\n"
+    "        let h = normalize(s.v + l);\n"
+    "        let nl = max(dot(s.n, l), 0.0);\n"
+    "        let nh = max(dot(s.n, h), 0.0);\n"
+    "        let dn = nh * nh * (a2 - 1.0) + 1.0;\n"
+    "        let ndf = a2 / (PI * dn * dn);\n"
+    "        let g = viro_g1(nv, r) * viro_g1(nl, r);\n"
+    "        let fr = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(h, s.v), 0.0, 1.0), 5.0);\n"
+    "        let spec = ndf * g * fr / (4.0 * nv * nl + 0.001);\n"
+    "        let kd = (vec3<f32>(1.0) - fr) * (1.0 - s.metal);\n"
+    "        color += (kd * s.base.rgb / PI + spec) * radiance * nl * PI;\n"
+    "    }\n"
+    "    if (frame.ibl.x > 0.5) {\n"
+    "        let fa = f0 + (max(vec3<f32>(1.0 - r), f0) - f0) * pow(1.0 - nv, 5.0);\n"
+    "        let irr = textureSampleLevel(irr_tex, ibl_samp, s.n, 0.0).rgb;\n"
+    "        let pre = textureSampleLevel(spec_tex, ibl_samp, reflect(-s.v, s.n), r * frame.ibl.z).rgb;\n"
+    "        let ab = textureSampleLevel(brdf_tex, ibl_samp, vec2<f32>(max(nv, 1e-4), r), 0.0).rg;\n"
+    "        color += (irr * s.base.rgb * (1.0 - s.metal) * (1.0 - fa) + pre * (f0 * ab.x + ab.y)) * s.ao * frame.ibl.y;\n"
+    "    } else {\n"
+    "        color += frame.ambient.rgb * s.base.rgb * (1.0 - s.metal) * s.ao;\n"
+    "    }\n"
+    "    return color;\n"
+    "}\n";
+
 string _scene_fs_head =
     "@fragment fn fs(v: V, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {\n"
     "    let d_s = textureSample(diffuse_tex, mat_samp, tuv(v, 0u));\n"
@@ -514,6 +574,8 @@ void scene_material_shader_with(int key, *SceneShader prog, *String out) {
         String_append(out, _scene_constant_wgsl);
     } else if (lighting == SCENE_PBR) {
         String_append(out, _scene_pbr_wgsl);
+    } else if (lighting == SCENE_PBR_VIRO) {
+        String_append(out, _scene_pbr_viro_wgsl);
     } else {
         String_append(out, _scene_classic_head);
         if (lighting == SCENE_PHONG) String_append(out, _scene_phong_spec);
@@ -824,6 +886,8 @@ string _scene_varying_interp(string t) {
 // entry points.
 void _scene_modified_shader(int key, *SceneShader p, *String out) {
     int lighting = scene_key_lighting(key);
+    // with modifiers, ViroReact's model goes through the standard PBR path
+    if (lighting == SCENE_PBR_VIRO) lighting = SCENE_PBR;
     int alpha = scene_key_alpha(key);
     int blend = scene_key_blend(key);
     // the common prelude, the program's varyings added to V
