@@ -632,6 +632,14 @@ into view, a width x height target in format (a window frame's view with the sur
 size and format, or a texture's). Passes recorded into enc afterwards (an interface)
 draw over the result. Fails with the GPU's message (a shader or pipeline error).
 
+### SCENE_PORTAL_DEPTH
+
+```eskiu
+const int SCENE_PORTAL_DEPTH = 4;
+```
+
+How many portals deep the scene draws from the world the camera is in.
+
 ### Scene_render
 
 ```eskiu

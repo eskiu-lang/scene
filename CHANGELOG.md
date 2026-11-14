@@ -36,7 +36,8 @@ All notable changes to this package are documented here. The format follows
 - Portals: `SceneNode.portal`, `portal_entrance`, `passable`, `portal_sky` and
   `Scene.active_portal` (ViroPortalScene and ViroPortal): a portal's world drawn only
   through its window with the stencil buffer, its own sky, walking in through a passable
-  window and seeing out. The scene's depth buffer now has a stencil
+  window and seeing out, portals inside portals (`SCENE_PORTAL_DEPTH` levels, ViroReact's
+  portal tree). The scene's depth buffer now has a stencil
   (`SCENE_DEPTH_FORMAT`, Depth24PlusStencil8). `docs/portals.md`.
 - `<scene/shapes>`: `scene_polygon` (ViroPolygon: holes, uv over the bounds) and
   `ScenePolyline` (ViroPolyline: camera-facing ribbons with round ends and joins).

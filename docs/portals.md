@@ -25,9 +25,10 @@ world, so it stays in front of what is behind the window.
 Each frame the scene draws:
 
 1. The world the camera is in, with the windows of its portals, and its sky.
-2. For each portal of that world: its window into the stencil buffer where it is visible
-   (an object in front of the window still covers it), the depth cleared there, then the
-   portal's sky and contents only there, and its window again on top.
+2. For each world next to it: its window into the stencil buffer where it is visible (an
+   object in front of the window still covers it), raising the stencil one level there; the
+   depth cleared there; then that world's sky and contents only there, its window again on
+   top, and its own neighbors one level deeper.
 
 `portal_sky` is a texture id from `Scene_add_texture`: a cube map, or a 360 image with
 `portal_sky_pano`. A portal without a sky shows, where its contents leave room, what was
@@ -42,6 +43,9 @@ world is drawn around the camera, and the world it came from is seen through the
 (`active_portal` 0). Set `active_portal` to put the camera in a portal directly. A portal
 that is not passable is only looked into.
 
-This covers one level: the world the camera is in and the portals of that world, or, inside
-a portal, the world around it. Portals inside portals are drawn as part of their portal's
-world, without their own windows. Lights reach every world.
+Portals nest, and the scene walks them as ViroReact walks its portal tree: from the world
+the camera is in, each neighboring world (a portal of it, or the world around it when it is
+a portal) is drawn through its window, and that world's own neighbors through their windows
+inside it, `SCENE_PORTAL_DEPTH` (4) levels deep. A world seen through two windows shows only
+where both are open. Walking through a passable window moves the camera one level, in or
+out. Lights reach every world.
