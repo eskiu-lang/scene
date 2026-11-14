@@ -1612,7 +1612,7 @@ Result<int, string> _scene_lights(*Scene self, *Vec3 ambient) {
         rec.end = l.attenuation_end;
         rec.mask = l.influence;
         rec.layer = -1;
-        if (l.type == SCENE_LIGHT_DIRECTIONAL && l.casts_shadows && shadows < SCENE_MAX_SHADOWS) {
+        if ((l.type == SCENE_LIGHT_DIRECTIONAL || l.type == SCENE_LIGHT_SPOT) && l.casts_shadows && shadows < SCENE_MAX_SHADOWS) {
             rec.layer = shadows;
             shadows++;
         }
@@ -1624,6 +1624,22 @@ Result<int, string> _scene_lights(*Scene self, *Vec3 ambient) {
 
 Mat4 _scene_shadow_matrix(*Scene self, *_SceneLightRec rec, *float texel_world) {
     *SceneLight l = &self.lights.data[rec.light];
+    if (l.type == SCENE_LIGHT_SPOT) {
+        // ViroReact's spot shadow: a square perspective frustum from the light down its
+        // direction, as wide as the outer cone, from shadow_near to shadow_far
+        float near = l.shadow_near > 0.0 ? l.shadow_near : 0.1;
+        float far = l.shadow_far > near ? l.shadow_far : 20.0;
+        float fov = l.outer_angle * 2.0;
+        if (fov > 3.1) fov = 3.1;
+        Vec3 sd = rec.dir;
+        Vec3 sup = sd.y > 0.99 || sd.y < -0.99 ? Vec3{0.0, 0.0, 1.0} : Vec3{0.0, 1.0, 0.0};
+        Mat4 sview = mat4_look_at(rec.pos, rec.pos + sd, sup);
+        uint32 ssize = self.shadow_size > 0 ? self.shadow_size : (uint32)2048;
+        // the normal offset is sized for a texel halfway down the attenuation range
+        float mid = l.attenuation_end > 0.0 ? l.attenuation_end * 0.5 : far * 0.5;
+        *texel_world = 2.0 * (float)tan((double)(fov * 0.5)) * mid / (float)ssize;
+        return mat4_perspective(fov, 1.0, near, far) * sview;
+    }
     Vec3 c = l.shadow_center;
     float radius = l.shadow_radius;
     if (radius <= 0.0) {

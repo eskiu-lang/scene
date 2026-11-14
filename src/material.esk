@@ -296,6 +296,7 @@ string _scene_common_wgsl =
     "    let li = lights[i];\n"
     "    if (li.direction.w < 0.0 || draw.info.y < 0.5) { return 1.0; }\n"
     "    let p = li.shadow_vp * vec4<f32>(world + n * li.spot.w, 1.0);\n"
+    "    if (p.w <= 0.0) { return 1.0; }\n"
     "    let c = p.xyz / p.w;\n"
     "    let uv = vec2<f32>(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);\n"
     "    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || c.z > 1.0) { return 1.0; }\n"
