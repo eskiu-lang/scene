@@ -15,6 +15,12 @@ All notable changes to this package are documented here. The format follows
   nodes. Events bubble to the nearest ancestor with a handler; thresholds, drag types and
   hover hysteresis follow ViroReact. `docs/input.md`.
 - `SceneNode.ignore_events` keeps a node out of hit tests.
+- `SceneNode.opacity` fades a node and its subtree: it multiplies down the tree, a node
+  below 1 is drawn blended (whatever its material's alpha mode), one at 0 is not drawn.
+- `<scene/animation>`: `SceneAnimations` animates position, scale, Euler rotation,
+  opacity and material color in groups (duration, delay, easing) and serial or parallel
+  chains, with ViroReact's easing curves, relative values and property strings, loops,
+  pause, resume and stop. `docs/animation.md`.
 - `Scene_camera_matrices` and `Scene_camera_is_ortho`: the view and projection the camera
   renders with.
 

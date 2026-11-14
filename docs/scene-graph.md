@@ -40,6 +40,8 @@ walking up its parents.
 |---|---|---|
 | `position`, `rotation`, `scale` | origin, identity, 1 | the local transform |
 | `visible` | true | false hides the node and its subtree |
+| `opacity` | 1 | fades the node and its subtree; multiplied down the tree, drawn blended below 1, not drawn at 0 |
+| `ignore_events` | false | rays pass through it ([hit testing](input.md)) |
 | `mesh`, `material` | 0, 0 | what the node draws |
 | `camera` | -1 | the camera it holds |
 | `casts_shadows`, `receives_shadows` | true, true | its part in shadows |
