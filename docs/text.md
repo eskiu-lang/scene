@@ -62,3 +62,35 @@ sampling it. The material is unlit (`SCENE_CONSTANT`) and blended: change it thr
 `Scene_material(label.material)`, for a lit text, another color, or `skip_depth_test` with
 a `rendering_order` to keep a label on top. The text is single-sided: seen from behind it
 is not drawn unless the material is `double_sided`.
+
+## Outline and drop shadow
+
+ViroText's `outerStroke` is `style.stroke`: `SCENE_TEXT_STROKE_OUTLINE` or
+`SCENE_TEXT_STROKE_DROP_SHADOW`, `stroke_width` points wide (2 by default) in
+`stroke_color` (white by default).
+
+```eskiu
+SceneTextStyle st = scene_text_style();
+st.stroke = SCENE_TEXT_STROKE_OUTLINE;
+st.stroke_width = 3.0;
+st.stroke_color = Vec4{0.0, 0.0, 0.0, 1.0};
+```
+
+As in ViroReact, each glyph gets a second glyph grown by the width on every side (the outer
+border of the outline, filled), drawn first and writing no depth so the text over it never
+fights it. An outline is centered on its glyph; a drop shadow keeps the glyph's top left
+corner, so it shows the width's distance to the right and down. The stroke is the child
+node `label.stroke_node` with its own material, `label.stroke_material`, and atlas; its
+`rendering_order` is one below the text node's.
+
+## Extruded text
+
+`style.extrusion` gives the text a depth in points (ViroText's `extrusionDepth`): 10 is 0.1
+world units. The glyphs then come from their outlines instead of an atlas, each curve in four
+steps as ViroReact does, with the front face at z = 0.01 x extrusion, the back face at 0 and
+the sides between. The front is the text node (`label.material`), the back and the sides are
+the child nodes `back_node` and `side_node` with `back_material` and `side_material`, the
+three materials of ViroReact's extruded text, all in the text's color and drawn from both
+sides. Give them a lit lighting model to shade the sides. Extruded text has no stroke, as in
+ViroReact. The faces carry their real normals (the front +Z, the back -Z, the sides across
+the outline), where ViroReact gives every vertex +Z.

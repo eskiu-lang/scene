@@ -142,6 +142,67 @@ Result<int, string> run() {
     }
     check("glyph drawn", lit > 20);
     check("nothing outside the glyph's bounds", stray == 0);
+
+    // an outline 4 points wide: its quads 0.04 larger on every side, blue around the red
+    // glyph, drawn behind it
+    SceneTextStyle os = big;
+    os.color = Vec4{1.0, 0.0, 0.0, 1.0};
+    os.stroke = SCENE_TEXT_STROKE_OUTLINE;
+    os.stroke_width = 4.0;
+    os.stroke_color = Vec4{0.0, 0.0, 1.0, 1.0};
+    t.set(&scene, &f, "H", os)?;
+    m = &scene.meshes.data[t.mesh];
+    *SceneMesh sm = &scene.meshes.data[t.stroke_mesh];
+    check("outline around the glyph", near(sm.min.x, m.min.x - 0.04, 0.001) && near(sm.max.x, m.max.x + 0.04, 0.001) &&
+        near(sm.min.y, m.min.y - 0.04, 0.001) && near(sm.max.y, m.max.y + 0.04, 0.001));
+    check("drawn before the text", scene.node(t.stroke_node).rendering_order < scene.node(t.node).rendering_order);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    float edge_x = m.min.x - 0.02;
+    int ex = (int)((edge_x + 0.5) * (float)N);
+    int sx = (int)((m.min.x + 0.015 + 0.5) * (float)N);
+    *uint16 pe = px + (32 * N + ex) * 4;
+    *uint16 ps = px + (32 * N + sx) * 4;
+    check("blue just outside the stem", half_to_float(pe[2]) > 0.5 && half_to_float(pe[0]) < 0.5);
+    check("red on the stem", half_to_float(ps[0]) > 0.5 && half_to_float(ps[2]) < 0.5);
+    // a drop shadow keeps the glyph's top left and reaches 0.08 to the right and down
+    os.stroke = SCENE_TEXT_STROKE_DROP_SHADOW;
+    t.set(&scene, &f, "H", os)?;
+    m = &scene.meshes.data[t.mesh];
+    sm = &scene.meshes.data[t.stroke_mesh];
+    check("drop shadow down and right", near(sm.min.x, m.min.x, 0.001) && near(sm.max.x, m.max.x + 0.08, 0.001) &&
+        near(sm.min.y, m.min.y - 0.08, 0.001) && near(sm.max.y, m.max.y, 0.001));
+
+    // extruded: front at 0.01 x 10, back at 0, sides between; the front's area matches the
+    // flat glyph's (holes kept), and no stroke
+    os.stroke = SCENE_TEXT_STROKE_NONE;
+    t.set(&scene, &f, "B", os)?;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    int flat_lit = 0;
+    for (i in 0..N * N) {
+        if (half_to_float(px[i * 4]) > 0.5) flat_lit++;
+    }
+    SceneTextStyle xs = os;
+    xs.extrusion = 10.0;
+    t.set(&scene, &f, "B", xs)?;
+    *SceneMesh fm = &scene.meshes.data[t.mesh];
+    *SceneMesh bm = &scene.meshes.data[t.back_mesh];
+    *SceneMesh dm = &scene.meshes.data[t.side_mesh];
+    check("front at the extrusion depth", near(fm.min.z, 0.1, 1e-5) && near(fm.max.z, 0.1, 1e-5));
+    check("back at 0", near(bm.min.z, 0.0, 1e-5) && near(bm.max.z, 0.0, 1e-5));
+    check("sides span it", near(dm.min.z, 0.0, 1e-5) && near(dm.max.z, 0.1, 1e-5));
+    check("no stroke on extruded text", scene.node(t.stroke_node).mesh == 0);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    int solid_lit = 0;
+    for (i in 0..N * N) {
+        if (half_to_float(px[i * 4]) > 0.5) solid_lit++;
+    }
+    check("the extruded face covers what the flat glyph does", solid_lit > 0 && (float)solid_lit < (float)flat_lit * 1.2 && (float)solid_lit > (float)flat_lit * 0.8);
+    xs.extrusion = 0.0;
+    t.set(&scene, &f, "B", xs)?;
+    check("flat again", scene.node(t.back_node).mesh == 0 && scene.node(t.side_node).mesh == 0 && scene.material(t.material).diffuse_texture == t.texture);
     return Ok<int, string>(0);
 }
 

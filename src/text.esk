@@ -17,7 +17,8 @@
 //
 // The glyphs come from an atlas made for the text's characters, rendered at four times
 // the font size, and the material is unlit (SCENE_CONSTANT) and blended: change it through
-// Scene_material(text.material) like any other.
+// Scene_material(text.material) like any other. style.stroke adds an outline or a drop
+// shadow behind the glyphs, and style.extrusion builds solid glyphs from their outlines.
 
 import <mem>;
 import <list>;
@@ -30,6 +31,7 @@ import <font/text>;
 import <scene>;
 import <scene/geometry>;
 import <scene/material>;
+import <scene/shapes>;
 
 // World units per point of font size (ViroReact's kTextPointToWorldScale).
 const float SCENE_TEXT_POINT = 0.01;
@@ -55,7 +57,10 @@ const int SCENE_TEXT_NO_WRAP = 3;
 // How a text is laid out. size is the font size in points; color is linear RGBA; width and
 // height the box in world units, centered on the node; clip keeps the lines inside the
 // box (and, without wrapping, cuts each line at its width); max_lines caps the line count
-// (0 for no cap).
+// (0 for no cap). stroke (SCENE_TEXT_STROKE_*) draws an outline or a drop shadow of
+// stroke_width points in stroke_color behind the glyphs (ViroText's outerStroke); extrusion
+// gives the text a depth of that many points (ViroText's extrusionDepth), the front facing
+// +Z.
 struct SceneTextStyle {
     float size;
     Vec4 color;
@@ -66,18 +71,30 @@ struct SceneTextStyle {
     int line_break;
     bool clip;
     int max_lines;
+    int stroke;
+    float stroke_width;
+    Vec4 stroke_color;
+    float extrusion;
 }
 
+// The strokes of ViroText's outerStroke: none, an outline around each glyph, or a drop
+// shadow down and to the right.
+const int SCENE_TEXT_STROKE_NONE = 0;
+const int SCENE_TEXT_STROKE_OUTLINE = 1;
+const int SCENE_TEXT_STROKE_DROP_SHADOW = 2;
+
 // ViroText's defaults: 18 points, white, a 1 x 1 box, left and top aligned, word wrap, no
-// clipping, no line cap.
+// clipping, no line cap, no stroke (2 points of white when one is chosen), no extrusion.
 SceneTextStyle scene_text_style() {
     return SceneTextStyle{size: 18.0, color: Vec4{1.0, 1.0, 1.0, 1.0}, width: 1.0, height: 1.0,
-        align: SCENE_TEXT_LEFT, valign: SCENE_TEXT_TOP, line_break: SCENE_TEXT_WORD_WRAP, clip: false, max_lines: 0};
+        align: SCENE_TEXT_LEFT, valign: SCENE_TEXT_TOP, line_break: SCENE_TEXT_WORD_WRAP, clip: false, max_lines: 0,
+        stroke: SCENE_TEXT_STROKE_NONE, stroke_width: 2.0, stroke_color: Vec4{1.0, 1.0, 1.0, 1.0}, extrusion: 0.0};
 }
 
 // A text node: node draws mesh with material, whose diffuse texture is the glyph atlas
 // texture. width and height are the size of the laid-out text (ViroText's realized
-// size), lines its line count.
+// size), lines its line count. The stroke and, for extruded text, the back and the sides
+// are child nodes with materials of their own.
 struct SceneText {
     int node;
     int mesh;
@@ -86,6 +103,16 @@ struct SceneText {
     float width;
     float height;
     int lines;
+    int stroke_node;
+    int stroke_mesh;
+    int stroke_material;
+    int stroke_texture;
+    int back_node;
+    int back_mesh;
+    int back_material;
+    int side_node;
+    int side_mesh;
+    int side_material;
 }
 
 const int _SCENE_TEXT_OVERSAMPLE = 4;
@@ -296,9 +323,15 @@ void scene_text_size(*Font f, string text, SceneTextStyle style, *float width, *
     cps.free();
 }
 
-// Builds text's geometry and atlas into g and atlas; returns the line count and the
-// realized size.
-Result<int, string> _scene_text_build(*Font f, string text, *SceneTextStyle st, *SceneGeometry g, *FontAtlas atlas, *float rw, *float rh) {
+struct _SceneTextPen {
+    uint32 cp;
+    float x;
+    float y;
+}
+
+// Lays text out and returns where each drawn character's pen is (x, and y on the baseline,
+// in world units), the line count and the realized size.
+int _scene_text_pens(*Font f, string text, *SceneTextStyle st, *List<_SceneTextPen> pens, *float rw, *float rh) {
     List<uint32> cps;
     defer cps.free();
     int64 i = 0;
@@ -306,44 +339,12 @@ Result<int, string> _scene_text_build(*Font f, string text, *SceneTextStyle st, 
     _SceneTextLayout l;
     defer _scene_text_free_layout(&l);
     _scene_text_layout(f, &cps, st, &l);
-
-    // the atlas of the characters drawn, each once
-    String chars;
-    defer chars.free();
-    List<uint32> seen;
-    defer seen.free();
-    for (k in 0..l.cps.size) {
-        uint32 c = l.cps.data[k];
-        if (_scene_text_ws(c) || c == 10) continue;
-        bool have = false;
-        for (j in 0..seen.size) {
-            if (seen.data[j] == c) have = true;
-        }
-        if (have) continue;
-        List_push(&seen, c);
-        _scene_utf8_append(&chars, c);
-    }
-    float raster = st.size * (float)_SCENE_TEXT_OVERSAMPLE;
-    *atlas = Font_atlas(f, raster, chars.data == null ? "" : (string)chars.data)?;
-    float k = SCENE_TEXT_POINT / (float)_SCENE_TEXT_OVERSAMPLE;
-
     float lh = l.line_height;
     float total = (float)l.lines.size * lh;
     float y = 0.0;
     if (st.valign == SCENE_TEXT_TOP) y = st.height / 2.0 - lh + l.descender;
     else if (st.valign == SCENE_TEXT_BOTTOM) y = -st.height / 2.0 + total - lh + l.descender;
     else y = total / 2.0 - lh + l.descender;
-
-    int quads = 0;
-    for (n in 0..l.cps.size) {
-        FontAtlasGlyph* e = FontAtlas_find(atlas, l.cps.data[n]);
-        if (e != null && e.width > 0 && e.height > 0) quads++;
-    }
-    *g = scene_geometry((uint32)(quads * 4), (uint32)(quads * 6));
-    float aw = (float)atlas.width;
-    float ah = (float)atlas.height;
-    Vec3 nrm = Vec3{0.0, 0.0, 1.0};
-    int q = 0;
     float realized = 0.0;
     for (li in 0..l.lines.size) {
         _SceneTextLine line = l.lines.data[li];
@@ -356,35 +357,331 @@ Result<int, string> _scene_text_build(*Font f, string text, *SceneTextStyle st, 
         else x = -lw / 2.0;
         for (j in 0..line.count) {
             uint32 c = l.cps.data[line.start + j];
-            FontAtlasGlyph* e = FontAtlas_find(atlas, c);
-            if (e != null && e.width > 0 && e.height > 0) {
-                float x0 = x + (float)e.left * k;
-                float x1 = x0 + (float)e.width * k;
-                float y1 = y - (float)e.top * k;
-                float y0 = y1 - (float)e.height * k;
-                float u0 = (float)e.x / aw;
-                float u1 = (float)(e.x + e.width) / aw;
-                float v0 = (float)e.y / ah;
-                float v1 = (float)(e.y + e.height) / ah;
-                uint32 b = (uint32)(q * 4);
-                g.set(b, Vec3{x0, y0, 0.0}, nrm, Vec2{u0, v1});
-                g.set(b + 1, Vec3{x1, y0, 0.0}, nrm, Vec2{u1, v1});
-                g.set(b + 2, Vec3{x1, y1, 0.0}, nrm, Vec2{u1, v0});
-                g.set(b + 3, Vec3{x0, y1, 0.0}, nrm, Vec2{u0, v0});
-                uint32[6] idx = {b, b + 1, b + 2, b, b + 2, b + 3};
-                for (t in 0..6) g.indices[q * 6 + t] = idx[t];
-                q++;
-            }
+            if (!_scene_text_ws(c) && c != 10) List_push(pens, _SceneTextPen{c, x, y});
             float adv = _scene_text_adv(f, c, st.size);
             if (c == 32) adv = adv * line.spacing;
             x += adv;
         }
         y -= lh;
     }
-    if (quads > 0) g.bounds();
     *rw = realized;
     *rh = total;
-    return Ok<int, string>(l.lines.size);
+    return l.lines.size;
+}
+
+// The atlas of the characters drawn, each once, at four times the font size.
+Result<int, string> _scene_text_atlas(*Font f, *List<_SceneTextPen> pens, float size, *FontAtlas atlas) {
+    String chars;
+    defer chars.free();
+    List<uint32> seen;
+    defer seen.free();
+    for (k in 0..pens.size) {
+        uint32 c = pens.data[k].cp;
+        bool have = false;
+        for (j in 0..seen.size) {
+            if (seen.data[j] == c) have = true;
+        }
+        if (have) continue;
+        List_push(&seen, c);
+        _scene_utf8_append(&chars, c);
+    }
+    *atlas = Font_atlas(f, size * (float)_SCENE_TEXT_OVERSAMPLE, chars.data == null ? "" : (string)chars.data)?;
+    return Ok<int, string>(0);
+}
+
+// One quad per drawn glyph of atlas: grow (world units) widens every side, and shift moves
+// the quad's top left (the stroke placements of ViroReact's buildBitmapChar).
+SceneGeometry _scene_text_quads(*List<_SceneTextPen> pens, *FontAtlas atlas, float grow, Vec2 shift) {
+    float k = SCENE_TEXT_POINT / (float)_SCENE_TEXT_OVERSAMPLE;
+    int quads = 0;
+    for (n in 0..pens.size) {
+        FontAtlasGlyph* e = FontAtlas_find(atlas, pens.data[n].cp);
+        if (e != null && e.width > 0 && e.height > 0) quads++;
+    }
+    SceneGeometry g = scene_geometry((uint32)(quads * 4), (uint32)(quads * 6));
+    float aw = (float)atlas.width;
+    float ah = (float)atlas.height;
+    Vec3 nrm = Vec3{0.0, 0.0, 1.0};
+    int q = 0;
+    for (n in 0..pens.size) {
+        _SceneTextPen p = pens.data[n];
+        FontAtlasGlyph* e = FontAtlas_find(atlas, p.cp);
+        if (e == null || e.width <= 0 || e.height <= 0) continue;
+        float x0 = p.x + (float)e.left * k - grow + shift.x;
+        float x1 = x0 + (float)e.width * k;
+        float y1 = p.y - (float)e.top * k + grow + shift.y;
+        float y0 = y1 - (float)e.height * k;
+        float u0 = (float)e.x / aw;
+        float u1 = (float)(e.x + e.width) / aw;
+        float v0 = (float)e.y / ah;
+        float v1 = (float)(e.y + e.height) / ah;
+        uint32 b = (uint32)(q * 4);
+        g.set(b, Vec3{x0, y0, 0.0}, nrm, Vec2{u0, v1});
+        g.set(b + 1, Vec3{x1, y0, 0.0}, nrm, Vec2{u1, v1});
+        g.set(b + 2, Vec3{x1, y1, 0.0}, nrm, Vec2{u1, v0});
+        g.set(b + 3, Vec3{x0, y1, 0.0}, nrm, Vec2{u0, v0});
+        uint32[6] idx = {b, b + 1, b + 2, b, b + 2, b + 3};
+        for (t in 0..6) g.indices[q * 6 + t] = idx[t];
+        q++;
+    }
+    if (quads > 0) g.bounds();
+    return g;
+}
+
+// The stroke atlas: each glyph of atlas grown by r pixels on every side, its coverage
+// spread over a disc of radius r with an antialiased rim (the outer border ViroReact's
+// FreeType stroker draws), packed in rows.
+FontAtlas _scene_stroke_atlas(*FontAtlas a, int r) {
+    FontAtlas o;
+    o.size = a.size;
+    o.line_height = a.line_height;
+    o.ascent = a.ascent;
+    int width = 0;
+    for (i in 0..a.glyphs.size) {
+        int w = a.glyphs.data[i].width + 2 * r + 2;
+        if (w > width) width = w;
+    }
+    width = width < 256 ? 256 : width;
+    if (width < a.width) width = a.width;
+    // shelves
+    int x = 0;
+    int y = 0;
+    int row = 0;
+    for (i in 0..a.glyphs.size) {
+        FontAtlasGlyph e = a.glyphs.data[i];
+        int w = e.width > 0 ? e.width + 2 * r : 0;
+        int h = e.height > 0 ? e.height + 2 * r : 0;
+        if (x + w + 1 > width) {
+            x = 0;
+            y += row + 1;
+            row = 0;
+        }
+        FontAtlasGlyph s = e;
+        s.x = x;
+        s.y = y;
+        s.width = w;
+        s.height = h;
+        s.left = e.left - r;
+        s.top = e.top - r;
+        List_push(&o.glyphs, s);
+        x += w + 1;
+        if (h > row) row = h;
+    }
+    o.width = width;
+    o.height = y + row + 1;
+    o.pixels = alloc<uint8>((int64)o.width * o.height + 1);
+    // disc weights
+    int d = 2 * r + 1;
+    *float wt = alloc<float>(d * d);
+    defer free(wt);
+    for (dy in 0..d) {
+        for (dx in 0..d) {
+            float fx = (float)(dx - r);
+            float fy = (float)(dy - r);
+            float t = (float)r + 0.5 - (float)sqrt((double)(fx * fx + fy * fy));
+            wt[dy * d + dx] = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+        }
+    }
+    for (i in 0..a.glyphs.size) {
+        FontAtlasGlyph e = a.glyphs.data[i];
+        FontAtlasGlyph s = o.glyphs.data[i];
+        if (s.width <= 0) continue;
+        for (py in 0..s.height) {
+            for (px in 0..s.width) {
+                float best = 0.0;
+                for (dy in 0..d) {
+                    int sy = py - r + dy - r;
+                    if (sy < 0 || sy >= e.height) continue;
+                    for (dx in 0..d) {
+                        float w = wt[dy * d + dx];
+                        if (w <= best / 255.0 && w < 1.0) continue;
+                        int sx = px - r + dx - r;
+                        if (sx < 0 || sx >= e.width) continue;
+                        float c = (float)a.pixels[(int64)(e.y + sy) * a.width + e.x + sx] * w;
+                        if (c > best) best = c;
+                    }
+                }
+                o.pixels[(int64)(s.y + py) * o.width + s.x + px] = (uint8)(best + 0.5);
+            }
+        }
+    }
+    return o;
+}
+
+// --- extruded text ---
+
+struct _SceneTextRing {
+    List<Vec2> pts;
+    float area;
+}
+
+float _scene_ring_area(*List<Vec2> r) {
+    float a = 0.0;
+    for (i in 0..r.size) {
+        Vec2 p = r.data[i];
+        Vec2 q = r.data[(i + 1) % r.size];
+        a += p.x * q.y - q.x * p.y;
+    }
+    return a * 0.5;
+}
+
+bool _scene_ring_inside(*List<Vec2> r, Vec2 p) {
+    bool inside = false;
+    int j = r.size - 1;
+    for (i in 0..r.size) {
+        Vec2 a = r.data[i];
+        Vec2 b = r.data[j];
+        if ((a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+        j = i;
+    }
+    return inside;
+}
+
+// A glyph's outline (font units) as closed rings, each quadratic curve in 4 steps as
+// ViroReact's vectorizer does.
+void _scene_glyph_rings(*Font f, int glyph, *List<_SceneTextRing> rings) {
+    List<FontCurve> curves;
+    defer curves.free();
+    Font_outline(f, glyph, &curves);
+    List<Vec2> cur;
+    float lx = 0.0;
+    float ly = 0.0;
+    for (i in 0..curves.size) {
+        FontCurve c = curves.data[i];
+        bool joined = cur.size > 0 && c.x0 == lx && c.y0 == ly;
+        if (!joined) {
+            if (cur.size >= 3) List_push(rings, _SceneTextRing{cur, 0.0});
+            else cur.free();
+            List<Vec2> fresh;
+            cur = fresh;
+            List_push(&cur, Vec2{c.x0, c.y0});
+        }
+        bool line = (c.cx == c.x0 && c.cy == c.y0) || (c.cx == c.x1 && c.cy == c.y1);
+        int steps = line ? 1 : 4;
+        for (s in 1..steps + 1) {
+            float t = (float)s / (float)steps;
+            float u = 1.0 - t;
+            List_push(&cur, Vec2{u * u * c.x0 + 2.0 * u * t * c.cx + t * t * c.x1, u * u * c.y0 + 2.0 * u * t * c.cy + t * t * c.y1});
+        }
+        lx = c.x1;
+        ly = c.y1;
+    }
+    if (cur.size >= 3) List_push(rings, _SceneTextRing{cur, 0.0});
+    else cur.free();
+    // a ring closed onto its start keeps one copy of that point
+    for (i in 0..rings.size) {
+        *_SceneTextRing r = &rings.data[i];
+        if (r.pts.size > 1) {
+            Vec2 a = r.pts.data[0];
+            Vec2 b = r.pts.data[r.pts.size - 1];
+            if (a.x == b.x && a.y == b.y) r.pts.size--;
+        }
+        r.area = _scene_ring_area(&r.pts);
+    }
+}
+
+struct _SceneExtrude {
+    List<float> front;
+    List<uint32> front_idx;
+    List<float> side;
+    List<uint32> side_idx;
+}
+
+void _scene_push_vertex(*List<float> v, Vec3 p, Vec3 n) {
+    List_push(v, p.x);
+    List_push(v, p.y);
+    List_push(v, p.z);
+    List_push(v, n.x);
+    List_push(v, n.y);
+    List_push(v, n.z);
+}
+
+// One extruded glyph at pen (x, y): its faces from the outer rings (TrueType winds them the
+// other way from their holes) with the holes inside each, and a side band along every
+// ring, from z 0 (the back) to depth (the front), as ViroReact's VROGlyph builds them.
+void _scene_extrude_glyph(*Font f, uint32 cp, float x, float y, float scale, float depth, *_SceneExtrude out) {
+    List<_SceneTextRing> rings;
+    _scene_glyph_rings(f, Font_glyph(f, cp), &rings);
+    // the biggest ring is an outer one: its sign marks the outer rings
+    float big = 0.0;
+    float sign = -1.0;
+    for (i in 0..rings.size) {
+        float a = rings.data[i].area < 0.0 ? -rings.data[i].area : rings.data[i].area;
+        if (a > big) {
+            big = a;
+            sign = rings.data[i].area < 0.0 ? -1.0 : 1.0;
+        }
+    }
+    for (i in 0..rings.size) {
+        *_SceneTextRing r = &rings.data[i];
+        bool outer = r.area * sign > 0.0;
+        // the filled side is to the left of travel for a counterclockwise outer ring or a
+        // clockwise hole; the side's normal points the other way
+        bool fill_left = outer ? r.area > 0.0 : r.area < 0.0;
+        for (k in 0..r.pts.size) {
+            Vec2 a = r.pts.data[k];
+            Vec2 b = r.pts.data[(k + 1) % r.pts.size];
+            Vec2 e = Vec2{b.x - a.x, b.y - a.y};
+            float len = (float)sqrt((double)(e.x * e.x + e.y * e.y));
+            if (len <= 0.0) continue;
+            Vec3 n = fill_left ? Vec3{e.y / len, -e.x / len, 0.0} : Vec3{-e.y / len, e.x / len, 0.0};
+            uint32 base = (uint32)(out.side.size / 6);
+            Vec3 pa = Vec3{x + a.x * scale, y + a.y * scale, 0.0};
+            Vec3 pb = Vec3{x + b.x * scale, y + b.y * scale, 0.0};
+            _scene_push_vertex(&out.side, pa, n);
+            _scene_push_vertex(&out.side, pb, n);
+            _scene_push_vertex(&out.side, Vec3{pb.x, pb.y, depth}, n);
+            _scene_push_vertex(&out.side, Vec3{pa.x, pa.y, depth}, n);
+            uint32[6] q = {base, base + 1, base + 2, base, base + 2, base + 3};
+            for (t in 0..6) List_push(&out.side_idx, q[t]);
+        }
+        if (!outer) continue;
+        List<Vec2> path;
+        for (k in 0..r.pts.size) List_push(&path, Vec2{x + r.pts.data[k].x * scale, y + r.pts.data[k].y * scale});
+        List<List<Vec2>> holes;
+        for (h in 0..rings.size) {
+            *_SceneTextRing hr = &rings.data[h];
+            if (hr.area * sign > 0.0 || hr.pts.size == 0) continue;
+            if (!_scene_ring_inside(&r.pts, hr.pts.data[0])) continue;
+            List<Vec2> hp;
+            for (k in 0..hr.pts.size) List_push(&hp, Vec2{x + hr.pts.data[k].x * scale, y + hr.pts.data[k].y * scale});
+            List_push(&holes, hp);
+        }
+        SceneGeometry face = scene_polygon(&path, &holes, Vec4{0.0, 0.0, 1.0, 1.0});
+        uint32 base = (uint32)(out.front.size / 6);
+        for (v in 0..face.vertex_count) {
+            *float fv = face.vertices + (int64)v * SCENE_VERTEX_FLOATS;
+            _scene_push_vertex(&out.front, Vec3{fv[0], fv[1], 0.0}, Vec3{0.0, 0.0, 1.0});
+        }
+        for (t in 0..face.index_count) List_push(&out.front_idx, base + face.indices[t]);
+        face.free();
+        path.free();
+        for (h in 0..holes.size) holes.data[h].free();
+        holes.free();
+    }
+    for (i in 0..rings.size) rings.data[i].pts.free();
+    rings.free();
+}
+
+SceneGeometry _scene_geometry_from(*List<float> v, *List<uint32> idx, float z, bool flip, bool back) {
+    uint32 n = (uint32)(v.size / 6);
+    SceneGeometry g = scene_geometry(n, (uint32)idx.size);
+    for (i in 0..n) {
+        *float p = v.data + (int64)i * 6;
+        Vec3 nrm = Vec3{p[3], p[4], p[5]};
+        if (back) nrm = Vec3{0.0, 0.0, -1.0};
+        g.set(i, Vec3{p[0], p[1], back || flip ? p[2] : z}, nrm, Vec2{0.0, 0.0});
+    }
+    for (t in 0..idx.size / 3) {
+        uint32 a = idx.data[t * 3];
+        uint32 b = idx.data[t * 3 + 1];
+        uint32 c = idx.data[t * 3 + 2];
+        g.indices[t * 3] = a;
+        g.indices[t * 3 + 1] = back ? c : b;
+        g.indices[t * 3 + 2] = back ? b : c;
+    }
+    if (n > 0) g.bounds();
+    return g;
 }
 
 void _scene_utf8_append(*String s, uint32 c) {
@@ -405,6 +702,7 @@ void _scene_utf8_append(*String s, uint32 c) {
     }
 }
 
+
 Result<GpuTexture, string> _scene_atlas_texture(*Scene self, *FontAtlas atlas) {
     int64 n = (int64)atlas.width * atlas.height;
     *uint8 rgba = alloc<uint8>(n * 4 + 4);
@@ -419,6 +717,14 @@ Result<GpuTexture, string> _scene_atlas_texture(*Scene self, *FontAtlas atlas) {
     return self.gpu.image_with(atlas.width, atlas.height, rgba, &o);
 }
 
+int _scene_text_part(*Scene self, int parent, Vec4 color) {
+    int node = Scene_add_node(self, parent, null);
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = color;
+    Scene_node(self, node).material = Scene_add_material(self, m);
+    return node;
+}
+
 // Adds a node under parent drawing text (UTF-8, '\n' breaks lines) in font f with style,
 // and returns it. The font is read now and not kept.
 Result<SceneText, string> Scene_add_text(*Scene self, int parent, *Font f, string text, SceneTextStyle style) {
@@ -429,40 +735,123 @@ Result<SceneText, string> Scene_add_text(*Scene self, int parent, *Font f, strin
     m.alpha_mode = SCENE_ALPHA_BLEND;
     t.material = Scene_add_material(self, m);
     Scene_node(self, t.node).material = t.material;
+    t.stroke_node = _scene_text_part(self, t.node, style.stroke_color);
+    t.stroke_material = Scene_node(self, t.stroke_node).material;
+    *SceneMaterial sm = Scene_material(self, t.stroke_material);
+    sm.alpha_mode = SCENE_ALPHA_BLEND;
+    sm.skip_depth_write = true;
+    t.back_node = _scene_text_part(self, t.node, style.color);
+    t.back_material = Scene_node(self, t.back_node).material;
+    t.side_node = _scene_text_part(self, t.node, style.color);
+    t.side_material = Scene_node(self, t.side_node).material;
     SceneText_set(&t, self, f, text, style)?;
     return Ok<SceneText, string>(t);
 }
 
-// Lays text out again with style and rebuilds the node's mesh and atlas; the color of
-// style is the material's diffuse color from now on.
+// Puts g in mesh *mesh (made on first use) and shows it on node, or hides node when g is
+// empty.
+Result<int, string> _scene_text_mesh(*Scene scene, int node, *int mesh, *SceneGeometry g) {
+    if (g.index_count == 0) {
+        Scene_node(scene, node).mesh = 0;
+        return Ok<int, string>(0);
+    }
+    if (*mesh > 0) {
+        if (!Scene_set_geometry(scene, *mesh, g)) return Err<int, string>("scene: text upload failed");
+    } else {
+        *mesh = Scene_add_geometry(scene, g)?;
+    }
+    Scene_node(scene, node).mesh = *mesh;
+    return Ok<int, string>(0);
+}
+
+Result<int, string> _scene_text_texture(*Scene scene, *FontAtlas atlas, *int texture) {
+    GpuTexture tex = _scene_atlas_texture(scene, atlas)?;
+    if (*texture > 0) Scene_set_texture(scene, *texture, tex);
+    else *texture = Scene_add_texture(scene, tex);
+    return Ok<int, string>(0);
+}
+
+// Lays text out again with style and rebuilds the node's meshes and atlases; the colors of
+// style are the materials' diffuse colors from now on. With extrusion the front, back and
+// sides are meshes of their own (node, back_node, side_node) with their own materials, and
+// no stroke is drawn, as in ViroReact.
 Result<int, string> SceneText_set(*SceneText self, *Scene scene, *Font f, string text, SceneTextStyle style) {
-    SceneGeometry g;
-    FontAtlas atlas;
+    List<_SceneTextPen> pens;
+    defer pens.free();
     float rw = 0.0;
     float rh = 0.0;
-    int lines = _scene_text_build(f, text, &style, &g, &atlas, &rw, &rh)?;
-    defer atlas.free();
-    defer g.free();
-    Scene_material(scene, self.material).diffuse = style.color;
+    int lines = _scene_text_pens(f, text, &style, &pens, &rw, &rh);
     self.width = rw;
     self.height = rh;
     self.lines = lines;
-    if (g.index_count == 0) {
-        Scene_node(scene, self.node).mesh = 0;
+    *SceneMaterial m = Scene_material(scene, self.material);
+    m.diffuse = style.color;
+    Scene_material(scene, self.back_material).diffuse = style.color;
+    Scene_material(scene, self.side_material).diffuse = style.color;
+    Scene_material(scene, self.stroke_material).diffuse = style.stroke_color;
+    SceneGeometry none;
+    if (style.extrusion > 0.0001) {
+        // ViroReact: the front at z = 0.01 x extrusion, the back at 0, no culling
+        float depth = style.extrusion * SCENE_TEXT_POINT;
+        float scale = Font_scale(f, style.size) * SCENE_TEXT_POINT;
+        _SceneExtrude ex;
+        for (i in 0..pens.size) _scene_extrude_glyph(f, pens.data[i].cp, pens.data[i].x, pens.data[i].y, scale, depth, &ex);
+        SceneGeometry front = _scene_geometry_from(&ex.front, &ex.front_idx, depth, false, false);
+        SceneGeometry back = _scene_geometry_from(&ex.front, &ex.front_idx, 0.0, false, true);
+        SceneGeometry side = _scene_geometry_from(&ex.side, &ex.side_idx, 0.0, true, false);
+        ex.front.free();
+        ex.front_idx.free();
+        ex.side.free();
+        ex.side_idx.free();
+        Result<int, string> r1 = _scene_text_mesh(scene, self.node, &self.mesh, &front);
+        Result<int, string> r2 = _scene_text_mesh(scene, self.back_node, &self.back_mesh, &back);
+        Result<int, string> r3 = _scene_text_mesh(scene, self.side_node, &self.side_mesh, &side);
+        front.free();
+        back.free();
+        side.free();
+        r1?;
+        r2?;
+        r3?;
+        m.diffuse_texture = 0;
+        m.alpha_mode = style.color.w < 1.0 ? SCENE_ALPHA_BLEND : SCENE_ALPHA_OPAQUE;
+        m.double_sided = true;
+        Scene_material(scene, self.back_material).double_sided = true;
+        Scene_material(scene, self.side_material).double_sided = true;
+        _scene_text_mesh(scene, self.stroke_node, &self.stroke_mesh, &none)?;
         return Ok<int, string>(lines);
     }
-    GpuTexture tex = _scene_atlas_texture(scene, &atlas)?;
-    if (self.texture > 0) {
-        Scene_set_texture(scene, self.texture, tex);
-    } else {
-        self.texture = Scene_add_texture(scene, tex);
-        Scene_material(scene, self.material).diffuse_texture = self.texture;
+    _scene_text_mesh(scene, self.back_node, &self.back_mesh, &none)?;
+    _scene_text_mesh(scene, self.side_node, &self.side_mesh, &none)?;
+    m.alpha_mode = SCENE_ALPHA_BLEND;
+    m.double_sided = false;
+    FontAtlas atlas;
+    _scene_text_atlas(f, &pens, style.size, &atlas)?;
+    defer atlas.free();
+    SceneGeometry g = _scene_text_quads(&pens, &atlas, 0.0, Vec2{0.0, 0.0});
+    defer g.free();
+    if (g.index_count > 0) {
+        _scene_text_texture(scene, &atlas, &self.texture)?;
+        m.diffuse_texture = self.texture;
     }
-    if (self.mesh > 0) {
-        if (!Scene_set_geometry(scene, self.mesh, &g)) return Err<int, string>("scene: text upload failed");
+    _scene_text_mesh(scene, self.node, &self.mesh, &g)?;
+    // the stroke: drawn just before the text, writing no depth (ViroReact's rendering order
+    // 0 against the text's 1)
+    if (style.stroke != SCENE_TEXT_STROKE_NONE && style.stroke_width > 0.0 && g.index_count > 0) {
+        int r = (int)(style.stroke_width * (float)_SCENE_TEXT_OVERSAMPLE + 0.5);
+        FontAtlas sa = _scene_stroke_atlas(&atlas, r);
+        defer sa.free();
+        float w = (float)r * SCENE_TEXT_POINT / (float)_SCENE_TEXT_OVERSAMPLE;
+        // an outline is centered on its glyph; a drop shadow keeps the glyph's top left, so
+        // it falls w to the right and down
+        SceneGeometry sg = style.stroke == SCENE_TEXT_STROKE_OUTLINE ? _scene_text_quads(&pens, &sa, 0.0, Vec2{0.0, 0.0})
+            : _scene_text_quads(&pens, &sa, 0.0, Vec2{w, -w});
+        defer sg.free();
+        _scene_text_texture(scene, &sa, &self.stroke_texture)?;
+        Scene_material(scene, self.stroke_material).diffuse_texture = self.stroke_texture;
+        _scene_text_mesh(scene, self.stroke_node, &self.stroke_mesh, &sg)?;
+        Scene_node(scene, self.stroke_node).rendering_order = Scene_node(scene, self.node).rendering_order - 1;
     } else {
-        self.mesh = Scene_add_geometry(scene, &g)?;
+        _scene_text_mesh(scene, self.stroke_node, &self.stroke_mesh, &none)?;
     }
-    Scene_node(scene, self.node).mesh = self.mesh;
     return Ok<int, string>(lines);
 }

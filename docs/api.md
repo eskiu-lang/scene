@@ -2896,7 +2896,8 @@ label.set(&scene, &f, "Bye", st)?;
 
 The glyphs come from an atlas made for the text's characters, rendered at four times
 the font size, and the material is unlit (SCENE_CONSTANT) and blended: change it through
-Scene_material(text.material) like any other.
+Scene_material(text.material) like any other. style.stroke adds an outline or a drop
+shadow behind the glyphs, and style.extrusion builds solid glyphs from their outlines.
 
 ### SCENE_TEXT_POINT
 
@@ -2952,13 +2953,31 @@ struct SceneTextStyle {
     int line_break;
     bool clip;
     int max_lines;
+    int stroke;
+    float stroke_width;
+    Vec4 stroke_color;
+    float extrusion;
 }
 ```
 
 How a text is laid out. size is the font size in points; color is linear RGBA; width and
 height the box in world units, centered on the node; clip keeps the lines inside the
 box (and, without wrapping, cuts each line at its width); max_lines caps the line count
-(0 for no cap).
+(0 for no cap). stroke (SCENE_TEXT_STROKE_*) draws an outline or a drop shadow of
+stroke_width points in stroke_color behind the glyphs (ViroText's outerStroke); extrusion
+gives the text a depth of that many points (ViroText's extrusionDepth), the front facing
++Z.
+
+### SCENE_TEXT_STROKE_NONE, SCENE_TEXT_STROKE_OUTLINE, SCENE_TEXT_STROKE_DROP_SHADOW
+
+```eskiu
+const int SCENE_TEXT_STROKE_NONE = 0;
+const int SCENE_TEXT_STROKE_OUTLINE = 1;
+const int SCENE_TEXT_STROKE_DROP_SHADOW = 2;
+```
+
+The strokes of ViroText's outerStroke: none, an outline around each glyph, or a drop
+shadow down and to the right.
 
 ### scene_text_style
 
@@ -2967,7 +2986,7 @@ SceneTextStyle scene_text_style()
 ```
 
 ViroText's defaults: 18 points, white, a 1 x 1 box, left and top aligned, word wrap, no
-clipping, no line cap.
+clipping, no line cap, no stroke (2 points of white when one is chosen), no extrusion.
 
 ### SceneText
 
@@ -2980,12 +2999,23 @@ struct SceneText {
     float width;
     float height;
     int lines;
+    int stroke_node;
+    int stroke_mesh;
+    int stroke_material;
+    int stroke_texture;
+    int back_node;
+    int back_mesh;
+    int back_material;
+    int side_node;
+    int side_mesh;
+    int side_material;
 }
 ```
 
 A text node: node draws mesh with material, whose diffuse texture is the glyph atlas
 texture. width and height are the size of the laid-out text (ViroText's realized
-size), lines its line count.
+size), lines its line count. The stroke and, for extruded text, the back and the sides
+are child nodes with materials of their own.
 
 ### scene_text_size
 
@@ -3011,5 +3041,7 @@ and returns it. The font is read now and not kept.
 Result<int, string> SceneText_set(*SceneText self, *Scene scene, *Font f, string text, SceneTextStyle style)
 ```
 
-Lays text out again with style and rebuilds the node's mesh and atlas; the color of
-style is the material's diffuse color from now on.
+Lays text out again with style and rebuilds the node's meshes and atlases; the colors of
+style are the materials' diffuse colors from now on. With extrusion the front, back and
+sides are meshes of their own (node, back_node, side_node) with their own materials, and
+no stroke is drawn, as in ViroReact.

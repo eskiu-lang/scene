@@ -55,7 +55,9 @@ All notable changes to this package are documented here. The format follows
 - `<scene/text>`: `Scene_add_text` and `SceneText_set` draw TrueType text (eskiu-lang/font,
   now a dependency) from a glyph atlas, laid out as ViroText: points at 0.01 world units, a
   box, word, character or no wrapping, justification, alignment, clipping, a line cap,
-  `scene_text_size`. `docs/text.md`.
+  `scene_text_size`; ViroText's outer strokes (`SCENE_TEXT_STROKE_OUTLINE` and
+  `_DROP_SHADOW`, `stroke_width`, `stroke_color`) and extrusion (`extrusion`: front, back and
+  side meshes with their own materials). `docs/text.md`.
 - 360 skies: `Scene_load_sky_360` and `Scene_set_sky_360` draw an equirectangular image
   behind the scene (ViroReact's `Viro360Image`), and `Scene.sky_rotation` turns any sky.
 - Texture sampling per material: `SceneMaterial.wrap_s`, `wrap_t` (repeat, clamp, mirror),
