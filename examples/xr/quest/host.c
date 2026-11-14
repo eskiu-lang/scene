@@ -3,11 +3,20 @@
 // gives), one swapchain per eye, and ../xr_scene.esk drawing each eye into its swapchain
 // image through wgpu (wgpuDeviceCreateTextureFromVulkan, eskiu-lang/wgpu-native's eskiu
 // branch). A NativeActivity: android_main is the app's thread.
+#include <android/asset_manager.h>
 #include <android/log.h>
+#include <fcntl.h>
+#include <media/NdkImageReader.h>
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaExtractor.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <android_native_app_glue.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <vulkan/vulkan.h>
@@ -30,6 +39,9 @@ int xr_scene_vulkan(void **instance, void **physical_device, void **device, uint
 void xr_scene_pointer(float ox, float oy, float oz, float dx, float dy, float dz, bool down, bool active);
 void xr_scene_hand(int h, bool tracked, float px, float py, float pz, float qx, float qy, float qz, float qw, float length);
 float xr_scene_ray_length(float ox, float oy, float oz, float dx, float dy, float dz);
+void xr_scene_set_assets(const char *dir);
+int xr_scene_current(void);
+void xr_scene_video_frame(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t stride, bool bgra);
 // wgpu-native's eskiu branch: Vulkan device extensions besides wgpu's own
 void wgpuSetVulkanDeviceExtensions(char const *const *names, size_t count);
 
@@ -72,6 +84,153 @@ static void pose_matrix(XrPosef p, float *m) {
     m[4] = 2 * (x * y - z * w);     m[5] = 1 - 2 * (x * x + z * z); m[6] = 2 * (y * z + x * w);     m[7] = 0;
     m[8] = 2 * (x * z + y * w);     m[9] = 2 * (y * z - x * w);     m[10] = 1 - 2 * (x * x + y * y); m[11] = 0;
     m[12] = p.position.x; m[13] = p.position.y; m[14] = p.position.z; m[15] = 1;
+}
+
+// The showcase's files travel in the APK's assets; the scene reads files, so they are copied
+// to the app's files directory once (again when a size changes).
+static void xr_copy_assets(struct android_app *app, char *dir, size_t cap) {
+    snprintf(dir, cap, "%s/assets", app->activity->internalDataPath);
+    mkdir(app->activity->internalDataPath, 0700);
+    mkdir(dir, 0700);
+    AAssetManager *mgr = app->activity->assetManager;
+    AAssetDir *ad = AAssetManager_openDir(mgr, "");
+    const char *name;
+    while ((name = AAssetDir_getNextFileName(ad)) != NULL) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s", dir, name);
+        AAsset *a = AAssetManager_open(mgr, name, AASSET_MODE_STREAMING);
+        if (a == NULL) continue;
+        off_t size = AAsset_getLength(a);
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size == size) {
+            AAsset_close(a);
+            continue;
+        }
+        FILE *f = fopen(path, "wb");
+        char buf[65536];
+        int n;
+        while (f && (n = AAsset_read(a, buf, sizeof buf)) > 0) fwrite(buf, 1, (size_t)n, f);
+        if (f) fclose(f);
+        AAsset_close(a);
+    }
+    AAssetDir_close(ad);
+}
+
+// xr_scene.esk's video scene
+#define XR_VIDEO_SCENE 4
+
+// The video scene's player: video.mp4 decoded by MediaCodec into an ImageReader as RGBA,
+// looping, on a thread of its own that runs only while the video scene is shown; the frame
+// loop hands the latest image to the scene.
+static AImageReader *xr_vreader;
+static AMediaCodec *xr_vcodec;
+static AMediaExtractor *xr_vext;
+
+static double xr_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+static void *xr_video_thread(void *arg) {
+    (void)arg;
+    double start = xr_now(), paused_at = 0;
+    bool input_done = false;
+    for (;;) {
+        if (xr_scene_current() != XR_VIDEO_SCENE) {
+            if (paused_at == 0) paused_at = xr_now();
+            usleep(50000);
+            continue;
+        }
+        if (paused_at != 0) {
+            start += xr_now() - paused_at;
+            paused_at = 0;
+        }
+        if (!input_done) {
+            ssize_t in = AMediaCodec_dequeueInputBuffer(xr_vcodec, 2000);
+            if (in >= 0) {
+                size_t cap;
+                uint8_t *buf = AMediaCodec_getInputBuffer(xr_vcodec, (size_t)in, &cap);
+                ssize_t n = AMediaExtractor_readSampleData(xr_vext, buf, cap);
+                if (n < 0) {
+                    AMediaCodec_queueInputBuffer(xr_vcodec, (size_t)in, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+                    input_done = true;
+                } else {
+                    AMediaCodec_queueInputBuffer(xr_vcodec, (size_t)in, 0, (size_t)n, (uint64_t)AMediaExtractor_getSampleTime(xr_vext), 0);
+                    AMediaExtractor_advance(xr_vext);
+                }
+            }
+        }
+        AMediaCodecBufferInfo info;
+        ssize_t out = AMediaCodec_dequeueOutputBuffer(xr_vcodec, &info, 2000);
+        if (out >= 0) {
+            double due = start + (double)info.presentationTimeUs * 1e-6;
+            double wait = due - xr_now();
+            if (wait > 0 && wait < 1.0) usleep((useconds_t)(wait * 1e6));
+            AMediaCodec_releaseOutputBuffer(xr_vcodec, (size_t)out, info.size > 0);
+            if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
+                // loop
+                AMediaCodec_flush(xr_vcodec);
+                AMediaExtractor_seekTo(xr_vext, 0, AMEDIAEXTRACTOR_SEEK_CLOSEST_SYNC);
+                input_done = false;
+                start = xr_now();
+            }
+        }
+    }
+    return NULL;
+}
+
+static void xr_video_start(const char *dir) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/video.mp4", dir);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    struct stat st;
+    fstat(fd, &st);
+    xr_vext = AMediaExtractor_new();
+    if (AMediaExtractor_setDataSourceFd(xr_vext, fd, 0, st.st_size) != AMEDIA_OK) return;
+    for (size_t i = 0; i < AMediaExtractor_getTrackCount(xr_vext); i++) {
+        AMediaFormat *fmt = AMediaExtractor_getTrackFormat(xr_vext, i);
+        const char *mime = NULL;
+        AMediaFormat_getString(fmt, AMEDIAFORMAT_KEY_MIME, &mime);
+        if (mime == NULL || strncmp(mime, "video/", 6) != 0) {
+            AMediaFormat_delete(fmt);
+            continue;
+        }
+        int32_t w = 0, h = 0;
+        AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, &w);
+        AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, &h);
+        AMediaExtractor_selectTrack(xr_vext, i);
+        if (AImageReader_new(w, h, AIMAGE_FORMAT_RGBA_8888, 3, &xr_vreader) != AMEDIA_OK) return;
+        ANativeWindow *win = NULL;
+        AImageReader_getWindow(xr_vreader, &win);
+        xr_vcodec = AMediaCodec_createDecoderByType(mime);
+        if (xr_vcodec == NULL || AMediaCodec_configure(xr_vcodec, fmt, win, NULL, 0) != AMEDIA_OK
+                || AMediaCodec_start(xr_vcodec) != AMEDIA_OK) {
+            LOG("video: no decoder for %s", mime);
+            return;
+        }
+        AMediaFormat_delete(fmt);
+        pthread_t t;
+        pthread_create(&t, NULL, xr_video_thread, NULL);
+        LOG("video: %s %dx%d", mime, w, h);
+        return;
+    }
+}
+
+static void xr_video_frame(void) {
+    if (xr_vreader == NULL || xr_scene_current() != XR_VIDEO_SCENE) return;
+    AImage *img = NULL;
+    if (AImageReader_acquireLatestImage(xr_vreader, &img) != AMEDIA_OK || img == NULL) return;
+    uint8_t *data = NULL;
+    int len = 0, stride = 0;
+    int32_t w = 0, h = 0;
+    AImage_getPlaneData(img, 0, &data, &len);
+    AImage_getPlaneRowStride(img, 0, &stride);
+    AImage_getWidth(img, &w);
+    AImage_getHeight(img, &h);
+    if (data) xr_scene_video_frame(data, (uint32_t)w, (uint32_t)h, (uint32_t)stride, false);
+    AImage_delete(img);
 }
 
 static XrPath path(Xr *xr, const char *s) {
@@ -253,6 +412,9 @@ static bool xr_start(Xr *xr, struct android_app *app) {
         wgpuSetVulkanDeviceExtensions(names, count);
     }
 
+    static char assets[512];
+    xr_copy_assets(app, assets, sizeof assets);
+    xr_scene_set_assets(assets);
     if (xr_scene_open() != 0) {
         LOG("the scene did not open");
         return false;
@@ -317,6 +479,7 @@ static bool xr_start(Xr *xr, struct android_app *app) {
         }
     }
     if (!xr_actions(xr)) LOG("no controller actions");
+    xr_video_start(assets);
     LOG("session ready: %ux%u per eye, %u images (first %p), depth layer %d", xr->eyes[0].width, xr->eyes[0].height,
         xr->eyes[0].count, (void *)xr->eyes[0].images[0].image, (int)xr->depth_layer);
     return true;
@@ -346,6 +509,7 @@ static void xr_frame(Xr *xr, float dt) {
     if (XR_FAILED(xrWaitFrame(xr->session, NULL, &fs))) return;
     xrBeginFrame(xr->session, NULL);
     xr_input(xr, fs.predictedDisplayTime);
+    xr_video_frame();
     xr_scene_step(dt);
     XrCompositionLayerProjectionView pv[2];
     XrCompositionLayerDepthInfoKHR depth_info[2];

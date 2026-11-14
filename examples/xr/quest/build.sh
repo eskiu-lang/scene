@@ -36,10 +36,12 @@ loader=$(find "$OPENXR_DIR" -path "*arm64-v8a/libopenxr_loader.so" | head -1)
 "$cc" -O2 -fPIC -I"$glue" -I"$inc" -c "$here/host.c" -o "$out/host.o"
 "$cc" -O2 -fPIC -I"$glue" -c "$glue/android_native_app_glue.c" -o "$out/glue.o"
 "$cc" -shared -o "$out/apk/lib/arm64-v8a/libeskiuxr.so" "$out/host.o" "$out/glue.o" "$out/xr_scene.o" \
-    "$WGPU_LIB" "$loader" -landroid -llog -lm -ldl \
+    "$WGPU_LIB" "$loader" -landroid -llog -lm -ldl -lmediandk \
     -Wl,-u,ANativeActivity_onCreate -Wl,-z,max-page-size=16384
 cp "$loader" "$out/apk/lib/arm64-v8a/"
-"$BT/aapt2" link -o "$out/unsigned.apk" --manifest "$here/AndroidManifest.xml" -I "$PLATFORM/android.jar"
+# the showcase's files go in the APK's assets
+"$here/../assets.sh" "$out/assets" >/dev/null
+"$BT/aapt2" link -o "$out/unsigned.apk" --manifest "$here/AndroidManifest.xml" -I "$PLATFORM/android.jar" -A "$out/assets"
 (cd "$out/apk" && zip -qr "$out/unsigned.apk" lib)
 "$BT/zipalign" -f -p 16 "$out/unsigned.apk" "$out/aligned.apk"
 ks=$out/debug.keystore

@@ -7,6 +7,8 @@
 	objects = {
 		A10000000000000000000001 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* App.swift */; };
 		A10000000000000000000002 /* host.m in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* host.m */; };
+		A10000000000000000000003 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* assets */; };
+		A20000000000000000000006 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = build/assets; name = assets; sourceTree = "<group>"; };
 		A20000000000000000000001 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* host.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = host.m; sourceTree = "<group>"; };
 		A20000000000000000000003 /* bridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bridge.h; sourceTree = "<group>"; };
@@ -14,8 +16,8 @@
 		A20000000000000000000005 /* EskiuXR.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EskiuXR.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A30000000000000000000001 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, ); runOnlyForDeploymentPostprocessing = 0; };
 		A30000000000000000000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ( ); runOnlyForDeploymentPostprocessing = 0; };
-		A30000000000000000000003 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ( ); runOnlyForDeploymentPostprocessing = 0; };
-		A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003, A20000000000000000000004, A40000000000000000000002, ); sourceTree = "<group>"; };
+		A30000000000000000000003 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000003, ); runOnlyForDeploymentPostprocessing = 0; };
+		A40000000000000000000001 = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003, A20000000000000000000004, A20000000000000000000006, A40000000000000000000002, ); sourceTree = "<group>"; };
 		A40000000000000000000002 /* Products */ = {isa = PBXGroup; children = (A20000000000000000000005, ); name = Products; sourceTree = "<group>"; };
 		A50000000000000000000001 /* EskiuXR */ = {
 			isa = PBXNativeTarget;
@@ -53,7 +55,7 @@
 			INFOPLIST_FILE = XcodeInfo.plist;
 			CODE_SIGN_STYLE = Automatic;
 			SWIFT_OBJC_BRIDGING_HEADER = bridge.h;
-			OTHER_LDFLAGS = ("$(PROJECT_DIR)/build/xr_scene.o", "$(ESKIU_WGPU_LIB)", "-framework", Metal, "-framework", QuartzCore, "-framework", CompositorServices, "-framework", ARKit, "-lc++", );
+			OTHER_LDFLAGS = ("$(PROJECT_DIR)/build/xr_scene.o", "$(ESKIU_WGPU_LIB)", "-framework", Metal, "-framework", QuartzCore, "-framework", CompositorServices, "-framework", ARKit, "-framework", AVFoundation, "-framework", CoreMedia, "-framework", CoreVideo, "-lc++", );
 			ESKIU_WGPU_LIB = "$(PROJECT_DIR)/../../../../wgpu-native-eskiu/eskiu/out/aarch64-apple-visionos/libwgpu_native.a";
 			DEAD_CODE_STRIPPING = NO;
 		}; name = Release; };

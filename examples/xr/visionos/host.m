@@ -5,6 +5,7 @@
 #import <CompositorServices/CompositorServices.h>
 #import <ARKit/ARKit.h>
 #import <Metal/Metal.h>
+#import <AVFoundation/AVFoundation.h>
 #include <simd/simd.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -22,6 +23,48 @@ int xr_scene_render(uint64_t image, uint32_t width, uint32_t height, int format,
 #define WGPU_DEPTH32FLOAT 0x30
 void xr_scene_wait(void);
 void xr_scene_pointer(float ox, float oy, float oz, float dx, float dy, float dz, bool down, bool active);
+void xr_scene_set_assets(const char *dir);
+int xr_scene_current(void);
+void xr_scene_video_frame(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t stride, bool bgra);
+
+// xr_scene.esk's video scene
+#define XR_VIDEO_SCENE 4
+
+// The video scene's player: video.mp4 from the assets, looping, playing only while its scene
+// is shown; each new frame goes to the scene as BGRA.
+static AVPlayer *xr_player;
+static AVPlayerItemVideoOutput *xr_video_output;
+
+static void xr_video_start(NSString *assets) {
+    NSURL *url = [NSURL fileURLWithPath:[assets stringByAppendingPathComponent:@"video.mp4"]];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:url.path]) return;
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
+    xr_video_output = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:@{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)}];
+    [item addOutput:xr_video_output];
+    xr_player = [AVPlayer playerWithPlayerItem:item];
+    xr_player.muted = YES;
+    xr_player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+    [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification object:item
+        queue:nil usingBlock:^(NSNotification *note) { [xr_player seekToTime:kCMTimeZero]; }];
+}
+
+static void xr_video_step(void) {
+    if (xr_player == nil) return;
+    bool shown = xr_scene_current() == XR_VIDEO_SCENE;
+    if (shown && xr_player.rate == 0) [xr_player play];
+    if (!shown && xr_player.rate != 0) [xr_player pause];
+    if (!shown) return;
+    CMTime t = [xr_video_output itemTimeForHostTime:CACurrentMediaTime()];
+    if (![xr_video_output hasNewPixelBufferForItemTime:t]) return;
+    CVPixelBufferRef pb = [xr_video_output copyPixelBufferForItemTime:t itemTimeForDisplay:NULL];
+    if (pb == NULL) return;
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    xr_scene_video_frame(CVPixelBufferGetBaseAddress(pb), (uint32_t)CVPixelBufferGetWidth(pb),
+                         (uint32_t)CVPixelBufferGetHeight(pb), (uint32_t)CVPixelBufferGetBytesPerRow(pb), true);
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferRelease(pb);
+}
 
 // Pinches arrive on the main thread (App.swift's onSpatialEvent) and wait here for the
 // render thread, which hands them to the scene before each frame.
@@ -54,10 +97,14 @@ static void xr_apply_pointer_events(void) {
 }
 
 void eskiu_xr_run(cp_layer_renderer_t renderer) {
+    // the showcase's files, in the app's assets folder (examples/xr/assets.sh)
+    NSString *assets = [[NSBundle mainBundle].resourcePath stringByAppendingPathComponent:@"assets"];
+    xr_scene_set_assets(assets.UTF8String);
     if (xr_scene_open() != 0) {
         fprintf(stderr, "xr: the scene did not open\n");
         return;
     }
+    xr_video_start(assets);
     ar_session_t session = ar_session_create();
     ar_world_tracking_configuration_t wtc = ar_world_tracking_configuration_create();
     ar_world_tracking_provider_t world = ar_world_tracking_provider_create(wtc);
@@ -86,6 +133,7 @@ void eskiu_xr_run(cp_layer_renderer_t renderer) {
             cp_frame_start_update(frame);
             CFTimeInterval now = CACurrentMediaTime();
             xr_apply_pointer_events();
+            xr_video_step();
             xr_scene_step(last == 0 ? 0.0f : (float)(now - last));
             last = now;
             cp_frame_end_update(frame);

@@ -29,12 +29,16 @@ cp "$here/../xr_scene.esk" "$pkg/xr_scene.esk"
 sed -e "s|^gpu = .*|gpu = { path = \"$GPU_DIR\" }|" -e "s|^main = .*|main = \"xr_scene.esk\"|" \
     "$root/eskiu.toml" > "$pkg/eskiu.toml"
 (cd "$pkg" && "$ESKIUC" xr_scene.esk --target "$triple" -c -o "$out/xr_scene.o")
+# the showcase's files (the Xcode project copies build/assets into the app too)
+"$here/../assets.sh" "$out/assets" >/dev/null
 sdk=$(xcrun --sdk "$SDK" --show-sdk-path)
 xcrun -sdk "$SDK" clang -target "$triple" -fobjc-arc -O2 -c "$here/host.m" -o "$out/host.o"
 xcrun -sdk "$SDK" swiftc -target "$triple" -sdk "$sdk" -O -parse-as-library \
     -import-objc-header "$here/bridge.h" "$here/App.swift" "$out/host.o" "$out/xr_scene.o" "$WGPU_LIB" \
     -framework Metal -framework QuartzCore -framework CompositorServices -framework ARKit \
-    -framework Foundation -lc++ -o "$out/EskiuXR.app/EskiuXR"
+    -framework Foundation -framework AVFoundation -framework CoreMedia -framework CoreVideo -lc++ -o "$out/EskiuXR.app/EskiuXR"
+rm -rf "$out/EskiuXR.app/assets"
+cp -R "$out/assets" "$out/EskiuXR.app/assets"
 # the platform the bundle is for: XRSimulator or XROS
 plat=XRSimulator
 [ "$SDK" = xros ] && plat=XROS
