@@ -1,0 +1,166 @@
+// Portals: a portal's world seen only through its window, the outer world around it, an
+// outer object in front of the window still covering it, the portal's own sky, walking
+// through a passable portal and looking back out, and a portal that is not passable.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 32;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+Vec3 pixel(*uint16 px, int x, int y) {
+    *uint16 p = px + (y * N + x) * 4;
+    return Vec3{half_to_float(p[0]), half_to_float(p[1]), half_to_float(p[2])};
+}
+
+bool is(Vec3 got, Vec3 want) {
+    Vec3 d = got - want;
+    return d.length() < 0.02;
+}
+
+void expect(string what, Vec3 got, Vec3 want) {
+    if (!is(got, want)) {
+        printf("FAIL %s: got %.3f %.3f %.3f\n", what, (double)got.x, (double)got.y, (double)got.z);
+        fails++;
+    }
+}
+
+int flat(*Scene scene, Vec4 color) {
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = color;
+    m.double_sided = true;
+    if (color.w < 1.0) m.alpha_mode = SCENE_ALPHA_BLEND;
+    return scene.add_material(m);
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    scene.background = Vec4{0.0, 0.0, 0.0, 1.0};
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+    SceneGeometry q = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    Vec3 green = Vec3{0.0, 1.0, 0.0};
+    Vec3 red = Vec3{1.0, 0.0, 0.0};
+    Vec3 blue = Vec3{0.0, 0.0, 1.0};
+    Vec3 yellow = Vec3{1.0, 1.0, 0.0};
+    Vec3 magenta = Vec3{1.0, 0.0, 1.0};
+
+    // the outer world: green far ahead, yellow far behind the starting camera
+    int far_wall = scene.add_object(0, quad, flat(&scene, Vec4{0.0, 1.0, 0.0, 1.0}));
+    scene.node(far_wall).position = Vec3{0.0, 0.0, -10.0};
+    scene.node(far_wall).scale = Vec3{40.0, 40.0, 1.0};
+    int back_wall = scene.add_object(0, quad, flat(&scene, Vec4{1.0, 1.0, 0.0, 1.0}));
+    scene.node(back_wall).position = Vec3{0.0, 0.0, 8.0};
+    scene.node(back_wall).scale = Vec3{40.0, 40.0, 1.0};
+    // the portal: a 2 x 2 window, invisible (alpha 0), at the origin; inside, red ahead and
+    // magenta behind the window
+    int portal = scene.add_node(0, "portal");
+    scene.node(portal).portal = true;
+    scene.node(portal).passable = true;
+    int window = scene.add_object(portal, quad, flat(&scene, Vec4{1.0, 1.0, 1.0, 0.0}));
+    scene.node(window).portal_entrance = true;
+    scene.node(window).scale = Vec3{2.0, 2.0, 1.0};
+    int inside = scene.add_object(portal, quad, flat(&scene, Vec4{1.0, 0.0, 0.0, 1.0}));
+    scene.node(inside).position = Vec3{0.0, 0.0, -3.0};
+    scene.node(inside).scale = Vec3{40.0, 40.0, 1.0};
+    int inside_back = scene.add_object(portal, quad, flat(&scene, Vec4{1.0, 0.0, 1.0, 1.0}));
+    scene.node(inside_back).position = Vec3{0.0, 0.0, 2.0};
+    scene.node(inside_back).scale = Vec3{40.0, 40.0, 1.0};
+    // between the starting camera and the window: it would show through the window from
+    // outside, so it appears only for the walk inside
+    scene.node(inside_back).visible = false;
+
+    int cam = scene.add_camera(0, scene_perspective(1.2, 0.1, 100.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("through the window: the portal's world", pixel(px, 16, 16), red);
+    expect("around it: the outer world", pixel(px, 2, 16), green);
+
+    // an outer object in front of the window still covers it
+    int bar = scene.add_object(0, quad, flat(&scene, Vec4{0.0, 0.0, 1.0, 1.0}));
+    scene.node(bar).position = Vec3{0.0, 0.0, 2.0};
+    scene.node(bar).scale = Vec3{0.4, 4.0, 1.0};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("an outer object in front of the window", pixel(px, 16, 16), blue);
+    expect("beside it, still the portal's world", pixel(px, 12, 16), red);
+    scene.remove(bar);
+
+    // the portal's own sky where its world has nothing: a one-color 360 image
+    scene.node(inside).visible = false;
+    uint8[4] cyan = {0, 255, 255, 255};
+    GpuImageOptions lo = GpuImageOptions{srgb: false};
+    scene.node(portal).portal_sky = scene.add_texture(gpu.image_with(1, 1, &cyan[0], &lo)?);
+    scene.node(portal).portal_sky_pano = true;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("the portal's sky through the window", pixel(px, 16, 16), Vec3{0.0, 1.0, 1.0});
+    expect("the outer world has none", pixel(px, 2, 16), green);
+    scene.node(inside).visible = true;
+
+    // walk through: the camera moves past the window into the portal's world
+    scene.node(inside_back).visible = true;
+    scene.node(cam).position = Vec3{0.0, 0.0, -2.0};
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("walked in", scene.active_portal == portal);
+    expect("inside: the portal's world all around", pixel(px, 2, 16), red);
+    // turn around: the outer world through the window, the portal's world around it
+    scene.node(cam).rotation = quat_axis_angle(Vec3{0.0, 1.0, 0.0}, 3.14159265);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("looking back out: the outer world through the window", pixel(px, 16, 16), yellow);
+    expect("and the portal's world around it", pixel(px, 1, 16), magenta);
+    // walk back out
+    scene.node(cam).rotation = quat_identity();
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.render_to(&target)?;
+    check("walked out", scene.active_portal == 0);
+
+    // not passable: walking through changes nothing
+    scene.node(portal).passable = false;
+    scene.node(cam).position = Vec3{0.0, 0.0, -1.0};
+    scene.render_to(&target)?;
+    check("a portal that is not passable keeps the camera out", scene.active_portal == 0);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("portals: ok\n");
+    return 0;
+}
