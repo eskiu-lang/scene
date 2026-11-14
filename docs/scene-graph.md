@@ -128,8 +128,8 @@ helmet.pose(&scene, &g);
 `SceneGltf_pose` copies node transforms and visibility, recomputes the joint matrices of
 skinned meshes, copies the morph target weights, and copies what `KHR_animation_pointer`
 channels changed in materials (base color, emissive, metallic, roughness, alpha cutoff and
-texture transforms). The glTF samplers are replaced by the scene's sampler (linear,
-mipmapped, repeating).
+texture transforms). Each material takes the wrap and filters of its base color texture's
+glTF sampler ([materials](materials.md)).
 
 ### Skinning and morph targets on your own meshes
 

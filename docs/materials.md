@@ -88,6 +88,13 @@ shadow. Its `blend_mode`, with `s` the surface color, `a` its alpha and `d` the 
 Blending happens in the linear HDR image, before tone mapping. `double_sided` turns off
 back-face culling and lights back faces with the flipped normal.
 
+`wrap_s` and `wrap_t` say how textures repeat past the 0 to 1 range (`SCENE_WRAP_REPEAT`,
+`_CLAMP`, `_MIRROR`), `filter` how texels are filtered when magnified or minified
+(`SCENE_FILTER_LINEAR`, `_NEAREST`, for pixel art) and `mip_filter` whether mipmap levels
+blend (ViroReact's `wrapS`, `wrapT`, `magnificationFilter`, `minificationFilter` and
+`mipFilter`; one filter serves magnification and minification here). They apply to all of
+the material's textures; a glTF material takes its base color texture's sampler.
+
 `skip_depth_test` draws the surface over whatever was drawn before it, near or far, and
 `skip_depth_write` leaves the depth buffer as it was (ViroReact's `readsFromDepthBuffer`
 and `writesToDepthBuffer` set to false). With a node's `rendering_order` they put a panel

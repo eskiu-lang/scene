@@ -1668,6 +1668,10 @@ struct SceneMaterial {
     bool double_sided;
     bool skip_depth_test;
     bool skip_depth_write;
+    int wrap_s;
+    int wrap_t;
+    int filter;
+    int mip_filter;
     SceneUv[6] uv;
 }
 ```
@@ -1685,6 +1689,28 @@ A material. Fields by lighting model:
 Texture ids come from the Scene that draws the material (0 is none). uv holds how each
 texture reads its coordinates, in the order diffuse, specular, normal, emissive,
 metal-roughness, occlusion (SCENE_TEX_DIFFUSE and the others).
+
+### SCENE_WRAP_REPEAT, SCENE_WRAP_CLAMP, SCENE_WRAP_MIRROR
+
+```eskiu
+const int SCENE_WRAP_REPEAT = 0;
+const int SCENE_WRAP_CLAMP = 1;
+const int SCENE_WRAP_MIRROR = 2;
+```
+
+How the material's textures repeat past 0..1 (SceneMaterial.wrap_s, wrap_t; ViroReact's
+wrapS and wrapT): repeated, the edge texels stretched, or mirrored.
+
+### SCENE_FILTER_LINEAR, SCENE_FILTER_NEAREST
+
+```eskiu
+const int SCENE_FILTER_LINEAR = 0;
+const int SCENE_FILTER_NEAREST = 1;
+```
+
+How texels are filtered (SceneMaterial.filter, for magnification and minification
+alike, and mip_filter between mipmap levels; ViroReact's magnificationFilter,
+minificationFilter and mipFilter).
 
 ### scene_material
 

@@ -29,6 +29,9 @@ All notable changes to this package are documented here. The format follows
   now a dependency) from a glyph atlas, laid out as ViroText: points at 0.01 world units, a
   box, word, character or no wrapping, justification, alignment, clipping, a line cap,
   `scene_text_size`. `docs/text.md`.
+- Texture sampling per material: `SceneMaterial.wrap_s`, `wrap_t` (repeat, clamp, mirror),
+  `filter` and `mip_filter` (linear or nearest), ViroReact's wrap and filter properties; a
+  glTF material takes its base color texture's sampler.
 - `Scene_set_geometry` and `Scene_set_texture` replace a mesh's or a texture's contents in
   place.
 - `<scene/animation>`: `SceneAnimations` animates position, scale, Euler rotation,
