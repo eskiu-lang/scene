@@ -299,6 +299,7 @@ struct Scene {
     List<SceneMesh> meshes;
     List<SceneMaterial> materials;
     List<GpuTexture> textures;
+    List<bool> _borrowed;
     List<SceneLight> lights;
     int camera;
     Vec4 background;
@@ -505,7 +506,10 @@ void Scene_release(*Scene self) {
         self.meshes.data[i].indices.release();
         self.meshes.data[i].morph.release();
     }
-    for (i in 0..self.textures.size) self.textures.data[i].release();
+    for (i in 0..self.textures.size) {
+        if (!_scene_borrowed(self, i)) self.textures.data[i].release();
+    }
+    List_free(&self._borrowed);
     self.sky_faces.release();
     for (i in 0..self.nodes.size) {
         String_free(&self.nodes.data[i].name);
@@ -931,14 +935,46 @@ int Scene_add_texture(*Scene self, GpuTexture texture) {
 // shows the new one. False for an unknown id (texture is then not taken over).
 bool Scene_set_texture(*Scene self, int id, GpuTexture texture) {
     if (id <= 0 || id >= self.textures.size) return false;
-    self.textures.data[id].release();
+    if (!_scene_borrowed(self, id)) self.textures.data[id].release();
     self.textures.data[id] = texture;
+    _scene_set_borrowed(self, id, false);
     for (i in 0..self._r.mats.size) {
         for (k in 0..6) {
             if (self._r.mats.data[i].bound[k] == id) self._r.mats.data[i].bound[k] = -1;
         }
     }
     return true;
+}
+
+bool _scene_borrowed(*Scene self, int id) {
+    return id >= 0 && id < self._borrowed.size && self._borrowed.data[id];
+}
+
+void _scene_set_borrowed(*Scene self, int id, bool on) {
+    while (self._borrowed.size <= id) List_push(&self._borrowed, false);
+    self._borrowed.data[id] = on;
+}
+
+// Shows texture, which stays the caller's (the scene never releases it), under texture id
+// id, or under a new id when id is 0; returns the id. For pictures another part of the
+// program makes each frame, a video frame turned to RGBA by <gpu/yuv> for one
+// (ViroReact's video materials): call it again whenever that texture is made anew (a new
+// size), as its handle changes.
+int Scene_borrow_texture(*Scene self, int id, *GpuTexture texture) {
+    if (id <= 0 || id >= self.textures.size) {
+        List_push(&self.textures, *texture);
+        id = self.textures.size - 1;
+    } else {
+        if (!_scene_borrowed(self, id)) self.textures.data[id].release();
+        self.textures.data[id] = *texture;
+        for (i in 0..self._r.mats.size) {
+            for (k in 0..6) {
+                if (self._r.mats.data[i].bound[k] == id) self._r.mats.data[i].bound[k] = -1;
+            }
+        }
+    }
+    _scene_set_borrowed(self, id, true);
+    return id;
 }
 
 // A texture from decoded pixels, stored as sRGB when srgb (color data) or linear (normal,
