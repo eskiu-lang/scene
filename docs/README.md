@@ -7,6 +7,7 @@ Guides and reference for scene. The [README](../README.md) has the overview.
 - [Materials](materials.md): lighting models, textures, alpha and blending
 - [Lights and shadows](lights.md)
 - [Rendering, post-processing and the sky](rendering.md)
+- [Hit testing and events](input.md): rays, hit tests, click, drag, pinch, rotate, hover and fuse
 - [API reference](api.md): every public function and type
 <!-- /pages -->
 
@@ -41,6 +42,7 @@ macOS; on Linux and Windows, an SDL3 build from your package manager or libsdl.o
 | `<scene/light>` | `SceneLight`, its constructors and falloff curves |
 | `<scene/post>` | `ScenePost`, tone mapping operators, CPU versions of the curves |
 | `<scene/sky>` | cube maps from six images |
+| `<scene/input>` | screen rays, hit tests, `SceneInput` and node events |
 
 ## Tests
 
@@ -56,6 +58,7 @@ Each test renders small images and reads them back:
 | `tests/sky.esk` | background color, skybox faces by view direction, sky intensity, six-image orientation, image-based lighting from a constant environment against its expected value |
 | `tests/shadows.esk` | a box's shadow on the ground where geometry puts it, opacity, nodes that do not cast or receive, two shadowed lights |
 | `tests/gltf.esk` | a glTF model's node tree, transforms, unlit material and pose updates |
+| `tests/input.esk` | screen rays against the camera's field of view, hits on rotated, scaled and nested nodes, hidden and `ignore_events` nodes, bubbling to a handler, click states, fixed-distance and plane drags, pinch, rotation, hover hysteresis, fuse |
 
 ## Not yet
 
@@ -70,7 +73,6 @@ These ViroReact renderer features are planned for later versions:
 - Shadows from spot and point lights, and cascaded shadow maps for large scenes.
 - glTF samplers (the scene's sampler is used: linear, mipmapped, repeating).
 - Node opacity, render order overrides, instanced drawing, frustum culling.
-- Hit testing and bounding-box queries.
 
 ## Contributing
 

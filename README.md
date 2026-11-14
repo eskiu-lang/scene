@@ -38,6 +38,8 @@ pipeline.
   Reinhard, exposure and Hable tone mapping, bloom, and sRGB output.
 - **Sky.** A solid color, a cube map from `<gpu/ibl>` or six images, and image-based
   lighting for PBR materials.
+- **Input.** Hit tests from the screen or any controller, and click, drag, pinch, rotate,
+  hover and fuse events on nodes, bubbling to the nearest handler as in ViroReact.
 
 ## A lit sphere
 

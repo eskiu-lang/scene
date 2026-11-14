@@ -4,6 +4,20 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `<scene/input>`: `Scene_screen_ray`, `Scene_hit_test` and `Scene_hit_test_all` (mesh
+  bounds tested in each node's own space, so rotated, scaled and nested nodes are exact),
+  and `SceneInput`, which turns touches (`SceneInput_touch`) or any controller's pointer,
+  button, gestures and gaze into click, drag, pinch, rotate, hover and fuse events on
+  nodes. Events bubble to the nearest ancestor with a handler; thresholds, drag types and
+  hover hysteresis follow ViroReact. `docs/input.md`.
+- `SceneNode.ignore_events` keeps a node out of hit tests.
+- `Scene_camera_matrices` and `Scene_camera_is_ortho`: the view and projection the camera
+  renders with.
+
 ## [0.1.0] - 2026-11-07
 
 ### Added
