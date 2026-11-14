@@ -1,0 +1,468 @@
+// text.esk: text in the scene (`<scene/text>`).
+//
+// A text node draws a string of a TrueType font (eskiu-lang/font) as glyph quads facing
+// +Z, laid out the way ViroReact's ViroText is: a font size in points, 0.01 world units a
+// point, inside a box of width x height world units centered on the node, wrapped by
+// words, by characters, justified or only at newlines, aligned left, center or right and
+// top, center or bottom, and clipped to the box or to a number of lines.
+//
+//     Font f = font_load("Inter.ttf")?;
+//     SceneTextStyle st = scene_text_style();
+//     st.size = 24.0;
+//     st.align = SCENE_TEXT_CENTER;
+//     SceneText label = scene.add_text(0, &f, "Hello, Eskiu", st)?;
+//     scene.node(label.node).position = Vec3{0.0, 1.0, -2.0};
+//     ...later:
+//     label.set(&scene, &f, "Bye", st)?;
+//
+// The glyphs come from an atlas made for the text's characters, rendered at four times
+// the font size, and the material is unlit (SCENE_CONSTANT) and blended: change it through
+// Scene_material(text.material) like any other.
+
+import <mem>;
+import <list>;
+import <result>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <font/ttf>;
+import <font/text>;
+import <scene>;
+import <scene/geometry>;
+import <scene/material>;
+
+// World units per point of font size (ViroReact's kTextPointToWorldScale).
+const float SCENE_TEXT_POINT = 0.01;
+
+// Horizontal alignment (SceneTextStyle.align).
+const int SCENE_TEXT_LEFT = 0;
+const int SCENE_TEXT_CENTER = 1;
+const int SCENE_TEXT_RIGHT = 2;
+
+// Vertical alignment (SceneTextStyle.valign).
+const int SCENE_TEXT_TOP = 0;
+const int SCENE_TEXT_MIDDLE = 1;
+const int SCENE_TEXT_BOTTOM = 2;
+
+// Line breaking (SceneTextStyle.line_break): at the last space that fits, at any character,
+// as WORD_WRAP with the spaces of every line but a paragraph's last stretched to the
+// width, or only at newlines.
+const int SCENE_TEXT_WORD_WRAP = 0;
+const int SCENE_TEXT_CHAR_WRAP = 1;
+const int SCENE_TEXT_JUSTIFY = 2;
+const int SCENE_TEXT_NO_WRAP = 3;
+
+// How a text is laid out. size is the font size in points; color is linear RGBA; width and
+// height the box in world units, centered on the node; clip keeps the lines inside the
+// box (and, without wrapping, cuts each line at its width); max_lines caps the line count
+// (0 for no cap).
+struct SceneTextStyle {
+    float size;
+    Vec4 color;
+    float width;
+    float height;
+    int align;
+    int valign;
+    int line_break;
+    bool clip;
+    int max_lines;
+}
+
+// ViroText's defaults: 18 points, white, a 1 x 1 box, left and top aligned, word wrap, no
+// clipping, no line cap.
+SceneTextStyle scene_text_style() {
+    return SceneTextStyle{size: 18.0, color: Vec4{1.0, 1.0, 1.0, 1.0}, width: 1.0, height: 1.0,
+        align: SCENE_TEXT_LEFT, valign: SCENE_TEXT_TOP, line_break: SCENE_TEXT_WORD_WRAP, clip: false, max_lines: 0};
+}
+
+// A text node: node draws mesh with material, whose diffuse texture is the glyph atlas
+// texture. width and height are the size of the laid-out text (ViroText's realized
+// size), lines its line count.
+struct SceneText {
+    int node;
+    int mesh;
+    int material;
+    int texture;
+    float width;
+    float height;
+    int lines;
+}
+
+const int _SCENE_TEXT_OVERSAMPLE = 4;
+
+struct _SceneTextLine {
+    int start;
+    int count;
+    float spacing;
+}
+
+struct _SceneTextLayout {
+    List<uint32> cps;
+    List<_SceneTextLine> lines;
+    float line_height;
+    float descender;
+}
+
+bool _scene_text_ws(uint32 c) {
+    return c == 32 || c == 9 || c == 11 || c == 13;
+}
+
+// The advance of character cp in world units at size points (no kerning, as ViroReact).
+float _scene_text_adv(*Font f, uint32 cp, float size) {
+    return (float)Font_advance(f, Font_glyph(f, cp)) * Font_scale(f, size) * SCENE_TEXT_POINT;
+}
+
+bool _scene_text_more(int lines, *SceneTextStyle st, float line_height) {
+    return (st.max_lines <= 0 || lines < st.max_lines) && (!st.clip || (float)(lines + 1) * line_height < st.height);
+}
+
+void _scene_text_push(*List<_SceneTextLine> out, *List<uint32> line, *List<uint32> all, float spacing) {
+    _SceneTextLine l;
+    l.start = all.size;
+    l.count = line.size;
+    l.spacing = spacing;
+    for (i in 0..line.size) List_push(all, line.data[i]);
+    List_push(out, l);
+    List_clear(line);
+}
+
+// Greedy word wrap of text[from, to) (ViroReact's wrapByWords). Returns false when the
+// line limit stopped it.
+bool _scene_text_words(*Font f, *List<uint32> text, int from, int to, *SceneTextStyle st, float lh, *_SceneTextLayout out) {
+    List<uint32> line;
+    float width = 0.0;
+    int cur = from;
+    bool more = true;
+    while (cur < to) {
+        if (text.data[cur] == 10) {
+            _scene_text_push(&out.lines, &line, &out.cps, 1.0);
+            width = 0.0;
+            if (!_scene_text_more(out.lines.size, st, lh)) {
+                more = false;
+                break;
+            }
+            cur++;
+            continue;
+        }
+        // a word: the characters to the first whitespace, then the whitespace after it,
+        // stopping at a newline
+        int end = cur;
+        while (end < to && !_scene_text_ws(text.data[end]) && text.data[end] != 10) end++;
+        while (end < to && _scene_text_ws(text.data[end])) end++;
+        if (end == cur) {
+            cur++;
+            continue;
+        }
+        float ww = 0.0;
+        for (k in cur..end) ww += _scene_text_adv(f, text.data[k], st.size);
+        if (width + ww > st.width) {
+            if (line.size == 0) {
+                for (k in cur..end) List_push(&line, text.data[k]);
+                _scene_text_push(&out.lines, &line, &out.cps, 1.0);
+                cur = end;
+            } else {
+                _scene_text_push(&out.lines, &line, &out.cps, 1.0);
+            }
+            width = 0.0;
+            if (!_scene_text_more(out.lines.size, st, lh)) {
+                more = false;
+                break;
+            }
+        } else {
+            width += ww;
+            for (k in cur..end) List_push(&line, text.data[k]);
+            cur = end;
+        }
+    }
+    if (more && line.size > 0 && _scene_text_more(out.lines.size, st, lh)) _scene_text_push(&out.lines, &line, &out.cps, 1.0);
+    line.free();
+    return more;
+}
+
+void _scene_text_layout(*Font f, *List<uint32> text, *SceneTextStyle st, *_SceneTextLayout out) {
+    float lh = Font_line_height(f, st.size) * SCENE_TEXT_POINT;
+    out.line_height = lh;
+    out.descender = -(float)f.descent * Font_scale(f, st.size) * SCENE_TEXT_POINT;
+    List<uint32> line;
+    if (st.line_break == SCENE_TEXT_WORD_WRAP) {
+        _scene_text_words(f, text, 0, text.size, st, lh, out);
+    } else if (st.line_break == SCENE_TEXT_CHAR_WRAP) {
+        float width = 0.0;
+        int i = 0;
+        while (i < text.size) {
+            uint32 c = text.data[i];
+            float cw = _scene_text_adv(f, c, st.size);
+            if (width + cw > st.width || c == 10) {
+                _scene_text_push(&out.lines, &line, &out.cps, 1.0);
+                if (!_scene_text_more(out.lines.size, st, lh)) break;
+                width = 0.0;
+                if (c == 10) i++;
+                else if (line.size == 0 && cw > st.width) {
+                    // a character wider than the box gets a line of its own
+                    List_push(&line, c);
+                    width = cw;
+                    i++;
+                }
+                continue;
+            }
+            width += cw;
+            List_push(&line, c);
+            i++;
+        }
+        if (line.size > 0 && _scene_text_more(out.lines.size, st, lh)) _scene_text_push(&out.lines, &line, &out.cps, 1.0);
+    } else if (st.line_break == SCENE_TEXT_NO_WRAP) {
+        float width = 0.0;
+        for (i in 0..text.size) {
+            uint32 c = text.data[i];
+            float cw = _scene_text_adv(f, c, st.size);
+            if (c == 10) {
+                _scene_text_push(&out.lines, &line, &out.cps, 1.0);
+                if (!_scene_text_more(out.lines.size, st, lh)) break;
+                width = 0.0;
+            } else if (!st.clip || width + cw < st.width) {
+                width += cw;
+                List_push(&line, c);
+            }
+        }
+        if (line.size > 0 && _scene_text_more(out.lines.size, st, lh)) _scene_text_push(&out.lines, &line, &out.cps, 1.0);
+    } else {
+        // justify: wrap each paragraph by words, then stretch the spaces of every line
+        // but the paragraph's last to the box width
+        float space = _scene_text_adv(f, 32, st.size);
+        int start = 0;
+        while (start <= text.size) {
+            int end = start;
+            while (end < text.size && text.data[end] != 10) end++;
+            int first = out.lines.size;
+            if (end == start) {
+                List<uint32> empty;
+                _scene_text_push(&out.lines, &empty, &out.cps, 1.0);
+                empty.free();
+            } else {
+                SceneTextStyle free_st = *st;
+                free_st.max_lines = 0;
+                free_st.clip = false;
+                _scene_text_words(f, text, start, end, &free_st, lh, out);
+            }
+            for (li in first..out.lines.size - 1) {
+                *_SceneTextLine l = &out.lines.data[li];
+                // drop the trailing spaces, then share the room left among the others
+                while (l.count > 0 && _scene_text_ws(out.cps.data[l.start + l.count - 1])) l.count--;
+                float w = 0.0;
+                int spaces = 0;
+                for (k in 0..l.count) {
+                    uint32 c = out.cps.data[l.start + k];
+                    w += _scene_text_adv(f, c, st.size);
+                    if (c == 32) spaces++;
+                }
+                if (spaces > 0 && space > 0.0) l.spacing = 1.0 + (st.width - w) / (float)spaces / space;
+            }
+            if (end >= text.size) break;
+            start = end + 1;
+        }
+        int keep = out.lines.size;
+        if (st.clip && lh > 0.0) {
+            int by_clip = (int)floorf(st.height / lh);
+            if (by_clip < keep) keep = by_clip;
+        }
+        if (st.max_lines > 0 && st.max_lines < keep) keep = st.max_lines;
+        while (out.lines.size > keep) List_pop(&out.lines);
+    }
+    line.free();
+}
+
+void _scene_text_free_layout(*_SceneTextLayout l) {
+    l.cps.free();
+    l.lines.free();
+}
+
+// Lays out text with style and returns its size in world units without building it
+// (ViroText's getTextSize), into width and height.
+void scene_text_size(*Font f, string text, SceneTextStyle style, *float width, *float height) {
+    List<uint32> cps;
+    int64 i = 0;
+    while (text != null && text[i] != 0) List_push(&cps, font_utf8_next(text, &i));
+    _SceneTextLayout l;
+    _scene_text_layout(f, &cps, &style, &l);
+    float w = 0.0;
+    for (k in 0..l.lines.size) {
+        float lw = 0.0;
+        for (j in 0..l.lines.data[k].count) lw += _scene_text_adv(f, l.cps.data[l.lines.data[k].start + j], style.size);
+        if (lw > w) w = lw;
+    }
+    *width = w;
+    *height = (float)l.lines.size * l.line_height;
+    _scene_text_free_layout(&l);
+    cps.free();
+}
+
+// Builds text's geometry and atlas into g and atlas; returns the line count and the
+// realized size.
+Result<int, string> _scene_text_build(*Font f, string text, *SceneTextStyle st, *SceneGeometry g, *FontAtlas atlas, *float rw, *float rh) {
+    List<uint32> cps;
+    defer cps.free();
+    int64 i = 0;
+    while (text != null && text[i] != 0) List_push(&cps, font_utf8_next(text, &i));
+    _SceneTextLayout l;
+    defer _scene_text_free_layout(&l);
+    _scene_text_layout(f, &cps, st, &l);
+
+    // the atlas of the characters drawn, each once
+    String chars;
+    defer chars.free();
+    List<uint32> seen;
+    defer seen.free();
+    for (k in 0..l.cps.size) {
+        uint32 c = l.cps.data[k];
+        if (_scene_text_ws(c) || c == 10) continue;
+        bool have = false;
+        for (j in 0..seen.size) {
+            if (seen.data[j] == c) have = true;
+        }
+        if (have) continue;
+        List_push(&seen, c);
+        _scene_utf8_append(&chars, c);
+    }
+    float raster = st.size * (float)_SCENE_TEXT_OVERSAMPLE;
+    *atlas = Font_atlas(f, raster, chars.data == null ? "" : (string)chars.data)?;
+    float k = SCENE_TEXT_POINT / (float)_SCENE_TEXT_OVERSAMPLE;
+
+    float lh = l.line_height;
+    float total = (float)l.lines.size * lh;
+    float y = 0.0;
+    if (st.valign == SCENE_TEXT_TOP) y = st.height / 2.0 - lh + l.descender;
+    else if (st.valign == SCENE_TEXT_BOTTOM) y = -st.height / 2.0 + total - lh + l.descender;
+    else y = total / 2.0 - lh + l.descender;
+
+    int quads = 0;
+    for (n in 0..l.cps.size) {
+        FontAtlasGlyph* e = FontAtlas_find(atlas, l.cps.data[n]);
+        if (e != null && e.width > 0 && e.height > 0) quads++;
+    }
+    *g = scene_geometry((uint32)(quads * 4), (uint32)(quads * 6));
+    float aw = (float)atlas.width;
+    float ah = (float)atlas.height;
+    Vec3 nrm = Vec3{0.0, 0.0, 1.0};
+    int q = 0;
+    float realized = 0.0;
+    for (li in 0..l.lines.size) {
+        _SceneTextLine line = l.lines.data[li];
+        float lw = 0.0;
+        for (j in 0..line.count) lw += _scene_text_adv(f, l.cps.data[line.start + j], st.size);
+        if (lw > realized) realized = lw;
+        float x = 0.0;
+        if (st.align == SCENE_TEXT_LEFT) x = -st.width / 2.0;
+        else if (st.align == SCENE_TEXT_RIGHT) x = st.width / 2.0 - lw;
+        else x = -lw / 2.0;
+        for (j in 0..line.count) {
+            uint32 c = l.cps.data[line.start + j];
+            FontAtlasGlyph* e = FontAtlas_find(atlas, c);
+            if (e != null && e.width > 0 && e.height > 0) {
+                float x0 = x + (float)e.left * k;
+                float x1 = x0 + (float)e.width * k;
+                float y1 = y - (float)e.top * k;
+                float y0 = y1 - (float)e.height * k;
+                float u0 = (float)e.x / aw;
+                float u1 = (float)(e.x + e.width) / aw;
+                float v0 = (float)e.y / ah;
+                float v1 = (float)(e.y + e.height) / ah;
+                uint32 b = (uint32)(q * 4);
+                g.set(b, Vec3{x0, y0, 0.0}, nrm, Vec2{u0, v1});
+                g.set(b + 1, Vec3{x1, y0, 0.0}, nrm, Vec2{u1, v1});
+                g.set(b + 2, Vec3{x1, y1, 0.0}, nrm, Vec2{u1, v0});
+                g.set(b + 3, Vec3{x0, y1, 0.0}, nrm, Vec2{u0, v0});
+                uint32[6] idx = {b, b + 1, b + 2, b, b + 2, b + 3};
+                for (t in 0..6) g.indices[q * 6 + t] = idx[t];
+                q++;
+            }
+            float adv = _scene_text_adv(f, c, st.size);
+            if (c == 32) adv = adv * line.spacing;
+            x += adv;
+        }
+        y -= lh;
+    }
+    if (quads > 0) g.bounds();
+    *rw = realized;
+    *rh = total;
+    return Ok<int, string>(l.lines.size);
+}
+
+void _scene_utf8_append(*String s, uint32 c) {
+    if (c < 0x80) {
+        s.push((char)c);
+    } else if (c < 0x800) {
+        s.push((char)(0xC0 | (c >> 6)));
+        s.push((char)(0x80 | (c & 63)));
+    } else if (c < 0x10000) {
+        s.push((char)(0xE0 | (c >> 12)));
+        s.push((char)(0x80 | ((c >> 6) & 63)));
+        s.push((char)(0x80 | (c & 63)));
+    } else {
+        s.push((char)(0xF0 | (c >> 18)));
+        s.push((char)(0x80 | ((c >> 12) & 63)));
+        s.push((char)(0x80 | ((c >> 6) & 63)));
+        s.push((char)(0x80 | (c & 63)));
+    }
+}
+
+Result<GpuTexture, string> _scene_atlas_texture(*Scene self, *FontAtlas atlas) {
+    int64 n = (int64)atlas.width * atlas.height;
+    *uint8 rgba = alloc<uint8>(n * 4 + 4);
+    defer free(rgba);
+    for (i in 0..n) {
+        rgba[i * 4] = 255;
+        rgba[i * 4 + 1] = 255;
+        rgba[i * 4 + 2] = 255;
+        rgba[i * 4 + 3] = atlas.pixels[i];
+    }
+    GpuImageOptions o = GpuImageOptions{srgb: true, mipmaps: true};
+    return self.gpu.image_with(atlas.width, atlas.height, rgba, &o);
+}
+
+// Adds a node under parent drawing text (UTF-8, '\n' breaks lines) in font f with style,
+// and returns it. The font is read now and not kept.
+Result<SceneText, string> Scene_add_text(*Scene self, int parent, *Font f, string text, SceneTextStyle style) {
+    SceneText t;
+    t.node = Scene_add_node(self, parent, null);
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = style.color;
+    m.alpha_mode = SCENE_ALPHA_BLEND;
+    t.material = Scene_add_material(self, m);
+    Scene_node(self, t.node).material = t.material;
+    SceneText_set(&t, self, f, text, style)?;
+    return Ok<SceneText, string>(t);
+}
+
+// Lays text out again with style and rebuilds the node's mesh and atlas; the color of
+// style is the material's diffuse color from now on.
+Result<int, string> SceneText_set(*SceneText self, *Scene scene, *Font f, string text, SceneTextStyle style) {
+    SceneGeometry g;
+    FontAtlas atlas;
+    float rw = 0.0;
+    float rh = 0.0;
+    int lines = _scene_text_build(f, text, &style, &g, &atlas, &rw, &rh)?;
+    defer atlas.free();
+    defer g.free();
+    Scene_material(scene, self.material).diffuse = style.color;
+    self.width = rw;
+    self.height = rh;
+    self.lines = lines;
+    if (g.index_count == 0) {
+        Scene_node(scene, self.node).mesh = 0;
+        return Ok<int, string>(lines);
+    }
+    GpuTexture tex = _scene_atlas_texture(scene, &atlas)?;
+    if (self.texture > 0) {
+        Scene_set_texture(scene, self.texture, tex);
+    } else {
+        self.texture = Scene_add_texture(scene, tex);
+        Scene_material(scene, self.material).diffuse_texture = self.texture;
+    }
+    if (self.mesh > 0) {
+        if (!Scene_set_geometry(scene, self.mesh, &g)) return Err<int, string>("scene: text upload failed");
+    } else {
+        self.mesh = Scene_add_geometry(scene, &g)?;
+    }
+    Scene_node(scene, self.node).mesh = self.mesh;
+    return Ok<int, string>(lines);
+}

@@ -5,3 +5,4 @@ main = "examples/scene.esk"
 
 [deps]
 gpu = { git = "https://github.com/eskiu-lang/gpu", rev = "v0.6.0" }
+font = { git = "https://github.com/eskiu-lang/font", rev = "v0.1.0" }

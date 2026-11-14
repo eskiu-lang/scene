@@ -1,0 +1,157 @@
+// Text: sizes in ViroReact's units (0.01 world units a point), word, character and no
+// wrapping, justification to the box width, clipping and the line cap, alignment of the
+// laid-out glyphs, rebuilding a text node, and the glyphs drawn where the layout puts them.
+import <io>;
+import <mem>;
+import <list>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <font/ttf>;
+import <scene>;
+import <scene/text>;
+
+const int N = 64;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b, float tol) {
+    return a - b < tol && b - a < tol;
+}
+
+float advance(*Font f, string s, float size) {
+    float w = 0.0;
+    for (i in 0..strlen(s)) w += (float)f.advance(f.glyph((uint32)(uint8)s[i])) * f.scale(size) * 0.01;
+    return w;
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+Result<int, string> run() {
+    Font f = font_load("tests/data/DejaVuSans-Latin1.ttf")?;
+    defer f.free();
+    SceneTextStyle st = scene_text_style();
+    check("ViroText defaults", st.size == 18.0 && st.width == 1.0 && st.height == 1.0 && st.line_break == SCENE_TEXT_WORD_WRAP);
+    float lh = f.line_height(18.0) * 0.01;
+
+    float w = 0.0;
+    float h = 0.0;
+    scene_text_size(&f, "Hello", st, &w, &h);
+    check("one line: width is the advances at 0.01 a point", near(w, advance(&f, "Hello", 18.0), 1e-5) && near(h, lh, 1e-5));
+
+    // word wrap in a box 1 unit wide
+    string words = "aaaa bbbb cccc dddd eeee ffff";
+    scene_text_size(&f, words, st, &w, &h);
+    int lines = (int)(h / lh + 0.5);
+    check("wraps by words", lines >= 2 && w <= 1.0);
+    // no wrap: one line as wide as the whole text, a newline still breaks
+    SceneTextStyle nw = st;
+    nw.line_break = SCENE_TEXT_NO_WRAP;
+    scene_text_size(&f, words, nw, &w, &h);
+    check("no wrap: one line", near(h, lh, 1e-5) && near(w, advance(&f, words, 18.0), 1e-4));
+    scene_text_size(&f, "ab\ncd", nw, &w, &h);
+    check("no wrap breaks at a newline", near(h, 2.0 * lh, 1e-5));
+    // character wrap fills each line closer to the width than word wrap
+    SceneTextStyle cw = st;
+    cw.line_break = SCENE_TEXT_CHAR_WRAP;
+    scene_text_size(&f, words, cw, &w, &h);
+    check("char wrap: lines fit", w <= 1.0 && w > 0.9);
+    // the line cap and clipping to the box height
+    SceneTextStyle cap = st;
+    cap.max_lines = 1;
+    scene_text_size(&f, words, cap, &w, &h);
+    check("max lines", near(h, lh, 1e-5));
+    SceneTextStyle clip = st;
+    clip.clip = true;
+    clip.height = lh * 2.5;
+    scene_text_size(&f, "a\nb\nc\nd", clip, &w, &h);
+    check("clipped to the box", near(h, 2.0 * lh, 1e-5));
+
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+
+    // justify: every line but the last spans the box
+    SceneTextStyle js = st;
+    js.line_break = SCENE_TEXT_JUSTIFY;
+    SceneText jt = scene.add_text(0, &f, words, js)?;
+    *SceneMesh jm = &scene.meshes.data[jt.mesh];
+    check("justified lines reach both sides", jt.lines >= 2 && jm.max.x > 0.45 && jm.min.x < -0.45);
+
+    // alignment: a left, top aligned word starts at the box's left edge, its first line
+    // below the top edge
+    SceneText t = scene.add_text(0, &f, "Ag", st)?;
+    *SceneMesh m = &scene.meshes.data[t.mesh];
+    check("left aligned", m.min.x >= -0.5 && m.min.x < -0.45);
+    check("top aligned within the box", m.max.y <= 0.5 + 1e-4 && m.max.y > 0.5 - lh);
+    SceneTextStyle cc = st;
+    cc.align = SCENE_TEXT_CENTER;
+    cc.valign = SCENE_TEXT_MIDDLE;
+    t.set(&scene, &f, "Ag", cc)?;
+    m = &scene.meshes.data[t.mesh];
+    check("centered", near((m.min.x + m.max.x) * 0.5, 0.0, 0.02) && m.max.y > 0.0 && m.min.y < 0.0);
+    int mesh = t.mesh;
+    t.set(&scene, &f, "", cc)?;
+    check("empty text draws nothing", scene.node(t.node).mesh == 0 && t.lines == 0);
+    t.set(&scene, &f, "Hi", cc)?;
+    check("rebuilt into the same mesh", t.mesh == mesh && scene.node(t.node).mesh == mesh);
+    scene.remove(jt.node);
+
+    // drawn: white glyphs on black, only inside the text's bounds
+    int cam = scene.add_camera(0, scene_orthographic(1.0, 0.1, 10.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 2.0};
+    scene.set_camera(cam);
+    SceneTextStyle big = cc;
+    big.size = 40.0;
+    t.set(&scene, &f, "H", big)?;
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    m = &scene.meshes.data[t.mesh];
+    int lit = 0;
+    int stray = 0;
+    for (y in 0..N) {
+        for (x in 0..N) {
+            float v = half_to_float(px[(y * N + x) * 4]);
+            float wx = ((float)x + 0.5) / (float)N - 0.5;
+            float wy = 0.5 - ((float)y + 0.5) / (float)N;
+            bool inside = wx >= m.min.x - 0.02 && wx <= m.max.x + 0.02 && wy >= m.min.y - 0.02 && wy <= m.max.y + 0.02;
+            if (v > 0.5) {
+                if (inside) lit++;
+                else stray++;
+            }
+        }
+    }
+    check("glyph drawn", lit > 20);
+    check("nothing outside the glyph's bounds", stray == 0);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("text: ok\n");
+    return 0;
+}
