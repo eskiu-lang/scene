@@ -72,6 +72,9 @@ scene.set_camera(cam);
 image to the top. `SceneCamera.aspect` 0 takes the target's width over height. With no
 camera set, the scene renders from the origin down -Z with a perspective of 1 radian.
 
+`scene_projection(matrix, near, far)` is a camera with a projection matrix of its own (depth
+0 at near to 1 at far, as eskiu-gpu's), as an AR session gives one ([rendering](rendering.md)).
+
 ## Meshes and shapes
 
 A `SceneGeometry` is a mesh on the CPU: an interleaved vertex array (position, normal,

@@ -133,6 +133,25 @@ prefiltered specular cube and the BRDF table, times `ibl.intensity`, in place of
 ambient lights (see [materials](materials.md#lighting-models)). The other models keep the
 ambient lights. Both pointers must outlive their use; the scene does not release them.
 
+## AR: the camera picture
+
+An AR app draws the camera picture behind the scene: `Scene.camera_background` is a texture
+id holding the picture already fitted to the view (eskiu-lang/ar's frame drawn with
+`<gpu/yuv>` into a texture of the view's size, then `Scene_borrow_texture`), with
+`Scene.background` at alpha 0. The final pass puts the scene over it as premultiplied color,
+after tone mapping and effects, so the picture stays as the camera shot it: opaque surfaces
+cover it, blended ones mix with it and additive ones (a hologram, sparks) glow on it.
+
+The camera then takes the session's matrices: its node's transform is the device's pose and
+`scene_projection(matrix, near, far)` gives it the session's projection (the intrinsics and
+the crop the picture was fitted with).
+
+```eskiu
+scene.camera_background = scene.borrow_texture(scene.camera_background, &camera_picture);
+scene.background = Vec4{0.0, 0.0, 0.0, 0.0};
+*scene.camera(cam) = scene_projection(*(*Mat4)&frame.projection(w, h, 0.02, 100.0), 0.02, 100.0);
+```
+
 ## Formats
 
 The scene renders into any color target: a surface frame (BGRA8Unorm or its sRGB twin), an

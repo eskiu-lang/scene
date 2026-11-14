@@ -53,6 +53,8 @@ import <scene/sky>;
 // Camera projections (SceneCamera.projection).
 const int SCENE_PERSPECTIVE = 0;
 const int SCENE_ORTHOGRAPHIC = 1;
+// A camera with a given projection matrix (SceneCamera.matrix), as an AR session gives it.
+const int SCENE_CUSTOM = 2;
 
 // A camera, attached to a node: it sits at the node's origin and looks down the node's -Z
 // axis with +Y up. fov is the vertical field of view in radians (perspective), height the
@@ -65,6 +67,15 @@ struct SceneCamera {
     float far;
     float height;
     float aspect;
+    Mat4 matrix;
+}
+
+// A camera with projection matrix (depth 0 at near to 1 at far, as eskiu-gpu's); near and
+// far are what the matrix was made with.
+SceneCamera scene_projection(Mat4 matrix, float near, float far) {
+    SceneCamera c = SceneCamera{SCENE_CUSTOM, 1.0, near, far, 0.0, 0.0};
+    c.matrix = matrix;
+    return c;
 }
 
 // A perspective camera with a vertical field of view of fov radians.
@@ -326,7 +337,11 @@ struct _SceneRenderer {
 // at the origin looking down -Z). The lists are the scene's objects by id. camera_texture
 // (a texture id) and camera_image_transform are what shader modifiers get as camera_texture
 // and camera_image_transform (ViroReact's AR camera image and its mapping from the view's
-// coordinates): an AR session sets them each frame.
+// coordinates): an AR session sets them each frame. camera_background (a texture id, 0 for
+// none) is shown behind what the scene draws, as it is (not tone mapped): the scene goes over
+// it as premultiplied color (with a background of alpha 0), so opaque surfaces cover it,
+// blended ones mix with it and additive ones glow on it: the AR camera picture, already
+// fitted to the view.
 struct Scene {
     Gpu gpu;
     List<SceneNode> nodes;
@@ -351,6 +366,7 @@ struct Scene {
     int active_portal;
     int camera_texture;
     Mat4 camera_image_transform;
+    int camera_background;
     _SceneRenderer _r;
 }
 
@@ -1851,7 +1867,9 @@ void Scene_camera_matrices(*Scene self, uint32 width, uint32 height, *Mat4 view,
     float aspect = cam.aspect > 0.0 ? cam.aspect : (float)width / (float)(height > 0 ? height : (uint32)1);
     float near = cam.near > 0.0 ? cam.near : 0.1;
     float far = cam.far > near ? cam.far : near * 1000.0;
-    if (cam.projection == SCENE_ORTHOGRAPHIC) {
+    if (cam.projection == SCENE_CUSTOM) {
+        *proj = cam.matrix;
+    } else if (cam.projection == SCENE_ORTHOGRAPHIC) {
         float h = cam.height > 0.0 ? cam.height * 0.5 : 1.0;
         *proj = mat4_ortho(-h * aspect, h * aspect, -h, h, near, far);
     } else {
@@ -2285,7 +2303,9 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     // turn, as ViroReact walks its portal tree
     _scene_portals_from(self, &pass, active, -1, 0)?;
     pass.end()?;
-    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post);
+    *GpuTexture bg = self.camera_background > 0 && self.camera_background < self.textures.size &&
+        self.textures.data[self.camera_background].handle != null ? &self.textures.data[self.camera_background] : null;
+    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post, bg);
 }
 
 // How many portals deep the scene draws from the world the camera is in.

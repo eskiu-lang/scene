@@ -75,6 +75,9 @@ All notable changes to this package are documented here. The format follows
   depth), `camera_texture` and `camera_image_transform` (`Scene.camera_texture`,
   `Scene.camera_image_transform`); geometry modifiers apply to the shadow maps.
   `docs/modifiers.md`.
+- AR rendering: `Scene.camera_background` shows the camera picture behind the scene as it
+  is (the scene over it as premultiplied color), and `scene_projection` /
+  `SCENE_CUSTOM` give a camera the session's projection matrix.
 - `<scene/physics>`: `ScenePhysicsWorld`, ViroReact's physics bodies: static, kinematic and
   dynamic bodies with box, sphere, automatic and compound shapes, gravity, friction,
   restitution, forces, torques, impulses, constant velocities and sleeping, stepped in fixed

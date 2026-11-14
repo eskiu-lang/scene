@@ -144,6 +144,7 @@ string _scene_post_wgsl =
     "@group(0) @binding(1) var src: texture_2d<f32>;\n"
     "@group(0) @binding(2) var samp: sampler;\n"
     "@group(0) @binding(3) var bloom_tex: texture_2d<f32>;\n"
+    "@group(0) @binding(4) var camera_tex: texture_2d<f32>;\n"
     "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n"
     "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
     "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
@@ -300,7 +301,13 @@ void _scene_post_shader(*int effects, *String out) {
         body.free();
         prev.free();
     }
-    out.appendf("@fragment fn fs_tone(v: V) -> @location(0) vec4<f32> {\n    let e = fx%d(v.uv);\n", n);
+    out.appendf("@fragment fn fs_tone(v: V) -> @location(0) vec4<f32> {\n    var e = fx%d(v.uv);\n", n);
+    // the camera picture behind the scene, as shown: the scene is over it as premultiplied
+    // color (opaque covers it, blended mixes, additive glows on it)
+    out.append("    if (post.c.w > 0.5) {\n"
+        "        let a = clamp(textureSampleLevel(src, samp, v.uv, 0.0).a, 0.0, 1.0);\n"
+        "        e = e + textureSampleLevel(camera_tex, samp, v.uv, 0.0).rgb * (1.0 - a);\n"
+        "    }\n");
     // an sRGB target encodes what it is given: hand it back the linear value
     out.append("    if (post.b.y > 0.5) { return vec4<f32>(linear(e), 1.0); }\n");
     out.append("    return vec4<f32>(e, 1.0);\n}\n");
@@ -342,6 +349,7 @@ Result<int, string> _scene_post_make(*_ScenePostGpu self, *Gpu gpu) {
     self.layout.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
     self.layout.sampler(2, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
     self.layout.texture(3, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    self.layout.texture(4, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
     *GpuBindLayout[1] groups = {&self.layout};
     GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_post_wgsl, vertex: "vs", fragment: "fs_bright",
         format: WGPUTextureFormat_RGBA16Float, groups: &groups[0], group_count: 1};
@@ -371,6 +379,7 @@ Result<int, string> _scene_post_make(*_ScenePostGpu self, *Gpu gpu) {
         all[i].sampler(2, &self.samp);
         all[i].texture(1, &self.black);
         all[i].texture(3, &self.black);
+        all[i].texture(4, &self.black);
     }
     self.made = true;
     return Ok<int, string>(0);
@@ -407,7 +416,7 @@ bool _scene_is_srgb(WGPUTextureFormat f) {
 
 // Records the bloom passes (when on) and the tone mapping pass from hdr into view.
 Result<int, string> _scene_post_run(*_ScenePostGpu self, *GpuEncoder enc, *GpuTexture hdr, WGPUTextureView view,
-                                    WGPUTextureFormat format, *ScenePost p) {
+                                    WGPUTextureFormat format, *ScenePost p, *GpuTexture background) {
     *GpuTexture bloom_src = &self.black;
     if (p.bloom) {
         uint32 w = hdr.width / 2;
@@ -451,6 +460,7 @@ Result<int, string> _scene_post_run(*_ScenePostGpu self, *GpuEncoder enc, *GpuTe
     }
     self.g_tone.texture(1, hdr);
     self.g_tone.texture(3, bloom_src);
+    self.g_tone.texture(4, background != null ? background : &self.black);
     float strength = p.bloom ? (p.bloom_strength > 0.0 ? p.bloom_strength : 1.0) : 0.0;
     float white = p.white_point > 0.0 ? p.white_point : 11.2;
     bool encode = p.gamma && !_scene_is_srgb(format);
@@ -458,7 +468,7 @@ Result<int, string> _scene_post_run(*_ScenePostGpu self, *GpuEncoder enc, *GpuTe
     Vec4 win = p.window;
     if (win.x == 0.0 && win.y == 0.0 && win.z == 0.0 && win.w == 0.0) win = Vec4{0.0, 0.0, 1.0, 1.0};
     float[16] ut = {(float)p.tone_mapping, p.exposure, white, strength, encode ? 1.0 : 0.0, srgb_target ? 1.0 : 0.0, 0.0, 0.0,
-        (float)hdr.width, (float)hdr.height, p.time * 2.0, 0.0, win.x, win.y, win.z, win.w};
+        (float)hdr.width, (float)hdr.height, p.time * 2.0, background != null ? 1.0 : 0.0, win.x, win.y, win.z, win.w};
     self.u_tone.write(0, &ut, 64);
     *GpuPipeline tone = _scene_post_tone_pipe(self, format, &p.effects[0])?;
     GpuPass tp = enc.pass(view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);

@@ -63,6 +63,14 @@ const int SCENE_ORTHOGRAPHIC = 1;
 
 Camera projections (SceneCamera.projection).
 
+### SCENE_CUSTOM
+
+```eskiu
+const int SCENE_CUSTOM = 2;
+```
+
+A camera with a given projection matrix (SceneCamera.matrix), as an AR session gives it.
+
 ### SceneCamera
 
 ```eskiu
@@ -73,6 +81,7 @@ struct SceneCamera {
     float far;
     float height;
     float aspect;
+    Mat4 matrix;
 }
 ```
 
@@ -80,6 +89,15 @@ A camera, attached to a node: it sits at the node's origin and looks down the no
 axis with +Y up. fov is the vertical field of view in radians (perspective), height the
 visible height in world units (orthographic), near and far the clipping distances, and
 aspect the width over height (0 takes the target's).
+
+### scene_projection
+
+```eskiu
+SceneCamera scene_projection(Mat4 matrix, float near, float far)
+```
+
+A camera with projection matrix (depth 0 at near to 1 at far, as eskiu-gpu's); near and
+far are what the matrix was made with.
 
 ### scene_perspective
 
@@ -239,6 +257,7 @@ struct Scene {
     int active_portal;
     int camera_texture;
     Mat4 camera_image_transform;
+    int camera_background;
 }
 ```
 
@@ -251,7 +270,11 @@ shadow map (2048). camera is the node of the camera that renders (-1 is a defaul
 at the origin looking down -Z). The lists are the scene's objects by id. camera_texture
 (a texture id) and camera_image_transform are what shader modifiers get as camera_texture
 and camera_image_transform (ViroReact's AR camera image and its mapping from the view's
-coordinates): an AR session sets them each frame.
+coordinates): an AR session sets them each frame. camera_background (a texture id, 0 for
+none) is shown behind what the scene draws, as it is (not tone mapped): the scene goes over
+it as premultiplied color (with a background of alpha 0), so opaque surfaces cover it,
+blended ones mix with it and additive ones glow on it: the AR camera picture, already
+fitted to the view.
 
 ### Gpu_scene
 

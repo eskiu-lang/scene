@@ -1,0 +1,123 @@
+// AR rendering: the camera picture behind the scene (Scene.camera_background), covered by
+// opaque surfaces, mixed under blended ones and brightened by additive ones, untouched by
+// tone mapping; and a camera given its projection matrix (scene_projection) drawing what
+// the same perspective camera draws.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 32;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(int a, int b, int tol) {
+    return a - b <= tol && b - a <= tol;
+}
+
+*uint8 at(*uint8 px, int x, int y) {
+    return px + (y * N + x) * 4;
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.tone_mapping = SCENE_TONE_HABLE;
+    scene.background = Vec4{0.0, 0.0, 0.0, 0.0};
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA8Unorm)?;
+    defer target.release();
+    *uint8 px = alloc<uint8>(N * N * 4);
+    defer free(px);
+    // the camera picture: a flat display color
+    uint8[4] grey = {100, 150, 200, 255};
+    GpuImageOptions lo = GpuImageOptions{srgb: false};
+    scene.camera_background = scene.add_texture(gpu.image_with(1, 1, &grey[0], &lo)?);
+    SceneGeometry q = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    int cam = scene.add_camera(0, scene_orthographic(2.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("an empty scene shows the camera as it is", near((int)at(px, 16, 16)[0], 100, 1) && near((int)at(px, 16, 16)[1], 150, 1) &&
+        near((int)at(px, 16, 16)[2], 200, 1));
+
+    // opaque white: covers the camera
+    SceneMaterial w = scene_material(SCENE_CONSTANT);
+    w.diffuse = Vec4{0.3, 0.3, 0.3, 1.0};
+    int obj = scene.add_object(0, quad, scene.add_material(w));
+    scene.post.tone_mapping = SCENE_TONE_NONE;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    // 0.3 linear is 149 in sRGB
+    check("an opaque surface covers the camera", near((int)at(px, 16, 16)[0], 149, 2) && near((int)at(px, 16, 16)[2], 149, 2));
+    check("around it the camera", near((int)at(px, 2, 2)[0], 100, 1));
+
+    // additive red: the camera shows through, red added
+    SceneMaterial add = scene_material(SCENE_CONSTANT);
+    add.diffuse = Vec4{0.2, 0.0, 0.0, 1.0};
+    add.alpha_mode = SCENE_ALPHA_BLEND;
+    add.blend_mode = SCENE_BLEND_ADD;
+    scene.node(obj).material = scene.add_material(add);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    *uint8 p = at(px, 16, 16);
+    check("an additive surface glows over the camera", (int)p[0] > 130 && near((int)p[1], 150, 2) && near((int)p[2], 200, 2));
+
+    // half-transparent black: halfway to black
+    SceneMaterial half = scene_material(SCENE_CONSTANT);
+    half.diffuse = Vec4{0.0, 0.0, 0.0, 0.5};
+    half.alpha_mode = SCENE_ALPHA_BLEND;
+    scene.node(obj).material = scene.add_material(half);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    p = at(px, 16, 16);
+    check("a blended surface mixes with the camera", near((int)p[0], 50, 3) && near((int)p[2], 100, 3));
+    scene.camera_background = 0;
+
+    // a camera with the perspective camera's own matrix draws the same picture
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = Vec4{1.0, 1.0, 1.0, 1.0};
+    scene.node(obj).material = scene.add_material(m);
+    scene.node(obj).position = Vec3{0.3, 0.1, 0.0};
+    scene.background = Vec4{0.0, 0.0, 0.0, 1.0};
+    *SceneCamera c = scene.camera(cam);
+    *c = scene_perspective(0.9, 0.1, 20.0);
+    scene.render_to(&target)?;
+    *uint8 first = alloc<uint8>(N * N * 4);
+    defer free(first);
+    target.read(first)?;
+    *c = scene_projection(mat4_perspective(0.9, 1.0, 0.1, 20.0), 0.1, 20.0);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    int diff = 0;
+    for (i in 0..N * N * 4) {
+        int d = (int)first[i] - (int)px[i];
+        if (d > 1 || d < -1) diff++;
+    }
+    check("a given projection matches the perspective camera", diff == 0);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("ar: ok\n");
+    return 0;
+}
