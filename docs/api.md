@@ -206,6 +206,8 @@ struct Scene {
     float sky_intensity;
     bool sky_flip;
     GpuTexture sky_faces;
+    bool sky_pano;
+    Quat sky_rotation;
     *GpuIbl ibl;
     ScenePost post;
     uint32 shadow_size;
@@ -213,8 +215,9 @@ struct Scene {
 ```
 
 A scene and its renderer. background is the linear color behind everything when there
-is no skybox; skybox (with sky_intensity, and sky_flip for a cube of six images) is
-set by Scene_set_skybox or Scene_set_skybox_faces; ibl by Scene_set_ibl; post holds
+is no skybox; skybox (with sky_intensity, and sky_flip for a cube of six images, sky_pano
+for a 360 image) is set by Scene_set_skybox, Scene_set_skybox_faces, Scene_set_sky_360 or
+Scene_load_sky_360, and sky_rotation turns it; ibl by Scene_set_ibl; post holds
 the tone mapping, gamma and bloom settings; shadow_size is the width and height of each
 shadow map (2048). camera is the node of the camera that renders (-1 is a default camera
 at the origin looking down -Z). The lists are the scene's objects by id.
@@ -510,6 +513,26 @@ Result<int, string> Scene_set_skybox_faces(*Scene self, *Bitmap faces)
 
 Makes a cube from six square images (+X, -X, +Y, -Y, +Z, -Z, see scene_cube_faces) and
 draws it behind the scene, owned by the scene.
+
+### Scene_set_sky_360
+
+```eskiu
+void Scene_set_sky_360(*Scene self, *GpuTexture equirect)
+```
+
+Shows a 360 image behind the scene (ViroReact's Viro360Image): equirectangular, its
+center straight ahead down -Z and its top row straight up, scaled by sky_intensity and
+turned by sky_rotation. The texture stays the caller's (an sRGB image texture with
+mipmaps, or an HDR one from `<gpu/ibl>`'s loaders).
+
+### Scene_load_sky_360
+
+```eskiu
+Result<int, string> Scene_load_sky_360(*Scene self, string path)
+```
+
+Loads a 360 image from a PNG or JPEG file into a texture the scene keeps, and shows it
+as with Scene_set_sky_360.
 
 ### Scene_set_ibl
 
@@ -1905,9 +1928,10 @@ An sRGB-encoded value (0 to 1) back to linear light.
 
 The background of a scene (`<scene/sky>`).
 
-Behind everything a scene shows a solid color (Scene.background) or a cube
-map: an environment from `<gpu/ibl>` (GpuIbl.environment, radiance by
-direction) with Scene_set_skybox, or six images with Scene_set_skybox_faces.
+Behind everything a scene shows a solid color (Scene.background), a cube
+map (an environment from `<gpu/ibl>`, GpuIbl.environment, with Scene_set_skybox,
+or six images with Scene_set_skybox_faces), or a 360 image, equirectangular, with
+Scene_set_sky_360 (ViroReact's Viro360Image). Scene.sky_rotation turns it.
 
 ```eskiu
 GpuIbl ibl = gpu.ibl(&sky_hdr, null)?;

@@ -84,6 +84,13 @@ order +X, -X, +Y, -Y, +Z, -Z, the usual skybox image sets (OpenGL's convention, 
 +Z image is the one in front of a camera looking down -Z), and the scene owns the cube it
 makes. `scene_cube_faces` makes that cube on its own.
 
+A 360 image works the same way (ViroReact's `Viro360Image`): `Scene_load_sky_360(path)`
+loads an equirectangular PNG or JPEG the scene keeps, and `Scene_set_sky_360(&texture)`
+takes any 2D texture, an HDR one included. Its center is straight ahead down -Z, its left
+and right edges meet behind, and its top row is straight up. `Scene.sky_rotation` turns
+any sky, cube or 360, in the world (ViroReact's `rotation` on `Viro360Image` and
+`ViroSkyBox`).
+
 `Scene_set_ibl` lights `SCENE_PBR` materials with the environment's irradiance, its
 prefiltered specular cube and the BRDF table, times `ibl.intensity`, in place of the
 ambient lights (see [materials](materials.md#lighting-models)). The other models keep the

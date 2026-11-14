@@ -36,8 +36,8 @@ pipeline.
   and outer cones), up to 8 per draw, and directional shadow maps with soft edges.
 - **HDR.** Linear RGBA16Float rendering, transparent surfaces sorted back to front,
   Reinhard, exposure and Hable tone mapping, bloom, and sRGB output.
-- **Sky.** A solid color, a cube map from `<gpu/ibl>` or six images, and image-based
-  lighting for PBR materials.
+- **Sky.** A solid color, a cube map from `<gpu/ibl>` or six images, a 360 image, and
+  image-based lighting for PBR materials.
 - **Text.** TrueType text from eskiu-lang/font in a box, wrapped, aligned, justified and
   clipped as ViroText lays it out.
 - **Animation.** Position, scale, rotation, opacity and color animated in groups and
