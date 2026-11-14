@@ -1,0 +1,444 @@
+// scene_assets.esk: textures, lights, the sky and glTF models in the scene (part of scene.esk, which imports it in order after the ones before it)
+
+// Adds a texture the scene takes over (it is released with the scene) and returns its id.
+// Color textures (diffuse, specular, emissive) should be in an sRGB format; normal,
+// metal-roughness and occlusion maps in a linear one.
+int Scene_add_texture(*Scene self, GpuTexture texture) {
+    List_push(&self.textures, texture);
+    return self.textures.size - 1;
+}
+
+// Replaces texture id with texture, releasing the old one; every material using the id
+// shows the new one. False for an unknown id (texture is then not taken over).
+bool Scene_set_texture(*Scene self, int id, GpuTexture texture) {
+    if (id <= 0 || id >= self.textures.size) return false;
+    if (!_scene_borrowed(self, id)) self.textures.data[id].release();
+    self.textures.data[id] = texture;
+    _scene_set_borrowed(self, id, false);
+    for (i in 0..self._r.mats.size) {
+        for (k in 0..6) {
+            if (self._r.mats.data[i].bound[k] == id) self._r.mats.data[i].bound[k] = -1;
+        }
+    }
+    return true;
+}
+
+bool _scene_borrowed(*Scene self, int id) {
+    return id >= 0 && id < self._borrowed.size && self._borrowed.data[id];
+}
+
+void _scene_set_borrowed(*Scene self, int id, bool on) {
+    while (self._borrowed.size <= id) List_push(&self._borrowed, false);
+    self._borrowed.data[id] = on;
+}
+
+// Shows texture, which stays the caller's (the scene never releases it), under texture id
+// id, or under a new id when id is 0; returns the id. For pictures another part of the
+// program makes each frame, a video frame turned to RGBA by <gpu/yuv> for one
+// (ViroReact's video materials): call it again whenever that texture is made anew (a new
+// size), as its handle changes.
+int Scene_borrow_texture(*Scene self, int id, *GpuTexture texture) {
+    if (id <= 0 || id >= self.textures.size) {
+        List_push(&self.textures, *texture);
+        id = self.textures.size - 1;
+    } else {
+        if (!_scene_borrowed(self, id)) self.textures.data[id].release();
+        self.textures.data[id] = *texture;
+        for (i in 0..self._r.mats.size) {
+            for (k in 0..6) {
+                if (self._r.mats.data[i].bound[k] == id) self._r.mats.data[i].bound[k] = -1;
+            }
+        }
+    }
+    _scene_set_borrowed(self, id, true);
+    return id;
+}
+
+// A texture from decoded pixels, stored as sRGB when srgb (color data) or linear (normal,
+// metal-roughness and occlusion maps), with mipmaps; returns its id.
+Result<int, string> Scene_image_texture(*Scene self, *Bitmap image, bool srgb) {
+    GpuImageOptions o = GpuImageOptions{srgb: srgb, mipmaps: true};
+    GpuTexture t = self.gpu.image_with(image.width, image.height, image.rgba, &o)?;
+    return Ok<int, string>(Scene_add_texture(self, t));
+}
+
+// A texture from a PNG or JPEG file (see Scene_image_texture); returns its id.
+Result<int, string> Scene_load_texture(*Scene self, string path, bool srgb) {
+    Bitmap img = image_load(path)?;
+    defer img.free();
+    return Scene_image_texture(self, &img, srgb);
+}
+
+// The texture with id texture, or null for 0 or an unknown id.
+*GpuTexture Scene_texture(*Scene self, int texture) {
+    if (texture <= 0 || texture >= self.textures.size) return null;
+    return &self.textures.data[texture];
+}
+
+// Adds a light and returns its id (from 0).
+int Scene_add_light(*Scene self, SceneLight light) {
+    List_push(&self.lights, light);
+    return self.lights.size - 1;
+}
+
+// The light with id light, or null for an unknown id. Changes show at the next render.
+*SceneLight Scene_light(*Scene self, int light) {
+    if (light < 0 || light >= self.lights.size) return null;
+    return &self.lights.data[light];
+}
+
+// Draws cube (a cube texture: an environment from `<gpu/ibl>` or Gpu_texture_with with
+// cube) behind the scene, sampled by world direction, scaled by sky_intensity. The texture
+// is not owned and must outlive its use; null goes back to the background color.
+void Scene_set_skybox(*Scene self, *GpuTexture cube) {
+    self.skybox = cube;
+    self.sky_flip = false;
+    self.sky_pano = false;
+}
+
+// Makes a cube from six square images (+X, -X, +Y, -Y, +Z, -Z, see scene_cube_faces) and
+// draws it behind the scene, owned by the scene.
+Result<int, string> Scene_set_skybox_faces(*Scene self, *Bitmap faces) {
+    GpuTexture t = scene_cube_faces(&self.gpu, faces)?;
+    self.sky_faces.release();
+    self.sky_faces = t;
+    self.skybox = &self.sky_faces;
+    self.sky_flip = true;
+    self.sky_pano = false;
+    return Ok<int, string>(0);
+}
+
+// Shows a 360 image behind the scene (ViroReact's Viro360Image): equirectangular, its
+// center straight ahead down -Z and its top row straight up, scaled by sky_intensity and
+// turned by sky_rotation. The texture stays the caller's (an sRGB image texture with
+// mipmaps, or an HDR one from <gpu/ibl>'s loaders).
+void Scene_set_sky_360(*Scene self, *GpuTexture equirect) {
+    self.skybox = equirect;
+    self.sky_flip = false;
+    self.sky_pano = true;
+}
+
+// Loads a 360 image from a PNG or JPEG file into a texture the scene keeps, and shows it
+// as with Scene_set_sky_360.
+Result<int, string> Scene_load_sky_360(*Scene self, string path) {
+    Bitmap img = image_load(path)?;
+    defer img.free();
+    GpuImageOptions o = GpuImageOptions{srgb: true, mipmaps: true};
+    GpuTexture t = self.gpu.image_with(img.width, img.height, img.rgba, &o)?;
+    self.sky_faces.release();
+    self.sky_faces = t;
+    Scene_set_sky_360(self, &self.sky_faces);
+    return Ok<int, string>(0);
+}
+
+// Lights PBR materials with an environment from `<gpu/ibl>` (its irradiance, specular cube
+// and BRDF table, times ibl.intensity) in place of the ambient lights; null goes back to
+// them. The GpuIbl is not owned and must outlive its use.
+void Scene_set_ibl(*Scene self, *GpuIbl ibl) {
+    self.ibl = ibl;
+}
+
+// The number of material pipelines made so far (one per variant drawn).
+int Scene_pipeline_count(*Scene self) {
+    return self._r.pipes.size;
+}
+
+int _scene_gltf_texture(*Scene self, *Gltf g, *SceneGltf out, int ref, bool srgb) {
+    if (ref < 0 || ref >= g.textures.size) return 0;
+    int image = g.textures.data[ref].image;
+    if (image < 0 || image >= g.images.size) return 0;
+    int slot = image * 2 + (srgb ? 1 : 0);
+    if (out.textures.data[slot] != 0) return out.textures.data[slot];
+    *GltfImage img = &g.images.data[image];
+    if (img.data == null || img.len == 0) return 0;
+    Result<Bitmap, string> dec = image_decode(img.data, img.len);
+    if (!dec.ok) return 0;
+    Bitmap pic = dec.value;
+    Result<int, string> t = Scene_image_texture(self, &pic, srgb);
+    Bitmap_free(&pic);
+    if (!t.ok) return 0;
+    out.textures.data[slot] = t.value;
+    return t.value;
+}
+
+// A glTF texture reference's coordinates as a SceneUv.
+SceneUv _scene_gltf_uv(GltfTextureRef r) {
+    return SceneUv{set: r.texcoord == 1 ? 1 : 0, transform: r.has_transform, offset: r.offset, rotation: r.rotation,
+                   scale: r.tscale};
+}
+
+// Copies what an animation can change in a glTF material (factors and texture transforms)
+// to its scene material.
+void _scene_gltf_material_sync(*SceneMaterial m, *GltfMaterial gm) {
+    m.diffuse = gm.base_color;
+    m.metalness = gm.metallic;
+    m.roughness = gm.roughness;
+    m.emissive = gm.emissive;
+    m.alpha_cutoff = gm.alpha_cutoff;
+    m.uv[SCENE_TEX_DIFFUSE] = _scene_gltf_uv(gm.base_color_texture);
+    m.uv[SCENE_TEX_NORMAL] = _scene_gltf_uv(gm.normal_texture);
+    m.uv[SCENE_TEX_EMISSIVE] = _scene_gltf_uv(gm.emissive_texture);
+    m.uv[SCENE_TEX_METAL_ROUGH] = _scene_gltf_uv(gm.metallic_roughness_texture);
+    m.uv[SCENE_TEX_OCCLUSION] = _scene_gltf_uv(gm.occlusion_texture);
+}
+
+// Whether glTF node gi and its ancestors are all visible (KHR_node_visibility).
+bool _scene_gltf_shown(*Gltf g, int gi) {
+    int guard = 0;
+    while (gi >= 0 && gi < g.nodes.size && guard < 4096) {
+        if (g.nodes.data[gi].hidden) return false;
+        gi = g.nodes.data[gi].parent;
+        guard++;
+    }
+    return true;
+}
+
+void _scene_gltf_node(*Scene self, *Gltf g, *SceneGltf out, int gi, int parent, int default_mat) {
+    if (gi < 0 || gi >= g.nodes.size || out.nodes.data[gi] != 0) return;
+    *GltfNode gn = &g.nodes.data[gi];
+    int id = Scene_add_node(self, parent, gn.name.data != null ? (string)gn.name.data : null);
+    out.nodes.data[gi] = id;
+    *SceneNode n = &self.nodes.data[id];
+    if (gn.has_matrix) {
+        scene_decompose(gn.matrix, &n.position, &n.rotation, &n.scale);
+    } else {
+        n.position = gn.translation;
+        n.rotation = gn.rotation;
+        n.scale = gn.scale;
+    }
+    if (gn.mesh >= 0 && gn.mesh < g.meshes.size) {
+        *GltfMesh mesh = &g.meshes.data[gn.mesh];
+        for (p in 0..mesh.primitives.size) {
+            int sm = out.meshes.data[out.prim_start.data[gn.mesh] + p];
+            if (sm == 0) continue;
+            int gm = mesh.primitives.data[p].material;
+            int mat = gm >= 0 && gm < out.materials.size ? out.materials.data[gm] : default_mat;
+            // A skinned primitive's vertices end up in the model's space through its joints,
+            // so it hangs from the model's root rather than from its node.
+            bool skinned = gn.skin >= 0 && gn.skin < g.skins.size && mesh.primitives.data[p].joints != null;
+            int obj = Scene_add_object(self, skinned ? out.root : id, sm, mat);
+            List_push(&out.prim_nodes, obj);
+            List_push(&out.prim_src, gi);
+            List_push(&out.prim_skin, skinned ? gn.skin : -1);
+        }
+    }
+    for (c in 0..gn.children.size) _scene_gltf_node(self, g, out, gn.children.data[c], id, default_mat);
+}
+
+// The sampler of glTF texture tex as the material's wrap and filters (one sampler serves
+// all of a material's textures here: the base color texture's).
+void _scene_gltf_sampler(*Gltf g, int tex, *SceneMaterial m) {
+    if (tex < 0 || tex >= g.textures.size) return;
+    int s = g.textures.data[tex].sampler;
+    if (s < 0 || s >= g.samplers.size) return;
+    *GltfSampler gs = &g.samplers.data[s];
+    int[2] wraps = {gs.wrap_s, gs.wrap_t};
+    int[2] modes;
+    for (i in 0..2) {
+        modes[i] = SCENE_WRAP_REPEAT;
+        if (wraps[i] == 33071) modes[i] = SCENE_WRAP_CLAMP;
+        if (wraps[i] == 33648) modes[i] = SCENE_WRAP_MIRROR;
+    }
+    m.wrap_s = modes[0];
+    m.wrap_t = modes[1];
+    if (gs.mag_filter == 9728) m.filter = SCENE_FILTER_NEAREST;
+    // NEAREST and LINEAR minification use no mipmaps; the *_MIPMAP_NEAREST ones pick the
+    // nearest level
+    if (gs.min_filter == 9728 || gs.min_filter == 9729 || gs.min_filter == 9984 || gs.min_filter == 9985) m.mip_filter = SCENE_FILTER_NEAREST;
+}
+
+// Adds a glTF model (from gltf_load, `<gpu/gltf>`, or obj_load) under parent: its images
+// as textures, its materials as PBR materials (CONSTANT for KHR_materials_unlit), its
+// triangle primitives as meshes, and its scene's node tree, each primitive a child node of
+// its glTF node. The Gltf can be freed afterwards unless the model is animated with
+// SceneGltf_pose. Free the result with SceneGltf_free.
+Result<SceneGltf, string> Scene_add_gltf(*Scene self, *Gltf g, int parent) {
+    SceneGltf out;
+    out.root = Scene_add_node(self, parent, "gltf");
+    for (i in 0..g.images.size * 2) List_push(&out.textures, 0);
+    for (i in 0..g.nodes.size) List_push(&out.nodes, 0);
+    for (i in 0..g.materials.size) {
+        GltfMaterial* gm = &g.materials.data[i];
+        SceneMaterial m = scene_material(gm.unlit ? SCENE_CONSTANT : SCENE_PBR);
+        m.diffuse = gm.base_color;
+        m.metalness = gm.metallic;
+        m.roughness = gm.roughness;
+        m.emissive = gm.emissive;
+        m.alpha_mode = gm.alpha_mode;
+        m.alpha_cutoff = gm.alpha_cutoff;
+        m.double_sided = gm.double_sided;
+        m.diffuse_texture = _scene_gltf_texture(self, g, &out, gm.base_color_texture.texture, true);
+        m.metal_rough_texture = _scene_gltf_texture(self, g, &out, gm.metallic_roughness_texture.texture, false);
+        m.normal_texture = _scene_gltf_texture(self, g, &out, gm.normal_texture.texture, false);
+        m.normal_scale = gm.normal_texture.scale;
+        m.occlusion_texture = _scene_gltf_texture(self, g, &out, gm.occlusion_texture.texture, false);
+        m.occlusion_strength = gm.occlusion_texture.scale;
+        m.emissive_texture = _scene_gltf_texture(self, g, &out, gm.emissive_texture.texture, true);
+        _scene_gltf_sampler(g, gm.base_color_texture.texture, &m);
+        _scene_gltf_material_sync(&m, gm);
+        List_push(&out.materials, Scene_add_material(self, m));
+    }
+    SceneMaterial dm = scene_material(SCENE_PBR);
+    dm.roughness = 1.0;
+    int default_mat = Scene_add_material(self, dm);
+    for (i in 0..g.meshes.size) {
+        List_push(&out.prim_start, out.meshes.size);
+        *GltfMesh mesh = &g.meshes.data[i];
+        for (p in 0..mesh.primitives.size) {
+            *GltfPrimitive gp = &mesh.primitives.data[p];
+            int id = 0;
+            if (gp.mode == GLTF_TRIANGLES && gp.vertex_count > 0 && gp.positions != null) {
+                SceneGeometry geo = scene_gltf_geometry(gp);
+                Result<int, string> made = Scene_add_geometry(self, &geo);
+                geo.free();
+                if (made.ok) {
+                    id = made.value;
+                    if (gp.target_count > 0 && gp.target_positions != null) {
+                        (void)Scene_set_morph_targets(self, id, gp.target_positions, gp.target_normals, gp.target_count);
+                    }
+                }
+            }
+            List_push(&out.meshes, id);
+        }
+    }
+    for (i in 0..g.roots.size) _scene_gltf_node(self, g, &out, g.roots.data[i], out.root, default_mat);
+    out.material_version = g.material_version;
+    SceneGltf_pose(&out, self, g);
+    return Ok<SceneGltf, string>(out);
+}
+
+// Copies the glTF model's current state (after Gltf_animate) to the scene: the nodes'
+// transforms and visibility (KHR_node_visibility), the joint matrices of skinned meshes,
+// morph target weights, and the material factors and texture transforms animation
+// pointers changed (KHR_animation_pointer).
+void SceneGltf_pose(*SceneGltf self, *Scene scene, *Gltf g) {
+    for (i in 0..self.nodes.size) {
+        int id = self.nodes.data[i];
+        if (id <= 0 || i >= g.nodes.size || !_scene_valid(scene, id)) continue;
+        *GltfNode gn = &g.nodes.data[i];
+        *SceneNode n = &scene.nodes.data[id];
+        if (gn.has_matrix) {
+            scene_decompose(gn.matrix, &n.position, &n.rotation, &n.scale);
+        } else {
+            n.position = gn.translation;
+            n.rotation = gn.rotation;
+            n.scale = gn.scale;
+        }
+        n.visible = !gn.hidden;
+    }
+    *Mat4 world = alloc<Mat4>(g.nodes.size + 1);
+    defer free(world);
+    Gltf_world(g, world);
+    *Mat4 jm = null;
+    int jcap = 0;
+    for (i in 0..self.prim_nodes.size) {
+        int id = self.prim_nodes.data[i];
+        int src = self.prim_src.data[i];
+        int skin = self.prim_skin.data[i];
+        if (!_scene_valid(scene, id) || src < 0 || src >= g.nodes.size) continue;
+        if (skin >= 0) {
+            scene.nodes.data[id].visible = _scene_gltf_shown(g, src);
+            int nj = g.skins.data[skin].joints.size;
+            if (nj > jcap) {
+                if (jm != null) free(jm);
+                jm = alloc<Mat4>(nj);
+                jcap = nj;
+            }
+            Gltf_joint_matrices(g, skin, world, jm);
+            Scene_set_joints(scene, id, jm, nj);
+        }
+        List<float>* w = &g.nodes.data[src].weights;
+        if (w.size > 0) Scene_set_weights(scene, id, w.data, w.size);
+    }
+    if (jm != null) free(jm);
+    if (self.material_version != g.material_version) {
+        self.material_version = g.material_version;
+        for (i in 0..self.materials.size) {
+            if (i >= g.materials.size) break;
+            _scene_gltf_material_sync(Scene_material(scene, self.materials.data[i]), &g.materials.data[i]);
+        }
+    }
+}
+
+// Frees the id lists (the nodes, meshes, materials and textures stay in the scene).
+void SceneGltf_free(*SceneGltf self) {
+    List_free(&self.nodes);
+    List_free(&self.meshes);
+    List_free(&self.prim_start);
+    List_free(&self.materials);
+    List_free(&self.textures);
+    List_free(&self.prim_nodes);
+    List_free(&self.prim_src);
+    List_free(&self.prim_skin);
+}
+
+WGPUBlendState _scene_blend_state(int mode) {
+    WGPUBlendComponent keep = WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_Zero, WGPUBlendFactor_One};
+    WGPUBlendComponent over = WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_OneMinusSrcAlpha};
+    if (mode == SCENE_BLEND_ADD) {
+        return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_One}, keep};
+    }
+    if (mode == SCENE_BLEND_MULTIPLY) {
+        return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_Dst, WGPUBlendFactor_Zero}, keep};
+    }
+    if (mode == SCENE_BLEND_SUBTRACT) {
+        return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_ReverseSubtract, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_One}, keep};
+    }
+    if (mode == SCENE_BLEND_SCREEN) {
+        return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_OneMinusDst, WGPUBlendFactor_One}, keep};
+    }
+    if (mode == SCENE_BLEND_PREMULTIPLIED) return WGPUBlendState{over, over};
+    return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha}, over};
+}
+
+Result<*GpuPipeline, string> _scene_pipeline(*Scene self, int key) {
+    *_SceneRenderer r = &self._r;
+    for (i in 0..r.pipes.size) {
+        if (r.pipes.data[i].key == key) return Ok<*GpuPipeline, string>(&r.pipes.data[i].pipe);
+    }
+    String src;
+    defer String_free(&src);
+    int sid = scene_key_shader(key);
+    *SceneShader prog = sid > 0 && sid < self.shaders.size ? &self.shaders.data[sid] : null;
+    scene_material_shader_with(key, prog, &src);
+    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)SCENE_VERTEX_FLOATS * 4};
+    defer layout.release();
+    _scene_vertex_layout(&layout);
+    *GpuBindLayout[4] groups = {&r.frame_layout, &r.draw_layout, &r.mat_layout, &r.mat_layout};
+    int group_count = 3;
+    if (prog != null && prog.modifiers.size > 0) {
+        groups[3] = _scene_shader_layout(self, sid);
+        group_count = 4;
+    }
+    bool blend = scene_key_blended(key);
+    WGPUBlendState bs = _scene_blend_state(scene_key_blend(key));
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: "fs",
+        format: WGPUTextureFormat_RGBA16Float, layout: &layout, groups: &groups[0], group_count: (uint32)group_count,
+        depth: true, depth_format: SCENE_DEPTH_FORMAT, depth_read_only: scene_key_skips_depth_write(key),
+        cull: scene_key_double_sided(key) ? WGPUCullMode_None : WGPUCullMode_Back};
+    if (scene_key_skips_depth_test(key)) d.depth_compare = WGPUCompareFunction_Always;
+    if (blend) d.blend_state = &bs;
+    if (scene_key_no_color(key)) {
+        // an occluder: depth only
+        d.no_color_write = true;
+        d.blend_state = null;
+    }
+    if ((key / _SCENE_KEY_MASKED) % 2 == 1) {
+        // drawn only where a portal's window set the stencil to the pass's reference
+        d.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_Equal};
+    }
+    if ((key / _SCENE_KEY_SILHOUETTE) % 2 == 1) {
+        // a portal's window into the stencil: no color, depth tested but not written
+        d.no_color_write = true;
+        d.blend_state = null;
+        d.depth_read_only = true;
+        d.depth_compare = WGPUCompareFunction_LessEqual;
+        d.cull = WGPUCullMode_None;
+        // only inside the window of the world it is seen from (stencil equal to the
+        // reference), raising the stencil there by one: the next world's level
+        d.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_Equal, pass: WGPUStencilOperation_IncrementClamp};
+    }
+    GpuPipeline p = self.gpu.pipeline(&d)?;
+    List_push(&r.pipes, _ScenePipe{key, p});
+    return Ok<*GpuPipeline, string>(&r.pipes.data[r.pipes.size - 1].pipe);
+}

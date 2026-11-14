@@ -1,0 +1,655 @@
+// scene_render.esk: lights, the world bind group, draws and the render passes (part of scene.esk, which imports it in order after the ones before it)
+
+Result<int, string> _scene_lights(*Scene self, *Vec3 ambient) {
+    *_SceneRenderer r = &self._r;
+    List_clear(&r.recs);
+    Vec3 amb = Vec3{0.0, 0.0, 0.0};
+    int shadows = 0;
+    for (i in 0..self.lights.size) {
+        *SceneLight l = &self.lights.data[i];
+        if (!l.enabled) continue;
+        if (l.type == SCENE_LIGHT_AMBIENT) {
+            amb = amb + l.color * l.intensity;
+            continue;
+        }
+        if (r.recs.size >= SCENE_MAX_LIGHTS) continue;
+        _SceneLightRec rec;
+        rec.light = i;
+        rec.type = l.type;
+        rec.pos = l.position;
+        rec.dir = l.direction.normalize();
+        if (l.node >= 0 && _scene_valid(self, l.node)) {
+            Mat4 w = self.nodes.data[l.node].world;
+            rec.pos = w.point(l.position);
+            Vec4 d4 = w * Vec4{l.direction.x, l.direction.y, l.direction.z, 0.0};
+            rec.dir = Vec3{d4.x, d4.y, d4.z}.normalize();
+        }
+        rec.end = l.attenuation_end;
+        rec.mask = l.influence;
+        rec.layer = -1;
+        if ((l.type == SCENE_LIGHT_DIRECTIONAL || l.type == SCENE_LIGHT_SPOT) && l.casts_shadows && shadows < SCENE_MAX_SHADOWS) {
+            rec.layer = shadows;
+            shadows++;
+        }
+        List_push(&r.recs, rec);
+    }
+    *ambient = amb;
+    return Ok<int, string>(shadows);
+}
+
+Mat4 _scene_shadow_matrix(*Scene self, *_SceneLightRec rec, *float texel_world) {
+    *SceneLight l = &self.lights.data[rec.light];
+    if (l.type == SCENE_LIGHT_SPOT) {
+        // ViroReact's spot shadow: a square perspective frustum from the light down its
+        // direction, as wide as the outer cone, from shadow_near to shadow_far
+        float near = l.shadow_near > 0.0 ? l.shadow_near : 0.1;
+        float far = l.shadow_far > near ? l.shadow_far : 20.0;
+        float fov = l.outer_angle * 2.0;
+        if (fov > 3.1) fov = 3.1;
+        Vec3 sd = rec.dir;
+        Vec3 sup = sd.y > 0.99 || sd.y < -0.99 ? Vec3{0.0, 0.0, 1.0} : Vec3{0.0, 1.0, 0.0};
+        Mat4 sview = mat4_look_at(rec.pos, rec.pos + sd, sup);
+        uint32 ssize = self.shadow_size > 0 ? self.shadow_size : (uint32)2048;
+        // the normal offset is sized for a texel halfway down the attenuation range
+        float mid = l.attenuation_end > 0.0 ? l.attenuation_end * 0.5 : far * 0.5;
+        *texel_world = 2.0 * (float)tan((double)(fov * 0.5)) * mid / (float)ssize;
+        return mat4_perspective(fov, 1.0, near, far) * sview;
+    }
+    Vec3 c = l.shadow_center;
+    float radius = l.shadow_radius;
+    if (radius <= 0.0) {
+        *_SceneRenderer r = &self._r;
+        Vec3 lo = Vec3{1e30, 1e30, 1e30};
+        Vec3 hi = Vec3{-1e30, -1e30, -1e30};
+        for (i in 0..r.draws.size) {
+            *_SceneDraw d = &r.draws.data[i];
+            Vec3 e = Vec3{d.radius, d.radius, d.radius};
+            Vec3 a = d.center - e;
+            Vec3 b = d.center + e;
+            if (a.x < lo.x) lo.x = a.x;
+            if (a.y < lo.y) lo.y = a.y;
+            if (a.z < lo.z) lo.z = a.z;
+            if (b.x > hi.x) hi.x = b.x;
+            if (b.y > hi.y) hi.y = b.y;
+            if (b.z > hi.z) hi.z = b.z;
+        }
+        if (r.draws.size == 0) {
+            lo = Vec3{-1.0, -1.0, -1.0};
+            hi = Vec3{1.0, 1.0, 1.0};
+        }
+        c = (lo + hi) * 0.5;
+        radius = ((hi - lo) * 0.5).length();
+        if (radius < 1e-3) radius = 1e-3;
+    }
+    Vec3 d = rec.dir;
+    Vec3 up = d.y > 0.99 || d.y < -0.99 ? Vec3{0.0, 0.0, 1.0} : Vec3{0.0, 1.0, 0.0};
+    Mat4 view = mat4_look_at(c - d * (radius * 2.0), c, up);
+    Mat4 proj = mat4_ortho(-radius, radius, -radius, radius, 0.0, radius * 4.0);
+    uint32 size = self.shadow_size > 0 ? self.shadow_size : (uint32)2048;
+    *texel_world = radius * 2.0 / (float)size;
+    return proj * view;
+}
+
+Result<int, string> _scene_shadow_targets(*Scene self, int layers) {
+    *_SceneRenderer r = &self._r;
+    uint32 size = self.shadow_size > 0 ? self.shadow_size : (uint32)2048;
+    if (r.shadow_size != size || r.shadow_layers < (uint32)layers) {
+        for (i in 0..r.shadow_views.size) r.shadow_views.data[i].release();
+        List_clear(&r.shadow_views);
+        r.shadow_maps.release();
+        GpuTextureDesc d = GpuTextureDesc{width: size, height: size, format: WGPUTextureFormat_Depth32Float,
+            layers: (uint32)layers, array: true};
+        r.shadow_maps = self.gpu.texture_with(&d)?;
+        r.shadow_size = size;
+        r.shadow_layers = (uint32)layers;
+        for (i in 0..layers) {
+            GpuTextureView v = r.shadow_maps.view_level((uint32)i, 0)?;
+            List_push(&r.shadow_views, v);
+        }
+    }
+    while (r.shadow_bufs.size < layers) {
+        GpuBuffer b = self.gpu.uniform(null, 80)?;
+        List_push(&r.shadow_bufs, b);
+        GpuBindGroup g = r.shadow_layout.group()?;
+        List_push(&r.shadow_groups, g);
+        r.shadow_groups.data[r.shadow_groups.size - 1].buffer(0, &r.shadow_bufs.data[r.shadow_bufs.size - 1]);
+    }
+    return Ok<int, string>(0);
+}
+
+// The frame bind group for a world lit by ibl (null: the ambient lights), made on first use.
+Result<int, string> _scene_world_group(*Scene self, *GpuIbl ibl) {
+    *_SceneRenderer r = &self._r;
+    for (i in 0..r.world_groups.size) {
+        if (r.world_groups.data[i].ibl == ibl) return Ok<int, string>(i);
+    }
+    _SceneWorldGroup w;
+    w.ibl = ibl;
+    w.frame = self.gpu.uniform(null, 272)?;
+    w.group = r.frame_layout.group()?;
+    w.group.buffer(0, &w.frame);
+    w.group.buffer(1, &r.lights);
+    w.group.texture(2, &r.no_shadow);
+    w.group.sampler(3, &r.shadow_samp);
+    if (ibl != null) {
+        w.group.texture(4, &ibl.irradiance);
+        w.group.texture(5, &ibl.specular);
+        w.group.texture(6, &ibl.brdf);
+    } else {
+        w.group.texture(4, &r.black_cube);
+        w.group.texture(5, &r.black_cube);
+        w.group.texture(6, &r.white);
+    }
+    w.group.sampler(7, &r.ibl_samp);
+    List_push(&r.world_groups, w);
+    return Ok<int, string>(r.world_groups.size - 1);
+}
+
+void _scene_bind_frame(*Scene self, bool shadows) {
+    *_SceneRenderer r = &self._r;
+    *GpuTexture st = shadows ? &r.shadow_maps : &r.no_shadow;
+    if (r.bound_shadow != st.view) {
+        r.frame_group.texture(2, st);
+        r.bound_shadow = st.view;
+    }
+    WGPUTextureView irr = self.ibl != null ? self.ibl.irradiance.view : r.black_cube.view;
+    if (r.bound_irr != irr) {
+        if (self.ibl != null) {
+            r.frame_group.texture(4, &self.ibl.irradiance);
+            r.frame_group.texture(5, &self.ibl.specular);
+            r.frame_group.texture(6, &self.ibl.brdf);
+        } else {
+            r.frame_group.texture(4, &r.black_cube);
+            r.frame_group.texture(5, &r.black_cube);
+            r.frame_group.texture(6, &r.white);
+        }
+        r.bound_irr = irr;
+    }
+}
+
+void _scene_draw_lights(*Scene self, *_SceneDraw d, *_SceneDrawU u) {
+    *_SceneRenderer r = &self._r;
+    uint32 mask = self.nodes.data[d.node].light_mask;
+    float[8] score;
+    int count = 0;
+    for (j in 0..r.recs.size) {
+        *_SceneLightRec rec = &r.recs.data[j];
+        if ((rec.mask & mask) == 0) continue;
+        float sc = 0.0;
+        if (rec.type != SCENE_LIGHT_DIRECTIONAL) {
+            float dist = (rec.pos - d.center).length() - d.radius;
+            if (dist > rec.end) continue;
+            sc = 1.0 + (dist > 0.0 ? dist : 0.0);
+        }
+        int at = count;
+        if (count == SCENE_LIGHTS_PER_DRAW) {
+            if (sc >= score[count - 1]) continue;
+            at = count - 1;
+        } else {
+            count++;
+        }
+        while (at > 0 && score[at - 1] > sc) {
+            score[at] = score[at - 1];
+            u.lights[at] = u.lights[at - 1];
+            at--;
+        }
+        score[at] = sc;
+        u.lights[at] = (uint32)j;
+    }
+    u.info[0] = (float)count;
+}
+
+void _scene_draw(*Scene self, *GpuPass pass, *_SceneDraw d, *GpuPipeline pipe) {
+    *_SceneRenderer r = &self._r;
+    *SceneMesh mesh = &self.meshes.data[d.mesh];
+    *GpuBindGroup fg = &r.frame_group;
+    if (d.world > 0) {
+        for (k in 0..r.portals.size) {
+            if (r.portals.data[k].node == d.world && r.portals.data[k].group >= 0) fg = &r.world_groups.data[r.portals.data[k].group].group;
+        }
+    }
+    pass.set_group(0, fg);
+    pass.set_group(1, &r.nodes.data[d.node].group);
+    pass.set_group(2, &r.mats.data[d.material].group);
+    if (r.mats.data[d.material].mod_made && scene_key_shader(d.key) > 0) pass.set_group(3, &r.mats.data[d.material].mod_group);
+    pass.draw_indexed(pipe, &mesh.vertices, &mesh.indices, mesh.index_count, _scene_instance_count(self, d.node));
+}
+
+// Records the scene into enc: shadow maps, the scene in HDR, then bloom and tone mapping
+// into view, a width x height target in format (a window frame's view with the surface's
+// size and format, or a texture's). Passes recorded into enc afterwards (an interface)
+// draw over the result. Fails with the GPU's message (a shader or pipeline error).
+Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureView view, uint32 width, uint32 height,
+                                    WGPUTextureFormat format) {
+    *_SceneRenderer r = &self._r;
+    if (width == 0 || height == 0) return Err<int, string>("scene: empty target");
+    if (r.w != width || r.h != height) {
+        r.hdr.release();
+        r.depth.release();
+        r.depth_prev.release();
+        r.depth_view.release();
+        r.depth_prev_view.release();
+        r.hdr = self.gpu.target_with(width, height, WGPUTextureFormat_RGBA16Float)?;
+        // two depth buffers in turn: the last frame's is what modifiers sample as
+        // scene_depth_texture
+        r.depth = self.gpu.texture(width, height, SCENE_DEPTH_FORMAT, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding)?;
+        r.depth_prev = self.gpu.texture(width, height, SCENE_DEPTH_FORMAT, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding)?;
+        GpuViewDesc dv = GpuViewDesc{format: WGPUTextureFormat_Depth24Plus, aspect: WGPUTextureAspect_DepthOnly, dimension: WGPUTextureViewDimension_2D};
+        r.depth_view = r.depth.view_with(&dv)?;
+        r.depth_prev_view = r.depth_prev.view_with(&dv)?;
+        r.w = width;
+        r.h = height;
+    } else {
+        GpuTexture t = r.depth;
+        r.depth = r.depth_prev;
+        r.depth_prev = t;
+        GpuTextureView tv = r.depth_view;
+        r.depth_view = r.depth_prev_view;
+        r.depth_prev_view = tv;
+    }
+    Scene_update(self);
+    _scene_camera(self, width, height);
+    List_clear(&r.draws);
+    List_clear(&r.portals);
+    _scene_collect(self, 0, 1.0, 0, 0);
+    _scene_portal_crossing(self);
+    if (r.draws.size > 1) sort<_SceneDraw>(r.draws.data, r.draws.size, _scene_draw_order);
+
+    Vec3 ambient;
+    int shadows = _scene_lights(self, &ambient)?;
+    bool any_caster = false;
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        if (!d.blend && self.nodes.data[d.node].casts_shadows) any_caster = true;
+    }
+    if (!any_caster) shadows = 0;
+    if (shadows > 0) _scene_shadow_targets(self, shadows)?;
+
+    float[2304] lb;
+    for (j in 0..r.recs.size) {
+        *_SceneLightRec rec = &r.recs.data[j];
+        *SceneLight l = &self.lights.data[rec.light];
+        *float o = &lb[j * 36];
+        o[0] = l.color.x;
+        o[1] = l.color.y;
+        o[2] = l.color.z;
+        o[3] = l.intensity;
+        o[4] = rec.pos.x;
+        o[5] = rec.pos.y;
+        o[6] = rec.pos.z;
+        o[7] = (float)rec.type;
+        o[8] = rec.dir.x;
+        o[9] = rec.dir.y;
+        o[10] = rec.dir.z;
+        o[11] = shadows > 0 ? (float)rec.layer : -1.0;
+        o[12] = l.attenuation_start;
+        o[13] = l.attenuation_end;
+        o[14] = l.falloff > 0.0 ? l.falloff : 2.0;
+        o[15] = l.shadow_bias;
+        o[16] = (float)cos((double)l.inner_angle);
+        o[17] = (float)cos((double)l.outer_angle);
+        o[18] = l.shadow_opacity;
+        o[19] = 0.0;
+        for (k in 20..36) o[k] = 0.0;
+        if (shadows > 0 && rec.layer >= 0) {
+            float texel = 0.0;
+            Mat4 vp = _scene_shadow_matrix(self, rec, &texel);
+            o[19] = l.shadow_normal_bias * texel;
+            for (k in 0..16) o[20 + k] = vp.m[k];
+            float[20] pv;
+            for (k in 0..16) pv[k] = vp.m[k];
+            pv[16] = r.eye.x;
+            pv[17] = r.eye.y;
+            pv[18] = r.eye.z;
+            pv[19] = 1.0;
+            r.shadow_bufs.data[rec.layer].write(0, &pv, 80);
+        }
+    }
+    if (r.recs.size > 0) r.lights.write(0, &lb, (uint64)r.recs.size * 144);
+
+    uint32 ssize = self.shadow_size > 0 ? self.shadow_size : (uint32)2048;
+    float[68] fu;
+    for (k in 0..16) fu[k] = r.view_proj.m[k];
+    fu[16] = r.eye.x;
+    fu[17] = r.eye.y;
+    fu[18] = r.eye.z;
+    fu[19] = r.ortho ? 1.0 : 0.0;
+    fu[20] = r.forward.x;
+    fu[21] = r.forward.y;
+    fu[22] = r.forward.z;
+    fu[23] = 0.0;
+    fu[24] = ambient.x;
+    fu[25] = ambient.y;
+    fu[26] = ambient.z;
+    fu[27] = 0.0;
+    fu[28] = self.ibl != null ? 1.0 : 0.0;
+    fu[29] = self.ibl != null ? self.ibl.intensity : 0.0;
+    fu[30] = self.ibl != null ? self.ibl.max_lod() : 0.0;
+    fu[31] = 0.0;
+    fu[32] = 1.0 / (float)ssize;
+    fu[33] = (float)height;
+    fu[34] = (float)width;
+    fu[35] = 0.0;
+    for (k in 0..16) fu[36 + k] = r.view.m[k];
+    for (k in 0..16) fu[52 + k] = r.proj.m[k];
+    r.frame.write(0, &fu, 272);
+    _scene_bind_frame(self, shadows > 0);
+    // each portal's world with its own lighting environment
+    for (k in 0..r.portals.size) {
+        *GpuIbl ibl = self.nodes.data[r.portals.data[k].node].portal_ibl;
+        int gi = _scene_world_group(self, ibl)?;
+        r.portals.data[k].group = gi;
+        fu[28] = ibl != null ? 1.0 : 0.0;
+        fu[29] = ibl != null ? ibl.intensity : 0.0;
+        fu[30] = ibl != null ? ibl.max_lod() : 0.0;
+        *_SceneWorldGroup wg = &r.world_groups.data[gi];
+        wg.frame.write(0, &fu, 272);
+        wg.group.texture(2, shadows > 0 ? &r.shadow_maps : &r.no_shadow);
+    }
+
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        _scene_node_gpu(self, d.node)?;
+        *SceneNode n = &self.nodes.data[d.node];
+        _SceneDrawU u;
+        u.model = n.world;
+        Mat4 inv = n.world.inverse();
+        u.normal = inv.transpose();
+        _scene_draw_lights(self, d, &u);
+        u.info[1] = n.receives_shadows ? 1.0 : 0.0;
+        bool skinned = false;
+        int targets = _scene_node_deform(self, d.node, d.mesh, &skinned)?;
+        u.info[2] = skinned ? 1.0 : 0.0;
+        u.info[3] = d.opacity;
+        u.morph[0] = (float)self.meshes.data[d.mesh].vertex_count;
+        u.morph[1] = (float)targets;
+        bool instanced = _scene_node_instances(self, d.node)?;
+        u.morph[2] = instanced ? 1.0 : 0.0;
+        r.nodes.data[d.node].uniforms.write(0, &u, sizeof(_SceneDrawU));
+    }
+    for (i in 0..self.materials.size) {
+        _scene_material_gpu(self, i)?;
+    }
+    for (i in 0..r.draws.size) {
+        _scene_pipeline(self, r.draws.data[i].key)?;
+    }
+
+    for (k in 0..shadows) {
+        GpuPassOptions so = GpuPassOptions{depth_view: &r.shadow_views.data[k]};
+        GpuPass sp = enc.pass_with(null, &so);
+        for (i in 0..r.draws.size) {
+            *_SceneDraw d = &r.draws.data[i];
+            if (d.blend || !self.nodes.data[d.node].casts_shadows) continue;
+            *SceneMesh mesh = &self.meshes.data[d.mesh];
+            sp.set_group(0, &r.shadow_groups.data[k]);
+            sp.set_group(1, &r.nodes.data[d.node].group);
+            *GpuPipeline shp = &r.shadow_pipe;
+            int sid = scene_key_shader(d.key);
+            if (sid > 0 && sid < self.shaders.size && scene_shader_moves_geometry(&self.shaders.data[sid]) && r.mats.data[d.material].mod_made) {
+                // a program that moves vertices casts the moved mesh
+                shp = _scene_shadow_pipe(self, sid)?;
+                sp.set_group(2, &r.mats.data[d.material].group);
+                sp.set_group(3, &r.mats.data[d.material].mod_group);
+            }
+            sp.draw_indexed(shp, &mesh.vertices, &mesh.indices, mesh.index_count, _scene_instance_count(self, d.node));
+        }
+        sp.end()?;
+    }
+
+    GpuPassOptions mo = GpuPassOptions{clear: GpuColor{(double)self.background.x, (double)self.background.y,
+        (double)self.background.z, (double)self.background.w}, depth: &r.depth};
+    GpuPass pass = enc.pass_with(r.hdr.view, &mo);
+    // the real world's depth first: what is behind it fails the depth test
+    if (self.occlusion_depth > 0) _scene_occlusion(self, &pass)?;
+    int active = _scene_active_world(self);
+    // the world the camera is in, with the entrances that lead out of it
+    _scene_world_pass(self, &pass, active, active, 0, false)?;
+    // every world seen through a window, and the worlds seen through their windows in
+    // turn, as ViroReact walks its portal tree
+    _scene_portals_from(self, &pass, active, -1, 0)?;
+    pass.end()?;
+    *GpuTexture bg = self.camera_background > 0 && self.camera_background < self.textures.size &&
+        self.textures.data[self.camera_background].handle != null ? &self.textures.data[self.camera_background] : null;
+    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post, bg);
+}
+
+// How many portals deep the scene draws from the world the camera is in.
+const int SCENE_PORTAL_DEPTH = 4;
+
+// Draws the worlds next to world (its portals, and the world around it when it is a
+// portal), except the one it was entered from, each through its window: the window into
+// the stencil where world is (level), the depth there cleared, then that world's sky and
+// contents at level + 1, the window's frame over them, and its own neighbors.
+Result<int, string> _scene_portals_from(*Scene self, *GpuPass pass, int world, int from, int level) {
+    *_SceneRenderer r = &self._r;
+    if (level >= SCENE_PORTAL_DEPTH) return Ok<int, string>(0);
+    for (k in 0..r.portals.size) {
+        _ScenePortalRec pr = r.portals.data[k];
+        int other = -1;
+        if (pr.outer == world && pr.node != from) other = pr.node;
+        else if (pr.node == world && pr.outer != from) other = pr.outer;
+        if (other < 0) continue;
+        pass.set_stencil_reference((uint32)level);
+        bool any = false;
+        for (i in 0..r.draws.size) {
+            *_SceneDraw d = &r.draws.data[i];
+            if (d.frame != pr.node || !d.in_view) continue;
+            *GpuPipeline sp = _scene_pipeline(self, d.key + _SCENE_KEY_SILHOUETTE)?;
+            _scene_draw(self, pass, d, sp);
+            any = true;
+        }
+        if (!any) continue;
+        pass.set_stencil_reference((uint32)(level + 1));
+        _scene_depth_reset(self, pass)?;
+        _scene_world_pass(self, pass, other, -1, pr.node, true)?;
+        if (other == pr.node) {
+            for (i in 0..r.draws.size) {
+                *_SceneDraw d = &r.draws.data[i];
+                if (d.frame != pr.node || !d.in_view) continue;
+                *GpuPipeline fp = _scene_pipeline(self, d.key + _SCENE_KEY_MASKED)?;
+                _scene_draw(self, pass, d, fp);
+            }
+        }
+        _scene_portals_from(self, pass, other, world, level + 1)?;
+        pass.set_stencil_reference((uint32)level);
+    }
+    return Ok<int, string>(0);
+}
+
+// The node of the world the camera is in: 0 (the root) or a portal node.
+int _scene_active_world(*Scene self) {
+    int a = self.active_portal;
+    if (a <= 0 || a >= self.nodes.size || !self.nodes.data[a].alive || !self.nodes.data[a].portal) return 0;
+    return a;
+}
+
+// Draws world (0 for the root's, else a portal node's contents) in draw order, its sky
+// before its first blended surface; frames_of adds the entrances of that portal (the
+// frames seen from inside it) and skip_frames_of leaves out the window being looked
+// through. masked draws only where the stencil holds the reference.
+Result<int, string> _scene_world_pass(*Scene self, *GpuPass pass, int world, int frames_of, int skip_frames_of, bool masked) {
+    *_SceneRenderer r = &self._r;
+    *GpuTexture sky = self.skybox;
+    bool pano = self.sky_pano;
+    bool flip = self.sky_flip;
+    if (world > 0) {
+        *SceneNode pn = &self.nodes.data[world];
+        sky = Scene_texture(self, pn.portal_sky);
+        pano = pn.portal_sky_pano;
+        flip = false;
+    }
+    bool sky_drawn = false;
+    int extra = masked ? _SCENE_KEY_MASKED : 0;
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        bool mine = d.world == world || (frames_of > 0 && d.frame == frames_of);
+        if (!mine || (skip_frames_of > 0 && d.frame == skip_frames_of)) continue;
+        if (d.blend && !sky_drawn) {
+            if (sky != null) _scene_sky_draw(&r.sky, pass, sky, pano, r.view_proj, self.sky_rotation, self.sky_intensity, flip, masked);
+            sky_drawn = true;
+        }
+        if (!d.in_view) continue;
+        *GpuPipeline p = _scene_pipeline(self, d.key + extra)?;
+        _scene_draw(self, pass, d, p);
+    }
+    if (!sky_drawn && sky != null) _scene_sky_draw(&r.sky, pass, sky, pano, r.view_proj, self.sky_rotation, self.sky_intensity, flip, masked);
+    return Ok<int, string>(0);
+}
+
+string _scene_depth_reset_wgsl =
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;\n"
+    "    return vec4<f32>(p, 1.0, 1.0);\n"
+    "}\n"
+    "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }\n";
+
+string _scene_occlusion_wgsl =
+    "struct O { proj: mat4x4<f32>, xf: mat4x4<f32> };\n"
+    "@group(0) @binding(0) var<uniform> o: O;\n"
+    "@group(0) @binding(1) var depth_tex: texture_2d<f32>;\n"
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n"
+    "struct F { @builtin(frag_depth) depth: f32, @location(0) color: vec4<f32> };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    var v: V;\n"
+    "    v.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    v.uv = vec2<f32>(p.x, 1.0 - p.y);\n"
+    "    return v;\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> F {\n"
+    "    var f: F;\n"
+    "    f.color = vec4<f32>(0.0);\n"
+    "    let uv = (o.xf * vec4<f32>(v.uv, 0.0, 1.0)).xy;\n"
+    "    let dims = vec2<f32>(textureDimensions(depth_tex));\n"
+    "    let meters = textureLoad(depth_tex, vec2<i32>(clamp(uv * dims, vec2<f32>(0.0), dims - 1.0)), 0).r;\n"
+    "    if (meters <= 0.0 || uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {\n"
+    "        f.depth = 1.0;\n"
+    "        return f;\n"
+    "    }\n"
+    "    let c = o.proj * vec4<f32>(0.0, 0.0, -meters, 1.0);\n"
+    "    f.depth = clamp(c.z / c.w, 0.0, 1.0);\n"
+    "    return f;\n"
+    "}\n";
+
+// Writes the real world's depth (Scene.occlusion_depth) into the depth buffer.
+Result<int, string> _scene_occlusion(*Scene self, *GpuPass pass) {
+    *_SceneRenderer r = &self._r;
+    if (self.occlusion_depth >= self.textures.size || self.textures.data[self.occlusion_depth].handle == null) {
+        return Ok<int, string>(0);
+    }
+    if (!r.occ_made) {
+        r.occ_layout = self.gpu.bind_layout();
+        r.occ_layout.uniform(0, WGPUShaderStage_Fragment);
+        r.occ_layout.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_UnfilterableFloat);
+        *GpuBindLayout[1] groups = {&r.occ_layout};
+        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_occlusion_wgsl, vertex: "vs", fragment: "fs",
+            format: WGPUTextureFormat_RGBA16Float, groups: &groups[0], group_count: 1, depth: true,
+            depth_format: SCENE_DEPTH_FORMAT, depth_compare: WGPUCompareFunction_Always, no_color_write: true};
+        r.occ_pipe = self.gpu.pipeline(&d)?;
+        r.occ_uniforms = self.gpu.uniform(null, 128)?;
+        r.occ_group = r.occ_layout.group()?;
+        r.occ_group.buffer(0, &r.occ_uniforms);
+        r.occ_made = true;
+    }
+    float[32] u;
+    for (k in 0..16) u[k] = r.proj.m[k];
+    for (k in 0..16) u[16 + k] = self.occlusion_transform.m[k];
+    r.occ_uniforms.write(0, &u, 128);
+    r.occ_group.texture(1, &self.textures.data[self.occlusion_depth]);
+    pass.set_group(0, &r.occ_group);
+    pass.draw(&r.occ_pipe, null, 3, 1);
+    return Ok<int, string>(0);
+}
+
+// Sets the depth to the far plane where the stencil holds the reference: what lies behind
+// a portal's window no longer hides that portal's world.
+Result<int, string> _scene_depth_reset(*Scene self, *GpuPass pass) {
+    *_SceneRenderer r = &self._r;
+    if (!r.depth_reset_made) {
+        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_depth_reset_wgsl, vertex: "vs", fragment: "fs",
+            format: WGPUTextureFormat_RGBA16Float, depth: true, depth_format: SCENE_DEPTH_FORMAT,
+            depth_compare: WGPUCompareFunction_Always, no_color_write: true,
+            stencil_front: GpuStencilFace{compare: WGPUCompareFunction_Equal}};
+        r.depth_reset = self.gpu.pipeline(&d)?;
+        r.depth_reset_made = true;
+    }
+    pass.draw(&r.depth_reset, null, 3, 1);
+    return Ok<int, string>(0);
+}
+
+// Whether the segment from a to b (world) crosses the box lo..hi of a node with world
+// matrix m.
+bool _scene_segment_crosses(Mat4 m, Vec3 lo, Vec3 hi, Vec3 a, Vec3 b) {
+    Mat4 inv = m.inverse();
+    Vec3 o = inv.point(a);
+    Vec3 d = inv.point(b) - o;
+    float t0 = 0.0;
+    float t1 = 1.0;
+    float[3] os = {o.x, o.y, o.z};
+    float[3] ds = {d.x, d.y, d.z};
+    float[3] ls = {lo.x, lo.y, lo.z};
+    float[3] hs = {hi.x, hi.y, hi.z};
+    for (k in 0..3) {
+        float eps = 1e-5;
+        if (ds[k] > -1e-12 && ds[k] < 1e-12) {
+            if (os[k] < ls[k] - eps || os[k] > hs[k] + eps) return false;
+            continue;
+        }
+        float ta = (ls[k] - eps - os[k]) / ds[k];
+        float tb = (hs[k] + eps - os[k]) / ds[k];
+        if (ta > tb) {
+            float t = ta;
+            ta = tb;
+            tb = t;
+        }
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+        if (t0 > t1) return false;
+    }
+    return true;
+}
+
+// Walks the camera through passable portals: when it moved through the bounds of a
+// passable portal's entrance since the last frame, the world it is in switches between
+// that portal and the one around it (ViroReact's passable portals).
+void _scene_portal_crossing(*Scene self) {
+    *_SceneRenderer r = &self._r;
+    Vec3 eye = r.eye;
+    if (!r.has_eye) {
+        r.last_eye = eye;
+        r.has_eye = true;
+        return;
+    }
+    Vec3 last = r.last_eye;
+    r.last_eye = eye;
+    if ((eye - last).length() <= 0.0) return;
+    int active = _scene_active_world(self);
+    for (k in 0..r.portals.size) {
+        _ScenePortalRec pr = r.portals.data[k];
+        if (!self.nodes.data[pr.node].passable) continue;
+        if (pr.outer != active && pr.node != active) continue;
+        bool crossed = false;
+        for (i in 0..r.draws.size) {
+            *_SceneDraw d = &r.draws.data[i];
+            if (d.frame != pr.node) continue;
+            *SceneMesh mesh = &self.meshes.data[d.mesh];
+            if (_scene_segment_crosses(self.nodes.data[d.node].world, mesh.min, mesh.max, last, eye)) crossed = true;
+        }
+        if (crossed) {
+            self.active_portal = active == pr.node ? pr.outer : pr.node;
+            return;
+        }
+    }
+}
+
+// Scene_render_in with an encoder of its own, submitted at the end.
+Result<int, string> Scene_render(*Scene self, WGPUTextureView view, uint32 width, uint32 height, WGPUTextureFormat format) {
+    GpuEncoder enc = self.gpu.encoder();
+    Scene_render_in(self, &enc, view, width, height, format)?;
+    return enc.submit();
+}
+
+// Renders into a texture (Gpu_target, Gpu_target_with), to read back or sample.
+Result<int, string> Scene_render_to(*Scene self, *GpuTexture target) {
+    return Scene_render(self, target.view, target.width, target.height, target.format);
+}

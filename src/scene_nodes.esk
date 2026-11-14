@@ -1,0 +1,641 @@
+// scene_nodes.esk: the renderer's setup, nodes, transforms, geometry and morph weights (part of scene.esk, which imports it in order after the ones before it)
+
+void _scene_vertex_layout(*GpuVertexLayout l) {
+    l.add(WGPUVertexFormat_Float32x3, 0);
+    l.add(WGPUVertexFormat_Float32x3, 12);
+    l.add(WGPUVertexFormat_Float32x2, 24);
+    l.add(WGPUVertexFormat_Float32x4, 32);
+    l.add(WGPUVertexFormat_Float32x4, 48);
+    l.add(WGPUVertexFormat_Float32x2, 64);
+    l.add(WGPUVertexFormat_Float32x4, 72);
+    l.add(WGPUVertexFormat_Float32x4, 88);
+}
+
+int _scene_new_node(*Scene self, int parent, string name) {
+    SceneNode n;
+    if (name != null) String_from(&n.name, name);
+    n.parent = parent;
+    n.rotation = quat_identity();
+    n.scale = Vec3{1.0, 1.0, 1.0};
+    n.visible = true;
+    n.alive = true;
+    n.camera = -1;
+    n.casts_shadows = true;
+    n.receives_shadows = true;
+    n.light_mask = 1;
+    n.opacity = 1.0;
+    n.world = mat4_identity();
+    List_push(&self.nodes, n);
+    _SceneNodeGpu g;
+    List_push(&self._r.nodes, g);
+    int id = self.nodes.size - 1;
+    if (parent >= 0) List_push(&self.nodes.data[parent].children, id);
+    return id;
+}
+
+Result<int, string> _scene_renderer_make(*Scene s) {
+    *_SceneRenderer r = &s._r;
+    *Gpu g = &s.gpu;
+    r.frame_layout = g.bind_layout();
+    r.frame_layout.uniform(0, 0);
+    r.frame_layout.storage(1, WGPUShaderStage_Fragment, true);
+    r.frame_layout.texture(2, WGPUShaderStage_Fragment, WGPUTextureSampleType_Depth, WGPUTextureViewDimension_2DArray);
+    r.frame_layout.sampler(3, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Comparison);
+    r.frame_layout.texture(4, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_Cube);
+    r.frame_layout.texture(5, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_Cube);
+    r.frame_layout.texture(6, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    r.frame_layout.sampler(7, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+    r.draw_layout = g.bind_layout();
+    r.draw_layout.uniform(0, 0);
+    for (b in 1..5) r.draw_layout.storage((uint32)b, WGPUShaderStage_Vertex, true);
+    r.mat_layout = g.bind_layout();
+    r.mat_layout.uniform(0, WGPUShaderStage_Fragment);
+    r.mat_layout.sampler(1, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+    for (i in 2..8) r.mat_layout.texture((uint32)i, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    r.shadow_layout = g.bind_layout();
+    r.shadow_layout.uniform(0, WGPUShaderStage_Vertex);
+
+    r.frame = g.uniform(null, 272)?;
+    r.no_storage = g.buffer(64, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    r.lights = g.buffer((uint64)SCENE_MAX_LIGHTS * 144, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    GpuSamplerOptions so = GpuSamplerOptions{mipmaps: true, anisotropy: 8};
+    r.samp = g.sampler_with(&so)?;
+    GpuSamplerOptions cso = GpuSamplerOptions{wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge,
+        compare: WGPUCompareFunction_LessEqual};
+    r.shadow_samp = g.sampler_with(&cso)?;
+    GpuSamplerOptions iso = GpuSamplerOptions{mipmaps: true, wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge};
+    r.ibl_samp = g.sampler_with(&iso)?;
+    uint8[4] white = {255, 255, 255, 255};
+    r.white = g.image(1, 1, &white)?;
+    GpuTextureDesc cd = GpuTextureDesc{width: 1, height: 1, cube: true};
+    r.black_cube = g.texture_with(&cd)?;
+    uint8[4] black = {0, 0, 0, 255};
+    for (f in 0..6) r.black_cube.write_level((uint32)f, 0, &black)?;
+    GpuTextureDesc sd = GpuTextureDesc{width: 1, height: 1, format: WGPUTextureFormat_Depth32Float, array: true};
+    r.no_shadow = g.texture_with(&sd)?;
+
+    r.frame_group = r.frame_layout.group()?;
+    r.frame_group.buffer(0, &r.frame);
+    r.frame_group.buffer(1, &r.lights);
+    r.frame_group.texture(2, &r.no_shadow);
+    r.bound_shadow = r.no_shadow.view;
+    r.frame_group.sampler(3, &r.shadow_samp);
+    r.frame_group.texture(4, &r.black_cube);
+    r.frame_group.texture(5, &r.black_cube);
+    r.frame_group.texture(6, &r.white);
+    r.frame_group.sampler(7, &r.ibl_samp);
+
+    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)SCENE_VERTEX_FLOATS * 4};
+    defer layout.release();
+    _scene_vertex_layout(&layout);
+    *GpuBindLayout[2] sg = {&r.shadow_layout, &r.draw_layout};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_shadow_wgsl, vertex: "vs", fragment: null, layout: &layout,
+        groups: &sg[0], group_count: 2, depth: true, depth_format: WGPUTextureFormat_Depth32Float,
+        depth_bias: 2, depth_bias_slope: 1.5};
+    r.shadow_pipe = g.pipeline(&d)?;
+    _scene_post_make(&r.post, g)?;
+    _scene_sky_make(&r.sky, g)?;
+    r.made = true;
+    return Ok<int, string>(0);
+}
+
+// A new, empty scene on gpu: the root node, the default material, black background, gamma
+// encoding on, no tone mapping and 2048-texel shadow maps. Fails when the GPU refuses a
+// pipeline or buffer.
+Result<Scene, string> Gpu_scene(*Gpu self) {
+    Scene s;
+    s.gpu = *self;
+    s.camera = -1;
+    s.background = Vec4{0.0, 0.0, 0.0, 1.0};
+    s.sky_intensity = 1.0;
+    s.sky_rotation = quat_identity();
+    s.camera_image_transform = mat4_identity();
+    s.occlusion_transform = mat4_identity();
+    s.semantic_transform = mat4_identity();
+    s.post.gamma = true;
+    s.shadow_size = 2048;
+    _scene_new_node(&s, -1, "root");
+    SceneMesh none;
+    List_push(&s.meshes, none);
+    List_push(&s.materials, scene_material(SCENE_BLINN));
+    _SceneMatGpu mg;
+    List_push(&s._r.mats, mg);
+    GpuTexture nt;
+    List_push(&s.textures, nt);
+    Result<int, string> made = _scene_renderer_make(&s);
+    if (!made.ok) {
+        Scene_release(&s);
+        return Err<Scene, string>(made.error);
+    }
+    return Ok<Scene, string>(s);
+}
+
+// Releases everything the scene made on the GPU (meshes, textures it owns, pipelines,
+// targets) and frees its lists. A GpuIbl or skybox texture set from outside is not
+// released.
+void Scene_release(*Scene self) {
+    *_SceneRenderer r = &self._r;
+    for (i in 0..r.nodes.size) {
+        if (r.nodes.data[i].made) {
+            r.nodes.data[i].group.release();
+            r.nodes.data[i].uniforms.release();
+        }
+        r.nodes.data[i].joints.release();
+        r.nodes.data[i].weights.release();
+        r.nodes.data[i].instances.release();
+    }
+    for (i in 0..r.mats.size) {
+        if (r.mats.data[i].made) {
+            r.mats.data[i].group.release();
+            r.mats.data[i].uniforms.release();
+        }
+        if (r.mats.data[i].mod_made) {
+            r.mats.data[i].mod_group.release();
+            r.mats.data[i].mod_buffer.release();
+        }
+        r.mats.data[i].mod_values.free();
+        r.mats.data[i].mod_textures.free();
+    }
+    for (i in 0..r.shader_gpu.size) {
+        if (r.shader_gpu.data[i].made) r.shader_gpu.data[i].layout.release();
+    }
+    List_free(&r.shader_gpu);
+    for (i in 0..r.pipes.size) r.pipes.data[i].pipe.release();
+    if (r.depth_reset_made) r.depth_reset.release();
+    if (r.occ_made) {
+        r.occ_group.release();
+        r.occ_uniforms.release();
+        r.occ_pipe.release();
+        r.occ_layout.release();
+    }
+    List_free(&r.portals);
+    List_free(&r.world_groups);
+    for (i in 0..r.samplers.size) r.samplers.data[i].samp.release();
+    List_free(&r.samplers);
+    for (i in 0..r.shadow_views.size) r.shadow_views.data[i].release();
+    for (i in 0..r.shadow_groups.size) r.shadow_groups.data[i].release();
+    for (i in 0..r.shadow_bufs.size) r.shadow_bufs.data[i].release();
+    List_free(&r.nodes);
+    List_free(&r.mats);
+    List_free(&r.pipes);
+    List_free(&r.shadow_views);
+    List_free(&r.shadow_groups);
+    List_free(&r.shadow_bufs);
+    List_free(&r.draws);
+    List_free(&r.recs);
+    if (r.made) {
+        _scene_post_release(&r.post);
+        _scene_sky_release(&r.sky);
+        r.shadow_pipe.release();
+        r.frame_group.release();
+        for (i in 0..r.world_groups.size) {
+            r.world_groups.data[i].group.release();
+            r.world_groups.data[i].frame.release();
+        }
+        r.frame.release();
+        r.lights.release();
+        r.samp.release();
+        r.no_storage.release();
+        r.shadow_samp.release();
+        r.ibl_samp.release();
+    }
+    r.white.release();
+    r.black_cube.release();
+    r.no_shadow.release();
+    r.shadow_maps.release();
+    r.hdr.release();
+    r.depth.release();
+    r.depth_prev.release();
+    r.depth_view.release();
+    r.depth_prev_view.release();
+    for (i in 0..r.shadow_pipes.size) r.shadow_pipes.data[i].pipe.release();
+    List_free(&r.shadow_pipes);
+    r.frame_layout.release();
+    r.draw_layout.release();
+    r.mat_layout.release();
+    r.shadow_layout.release();
+    r.made = false;
+    for (i in 0..self.meshes.size) {
+        self.meshes.data[i].vertices.release();
+        self.meshes.data[i].indices.release();
+        self.meshes.data[i].morph.release();
+    }
+    for (i in 0..self.textures.size) {
+        if (!_scene_borrowed(self, i)) self.textures.data[i].release();
+    }
+    List_free(&self._borrowed);
+    self.sky_faces.release();
+    for (i in 0..self.nodes.size) {
+        String_free(&self.nodes.data[i].name);
+        List_free(&self.nodes.data[i].children);
+        List_free(&self.nodes.data[i].joints);
+        List_free(&self.nodes.data[i].weights);
+    }
+    List_free(&self.nodes);
+    List_free(&self.cameras);
+    List_free(&self.meshes);
+    List_free(&self.materials);
+    for (i in 0..self.shaders.size) scene_shader_free(&self.shaders.data[i]);
+    List_free(&self.shaders);
+    List_free(&self.textures);
+    List_free(&self.lights);
+}
+
+bool _scene_valid(*Scene self, int node) {
+    return node >= 0 && node < self.nodes.size && self.nodes.data[node].alive;
+}
+
+// Adds an empty node under parent (0 for the root; a removed or unknown parent is the
+// root) named name (null for none), at the parent's origin, and returns its id.
+int Scene_add_node(*Scene self, int parent, string name) {
+    if (!_scene_valid(self, parent)) parent = 0;
+    return _scene_new_node(self, parent, name);
+}
+
+// Adds a node under parent that draws mesh with material, and returns its id.
+int Scene_add_object(*Scene self, int parent, int mesh, int material) {
+    int id = Scene_add_node(self, parent, null);
+    self.nodes.data[id].mesh = mesh;
+    self.nodes.data[id].material = material;
+    return id;
+}
+
+// Adds a node under parent holding camera, and returns its id (make it the scene's view
+// with Scene_set_camera).
+int Scene_add_camera(*Scene self, int parent, SceneCamera camera) {
+    int id = Scene_add_node(self, parent, null);
+    List_push(&self.cameras, camera);
+    self.nodes.data[id].camera = self.cameras.size - 1;
+    return id;
+}
+
+// Renders through the camera of node (a node made by Scene_add_camera).
+void Scene_set_camera(*Scene self, int node) {
+    self.camera = node;
+}
+
+// The node with id node (the root for an unknown id).
+*SceneNode Scene_node(*Scene self, int node) {
+    if (node < 0 || node >= self.nodes.size) node = 0;
+    return &self.nodes.data[node];
+}
+
+// The camera settings of a camera node, or null when the node holds no camera.
+*SceneCamera Scene_camera(*Scene self, int node) {
+    if (node < 0 || node >= self.nodes.size) return null;
+    int c = self.nodes.data[node].camera;
+    if (c < 0 || c >= self.cameras.size) return null;
+    return &self.cameras.data[c];
+}
+
+// The first live node named name, or -1.
+int Scene_find(*Scene self, string name) {
+    for (i in 0..self.nodes.size) {
+        if (self.nodes.data[i].alive && self.nodes.data[i].name.data != null && String_eq_cstr(&self.nodes.data[i].name, name) != 0) return i;
+    }
+    return -1;
+}
+
+void _scene_detach(*Scene self, int node) {
+    int p = self.nodes.data[node].parent;
+    if (p < 0) return;
+    *List<int> ch = &self.nodes.data[p].children;
+    for (i in 0..ch.size) {
+        if (ch.data[i] == node) {
+            List_remove(ch, i);
+            break;
+        }
+    }
+}
+
+// Moves node (and its subtree) under parent, keeping its local position, rotation and
+// scale. Returns false, changing nothing, for the root, a removed node or a parent inside
+// the node's own subtree.
+bool Scene_set_parent(*Scene self, int node, int parent) {
+    if (node <= 0 || !_scene_valid(self, node) || !_scene_valid(self, parent)) return false;
+    int p = parent;
+    while (p >= 0) {
+        if (p == node) return false;
+        p = self.nodes.data[p].parent;
+    }
+    _scene_detach(self, node);
+    self.nodes.data[node].parent = parent;
+    List_push(&self.nodes.data[parent].children, node);
+    return true;
+}
+
+void _scene_kill(*Scene self, int node) {
+    *SceneNode n = &self.nodes.data[node];
+    n.alive = false;
+    *_SceneNodeGpu g = &self._r.nodes.data[node];
+    if (g.made) {
+        g.group.release();
+        g.uniforms.release();
+        g.made = false;
+    }
+    g.joints.release();
+    g.weights.release();
+    g.instances.release();
+    for (i in 0..n.children.size) _scene_kill(self, n.children.data[i]);
+}
+
+// Removes node and its subtree from the scene (their ids are not reused). The root cannot
+// be removed. Meshes, materials and textures stay in the scene.
+void Scene_remove(*Scene self, int node) {
+    if (node <= 0 || !_scene_valid(self, node)) return;
+    _scene_detach(self, node);
+    _scene_kill(self, node);
+    if (self.camera == node) self.camera = -1;
+}
+
+// The local matrix of node: translation * rotation * scale.
+Mat4 Scene_local(*Scene self, int node) {
+    *SceneNode n = Scene_node(self, node);
+    return mat4_trs(n.position, n.rotation, n.scale);
+}
+
+// The world matrix of node, computed now from its ancestors' current transforms.
+Mat4 Scene_world(*Scene self, int node) {
+    if (node < 0 || node >= self.nodes.size) return mat4_identity();
+    Mat4 m = Scene_local(self, node);
+    int p = self.nodes.data[node].parent;
+    while (p >= 0) {
+        m = Scene_local(self, p) * m;
+        p = self.nodes.data[p].parent;
+    }
+    return m;
+}
+
+// The rotation turning +Z (look) toward to (normalized), about axis when the two are
+// parallel (ViroReact's computeAxisRotation).
+Quat _scene_axis_rotation(Vec3 look, Vec3 fallback, Vec3 to) {
+    float c = look.dot(to);
+    if (c > 0.99999999) return quat_identity();
+    if (c < -0.99999999) return quat_axis_angle(fallback, 3.14159265358979);
+    Vec3 axis = look.cross(to);
+    if (axis.length() < 1e-12) return quat_identity();
+    return quat_axis_angle(axis, (float)acos((double)c));
+}
+
+// The world matrix of a billboarded node: at its world position and scale, turned by
+// ViroReact's billboard rotation toward eye, then by its own rotation.
+Mat4 _scene_billboard(*SceneNode n, Vec3 eye) {
+    Mat4 w = n.world;
+    Vec3 pos = Vec3{w.m[12], w.m[13], w.m[14]};
+    Vec3 scale = Vec3{Vec3{w.m[0], w.m[1], w.m[2]}.length(), Vec3{w.m[4], w.m[5], w.m[6]}.length(),
+        Vec3{w.m[8], w.m[9], w.m[10]}.length()};
+    Vec3 look = Vec3{0.0, 0.0, 1.0};
+    Vec3 to = eye - pos;
+    Quat b = quat_identity();
+    if (n.billboard == SCENE_BILLBOARD_ALL) {
+        Vec3 flat = Vec3{to.x, 0.0, to.z};
+        if (flat.length() > 1e-9) {
+            Vec3 fl = flat.normalize();
+            Quat qy = _scene_axis_rotation(look, Vec3{0.0, 1.0, 0.0}, fl);
+            Vec3 tn = to.length() > 1e-9 ? to.normalize() : fl;
+            float c = tn.dot(fl);
+            Vec3 axis = tn.y < 0.0 ? Vec3{1.0, 0.0, 0.0} : Vec3{-1.0, 0.0, 0.0};
+            Quat qx = quat_identity();
+            if (c < -0.99999999) qx = quat_axis_angle(axis, 3.14159265358979);
+            else if (c < 0.99999999) qx = quat_axis_angle(axis, (float)acos((double)c));
+            b = qy * qx;
+        }
+    } else {
+        Vec3 fallback = Vec3{1.0, 0.0, 0.0};
+        if (n.billboard == SCENE_BILLBOARD_X) {
+            to.x = 0.0;
+        } else if (n.billboard == SCENE_BILLBOARD_Y) {
+            to.y = 0.0;
+            fallback = Vec3{0.0, 1.0, 0.0};
+        } else {
+            to.z = 0.0;
+            fallback = Vec3{0.0, 0.0, 1.0};
+        }
+        if (to.length() > 1e-9) b = _scene_axis_rotation(look, fallback, to.normalize());
+    }
+    return mat4_trs(pos, b * n.rotation, scale);
+}
+
+void _scene_update_node(*Scene self, int node, Mat4 parent, bool billboards, Vec3 eye) {
+    *SceneNode n = &self.nodes.data[node];
+    n.world = parent * mat4_trs(n.position, n.rotation, n.scale);
+    if (billboards && n.billboard != SCENE_BILLBOARD_NONE) n.world = _scene_billboard(n, eye);
+    for (i in 0..n.children.size) _scene_update_node(self, n.children.data[i], n.world, billboards, eye);
+}
+
+// Recomputes every node's world matrix (SceneNode.world) from the tree, turning
+// billboarded nodes toward the scene's camera. Scene_render does it first; call it to
+// read world matrices in between.
+void Scene_update(*Scene self) {
+    Vec3 none = Vec3{0.0, 0.0, 0.0};
+    _scene_update_node(self, 0, mat4_identity(), false, none);
+    bool any = false;
+    for (i in 1..self.nodes.size) {
+        if (self.nodes.data[i].alive && self.nodes.data[i].billboard != SCENE_BILLBOARD_NONE) any = true;
+    }
+    if (!any) return;
+    Vec3 eye = none;
+    if (self.camera >= 0 && self.camera < self.nodes.size && self.nodes.data[self.camera].alive) {
+        Mat4 c = self.nodes.data[self.camera].world;
+        eye = Vec3{c.m[12], c.m[13], c.m[14]};
+    }
+    _scene_update_node(self, 0, mat4_identity(), true, eye);
+}
+
+// The rotation of a matrix's upper 3x3 part, with its scale divided out.
+Quat scene_matrix_rotation(Mat4 m) {
+    Vec3 c0 = Vec3{m.m[0], m.m[1], m.m[2]}.normalize();
+    Vec3 c1 = Vec3{m.m[4], m.m[5], m.m[6]}.normalize();
+    Vec3 c2 = Vec3{m.m[8], m.m[9], m.m[10]}.normalize();
+    if (c0.cross(c1).dot(c2) < 0.0) c0 = -c0;
+    float r00 = c0.x;
+    float r10 = c0.y;
+    float r20 = c0.z;
+    float r01 = c1.x;
+    float r11 = c1.y;
+    float r21 = c1.z;
+    float r02 = c2.x;
+    float r12 = c2.y;
+    float r22 = c2.z;
+    float tr = r00 + r11 + r22;
+    Quat q;
+    if (tr > 0.0) {
+        float s = (float)sqrt((double)(tr + 1.0)) * 2.0;
+        q = Quat{(r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s, 0.25 * s};
+    } else if (r00 > r11 && r00 > r22) {
+        float s = (float)sqrt((double)(1.0 + r00 - r11 - r22)) * 2.0;
+        q = Quat{0.25 * s, (r01 + r10) / s, (r02 + r20) / s, (r21 - r12) / s};
+    } else if (r11 > r22) {
+        float s = (float)sqrt((double)(1.0 + r11 - r00 - r22)) * 2.0;
+        q = Quat{(r01 + r10) / s, 0.25 * s, (r12 + r21) / s, (r02 - r20) / s};
+    } else {
+        float s = (float)sqrt((double)(1.0 + r22 - r00 - r11)) * 2.0;
+        q = Quat{(r02 + r20) / s, (r12 + r21) / s, 0.25 * s, (r10 - r01) / s};
+    }
+    return q.normalize();
+}
+
+// Splits a matrix made of a translation, a rotation and a scale into the three (a
+// negative determinant flips the x scale).
+void scene_decompose(Mat4 m, *Vec3 translation, *Quat rotation, *Vec3 scale) {
+    *translation = Vec3{m.m[12], m.m[13], m.m[14]};
+    Vec3 c0 = Vec3{m.m[0], m.m[1], m.m[2]};
+    Vec3 c1 = Vec3{m.m[4], m.m[5], m.m[6]};
+    Vec3 c2 = Vec3{m.m[8], m.m[9], m.m[10]};
+    float sx = c0.length();
+    if (c0.cross(c1).dot(c2) < 0.0) sx = -sx;
+    *scale = Vec3{sx, c1.length(), c2.length()};
+    *rotation = scene_matrix_rotation(m);
+}
+
+// Turns node so that its -Z axis points at target (a point in world space) with its +Y
+// axis toward up: how cameras, spot lights and directional lights on a node are aimed.
+void Scene_look_at(*Scene self, int node, Vec3 target, Vec3 up) {
+    if (!_scene_valid(self, node)) return;
+    Mat4 world = Scene_world(self, node);
+    Vec3 eye = Vec3{world.m[12], world.m[13], world.m[14]};
+    Vec3 z = (eye - target).normalize();
+    if (z.length() < 0.5) return;
+    Vec3 x = up.cross(z).normalize();
+    if (x.length() < 0.5) x = Vec3{0.0, 0.0, 1.0}.cross(z).normalize();
+    if (x.length() < 0.5) x = Vec3{1.0, 0.0, 0.0};
+    Vec3 y = z.cross(x);
+    Mat4 r = mat4_identity();
+    r.m[0] = x.x;
+    r.m[1] = x.y;
+    r.m[2] = x.z;
+    r.m[4] = y.x;
+    r.m[5] = y.y;
+    r.m[6] = y.z;
+    r.m[8] = z.x;
+    r.m[9] = z.y;
+    r.m[10] = z.z;
+    Quat qw = scene_matrix_rotation(r);
+    int p = self.nodes.data[node].parent;
+    Quat local = qw;
+    if (p >= 0) {
+        Quat pr = scene_matrix_rotation(Scene_world(self, p));
+        local = pr.conjugate() * qw;
+    }
+    self.nodes.data[node].rotation = local.normalize();
+}
+
+// Uploads geometry as a mesh and returns its id. The geometry can be freed afterwards.
+Result<int, string> Scene_add_geometry(*Scene self, *SceneGeometry geometry) {
+    if (geometry.vertex_count == 0 || geometry.index_count < 3) return Err<int, string>("scene: empty geometry");
+    SceneMesh m;
+    m.vertices = self.gpu.vertices(geometry.vertices, (uint64)geometry.vertex_count * SCENE_VERTEX_FLOATS * 4)?;
+    Result<GpuBuffer, string> ib = self.gpu.indices(geometry.indices, (uint64)geometry.index_count);
+    if (!ib.ok) {
+        m.vertices.release();
+        return Err<int, string>(ib.error);
+    }
+    m.indices = ib.value;
+    m.index_count = geometry.index_count;
+    m.vertex_count = geometry.vertex_count;
+    m.min = geometry.min;
+    m.max = geometry.max;
+    List_push(&self.meshes, m);
+    return Ok<int, string>(self.meshes.size - 1);
+}
+
+// Replaces mesh's vertices and indices with geometry (a text that changed, a shape built
+// again, particles each frame): written in place when they fit in the mesh's buffers,
+// else in new ones. Its morph targets are dropped. False, changing nothing, for an unknown mesh or
+// an empty geometry, or when the upload fails.
+bool Scene_set_geometry(*Scene self, int mesh, *SceneGeometry geometry) {
+    if (mesh <= 0 || mesh >= self.meshes.size) return false;
+    if (geometry.vertex_count == 0 || geometry.index_count < 3) return false;
+    *SceneMesh old = &self.meshes.data[mesh];
+    uint64 vbytes = (uint64)geometry.vertex_count * SCENE_VERTEX_FLOATS * 4;
+    uint64 ibytes = (uint64)geometry.index_count * 4;
+    if (old.targets == 0 && old.vertices.handle != null && vbytes <= old.vertices.size && ibytes <= old.indices.size) {
+        // it fits: write in place (a mesh rebuilt every frame, like particles)
+        old.vertices.write(0, geometry.vertices, vbytes);
+        old.indices.write(0, geometry.indices, ibytes);
+        old.index_count = geometry.index_count;
+        old.vertex_count = geometry.vertex_count;
+        old.min = geometry.min;
+        old.max = geometry.max;
+        return true;
+    }
+    Result<GpuBuffer, string> vb = self.gpu.vertices(geometry.vertices, (uint64)geometry.vertex_count * SCENE_VERTEX_FLOATS * 4);
+    if (!vb.ok) return false;
+    Result<GpuBuffer, string> ib = self.gpu.indices(geometry.indices, (uint64)geometry.index_count);
+    if (!ib.ok) {
+        vb.value.release();
+        return false;
+    }
+    *SceneMesh m = &self.meshes.data[mesh];
+    m.vertices.release();
+    m.indices.release();
+    m.morph.release();
+    m.targets = 0;
+    m.vertices = vb.value;
+    m.indices = ib.value;
+    m.index_count = geometry.index_count;
+    m.vertex_count = geometry.vertex_count;
+    m.min = geometry.min;
+    m.max = geometry.max;
+    for (i in 0..self._r.nodes.size) {
+        if (self._r.nodes.data[i].bound_mesh == mesh) self._r.nodes.data[i].bound_mesh = -1;
+    }
+    return true;
+}
+
+// Gives mesh targets morph targets: positions and normals (normals may be null) hold
+// targets * vertex_count * 3 floats each, the delta of target t for vertex v at
+// (t * vertex_count + v) * 3. A node drawing the mesh blends them by its weights
+// (Scene_set_weights).
+Result<int, string> Scene_set_morph_targets(*Scene self, int mesh, *float positions, *float normals, int targets) {
+    if (mesh <= 0 || mesh >= self.meshes.size || positions == null || targets <= 0) return Err<int, string>("scene: bad morph targets");
+    *SceneMesh m = &self.meshes.data[mesh];
+    int64 n = (int64)targets * m.vertex_count;
+    *float d = alloc<float>(n * 8 + 4);
+    defer free(d);
+    for (i in 0..n) {
+        for (k in 0..3) {
+            d[i * 8 + k] = positions[i * 3 + k];
+            d[i * 8 + 4 + k] = normals != null ? normals[i * 3 + k] : 0.0;
+        }
+    }
+    m.morph.release();
+    m.morph = self.gpu.buffer((uint64)(n * 32), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    m.morph.write(0, d, (uint64)(n * 32));
+    m.targets = targets;
+    for (i in 0..self._r.nodes.size) self._r.nodes.data[i].bound_mesh = -1;
+    return Ok<int, string>(0);
+}
+
+// Skins node's mesh with count joint matrices, each a joint's transform times its inverse
+// bind matrix in the space of node's own transform (glTF's joint matrices). The vertex
+// joints index them and the vertex weights blend them. count 0 stops skinning.
+void Scene_set_joints(*Scene self, int node, *Mat4 joints, int count) {
+    if (!_scene_valid(self, node)) return;
+    *SceneNode n = &self.nodes.data[node];
+    List_clear(&n.joints);
+    for (i in 0..count) List_push(&n.joints, joints[i]);
+}
+
+// Sets node's morph target weights, one per target of its mesh.
+void Scene_set_weights(*Scene self, int node, *float weights, int count) {
+    if (!_scene_valid(self, node)) return;
+    *SceneNode n = &self.nodes.data[node];
+    List_clear(&n.weights);
+    for (i in 0..count) List_push(&n.weights, weights[i]);
+}
+
+// Adds a material and returns its id.
+int Scene_add_material(*Scene self, SceneMaterial material) {
+    List_push(&self.materials, material);
+    _SceneMatGpu g;
+    List_push(&self._r.mats, g);
+    return self.materials.size - 1;
+}
+
+// The material with id material (the default material, id 0, for an unknown id). Changes
+// show at the next render.
+*SceneMaterial Scene_material(*Scene self, int material) {
+    if (material < 0 || material >= self.materials.size) material = 0;
+    return &self.materials.data[material];
+}

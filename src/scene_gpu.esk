@@ -1,0 +1,526 @@
+// scene_gpu.esk: GPU resources per frame: samplers, shader layouts, uniforms, node buffers, culling and the camera (part of scene.esk, which imports it in order after the ones before it)
+
+*GpuTexture _scene_tex(*Scene self, int id) {
+    if (id <= 0 || id >= self.textures.size || self.textures.data[id].handle == null) return &self._r.white;
+    return &self.textures.data[id];
+}
+
+int _scene_sampler_key(*SceneMaterial m) {
+    int ws = m.wrap_s < 0 || m.wrap_s > SCENE_WRAP_MIRROR ? 0 : m.wrap_s;
+    int wt = m.wrap_t < 0 || m.wrap_t > SCENE_WRAP_MIRROR ? 0 : m.wrap_t;
+    return ws + wt * 3 + (m.filter == SCENE_FILTER_NEAREST ? 9 : 0) + (m.mip_filter == SCENE_FILTER_NEAREST ? 18 : 0);
+}
+
+WGPUAddressMode _scene_wrap_mode(int w) {
+    if (w == SCENE_WRAP_CLAMP) return WGPUAddressMode_ClampToEdge;
+    if (w == SCENE_WRAP_MIRROR) return WGPUAddressMode_MirrorRepeat;
+    return WGPUAddressMode_Repeat;
+}
+
+// The sampler of a material sampler key (0 is the scene's default sampler).
+Result<*GpuSampler, string> _scene_sampler(*Scene self, int key) {
+    *_SceneRenderer r = &self._r;
+    if (key == 0) return Ok<*GpuSampler, string>(&r.samp);
+    for (i in 0..r.samplers.size) {
+        if (r.samplers.data[i].key == key) return Ok<*GpuSampler, string>(&r.samplers.data[i].samp);
+    }
+    GpuSamplerOptions o = GpuSamplerOptions{wrap_u: _scene_wrap_mode(key % 3), wrap_v: _scene_wrap_mode((key / 3) % 3),
+        nearest: (key / 9) % 2 == 1, mipmaps: (key / 18) % 2 == 0, anisotropy: 8};
+    GpuSampler s = self.gpu.sampler_with(&o)?;
+    List_push(&r.samplers, _SceneSampler{key, s});
+    return Ok<*GpuSampler, string>(&r.samplers.data[r.samplers.size - 1].samp);
+}
+
+Result<int, string> _scene_material_gpu(*Scene self, int id) {
+    *_SceneMatGpu g = &self._r.mats.data[id];
+    *SceneMaterial m = &self.materials.data[id];
+    if (!g.made) {
+        g.uniforms = self.gpu.uniform(null, 272)?;
+        Result<GpuBindGroup, string> bg = self._r.mat_layout.group();
+        if (!bg.ok) {
+            g.uniforms.release();
+            return Err<int, string>(bg.error);
+        }
+        g.group = bg.value;
+        g.group.buffer(0, &g.uniforms);
+        g.group.sampler(1, &self._r.samp);
+        g.sampler = 0;
+        for (k in 0..6) g.bound[k] = -1;
+        g.made = true;
+    }
+    int skey = _scene_sampler_key(m);
+    if (g.sampler != skey) {
+        *GpuSampler smp = _scene_sampler(self, skey)?;
+        g.group.sampler(1, smp);
+        g.sampler = skey;
+    }
+    int[6] ids = {m.diffuse_texture, m.specular_texture, m.normal_texture, m.emissive_texture,
+        m.metal_rough_texture, m.occlusion_texture};
+    for (k in 0..6) {
+        if (g.bound[k] != ids[k]) {
+            g.group.texture((uint32)(k + 2), _scene_tex(self, ids[k]));
+            g.bound[k] = ids[k];
+        }
+    }
+    bool has_normal = m.normal_texture > 0 && m.lighting != SCENE_CONSTANT;
+    bool has_occ = m.occlusion_texture > 0;
+    float[68] u = {m.diffuse.x, m.diffuse.y, m.diffuse.z, m.diffuse.w,
+        m.specular.x, m.specular.y, m.specular.z, m.shininess,
+        m.emissive.x, m.emissive.y, m.emissive.z, m.alpha_cutoff,
+        m.metalness, m.roughness, has_normal ? m.normal_scale : 0.0, has_occ ? m.occlusion_strength : 0.0,
+        m.diffuse_intensity, m.chroma_key_color.x, m.chroma_key_color.y, m.chroma_key_color.z};
+    // Each texture's coordinates: (a, b, c, d) and (tx, ty, set), u' = a u + b v + tx,
+    // v' = c u + d v + ty, as KHR_texture_transform's T * R * S.
+    for (k in 0..6) {
+        *float f = &u[20 + k * 8];
+        SceneUv t = m.uv[k];
+        float c = 1.0;
+        float sn = 0.0;
+        float sx = 1.0;
+        float sy = 1.0;
+        if (t.transform) {
+            c = (float)cos((double)t.rotation);
+            sn = (float)sin((double)t.rotation);
+            sx = t.scale.x;
+            sy = t.scale.y;
+            f[4] = t.offset.x;
+            f[5] = t.offset.y;
+        }
+        f[0] = c * sx;
+        f[1] = sn * sy;
+        f[2] = -sn * sx;
+        f[3] = c * sy;
+        f[6] = t.set == 1 ? 1.0 : 0.0;
+    }
+    g.uniforms.write(0, &u, 272);
+    if (m.shader > 0 && m.shader < self.shaders.size) _scene_material_mods(self, id)?;
+    return Ok<int, string>(0);
+}
+
+// The shadow-map pipeline of shader program sid (one that moves vertices), made on first
+// use.
+Result<*GpuPipeline, string> _scene_shadow_pipe(*Scene self, int sid) {
+    *_SceneRenderer r = &self._r;
+    for (i in 0..r.shadow_pipes.size) {
+        if (r.shadow_pipes.data[i].key == sid) return Ok<*GpuPipeline, string>(&r.shadow_pipes.data[i].pipe);
+    }
+    String src;
+    defer src.free();
+    scene_shadow_shader_with(&self.shaders.data[sid], &src);
+    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)SCENE_VERTEX_FLOATS * 4};
+    defer layout.release();
+    _scene_vertex_layout(&layout);
+    *GpuBindLayout[4] sg = {&r.shadow_layout, &r.draw_layout, &r.mat_layout, _scene_shader_layout(self, sid)};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: null, layout: &layout,
+        groups: &sg[0], group_count: 4, depth: true, depth_format: WGPUTextureFormat_Depth32Float,
+        depth_bias: 2, depth_bias_slope: 1.5};
+    GpuPipeline p = self.gpu.pipeline(&d)?;
+    List_push(&r.shadow_pipes, _ScenePipe{sid, p});
+    return Ok<*GpuPipeline, string>(&r.shadow_pipes.data[r.shadow_pipes.size - 1].pipe);
+}
+
+// The bind layout of shader program sid, made on first use.
+*GpuBindLayout _scene_shader_layout(*Scene self, int sid) {
+    *_SceneRenderer r = &self._r;
+    while (r.shader_gpu.size <= sid) {
+        _SceneShaderGpu z;
+        List_push(&r.shader_gpu, z);
+    }
+    *_SceneShaderGpu sg = &r.shader_gpu.data[sid];
+    if (!sg.made) {
+        *SceneShader p = &self.shaders.data[sid];
+        sg.layout = self.gpu.bind_layout();
+        sg.layout.uniform(0, WGPUShaderStage_Vertex | WGPUShaderStage_Fragment);
+        sg.layout.sampler(1, WGPUShaderStage_Vertex | WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+        int t = 0;
+        for (k in 0..p.uniforms.size) {
+            if (p.offsets.data[k] >= 0) continue;
+            bool depth = strcmp((string)p.uniforms.data[k].name.data, "scene_depth_texture") == 0;
+            sg.layout.texture((uint32)(2 + t), WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
+                depth ? WGPUTextureSampleType_Depth : WGPUTextureSampleType_Float);
+            t++;
+        }
+        sg.made = true;
+    }
+    return &sg.layout;
+}
+
+// Material id's uniform block and textures for its shader program.
+Result<int, string> _scene_material_mods(*Scene self, int id) {
+    *_SceneMatGpu g = &self._r.mats.data[id];
+    int sid = self.materials.data[id].shader;
+    *SceneShader p = &self.shaders.data[sid];
+    if (g.mod_made && g.mod_shader != sid) {
+        g.mod_group.release();
+        g.mod_buffer.release();
+        g.mod_made = false;
+    }
+    while (g.mod_values.size < p.uniform_bytes / 4) List_push(&g.mod_values, 0.0);
+    while (g.mod_textures.size < p.uniforms.size) List_push(&g.mod_textures, 0);
+    if (!g.mod_made) {
+        g.mod_buffer = self.gpu.uniform(null, (uint64)p.uniform_bytes)?;
+        *GpuBindLayout layout = _scene_shader_layout(self, sid);
+        Result<GpuBindGroup, string> bg = layout.group();
+        if (!bg.ok) {
+            g.mod_buffer.release();
+            return Err<int, string>(bg.error);
+        }
+        g.mod_group = bg.value;
+        g.mod_group.buffer(0, &g.mod_buffer);
+        g.mod_group.sampler(1, &self._r.samp);
+        g.mod_shader = sid;
+        g.mod_made = true;
+    }
+    int t = 0;
+    for (k in 0..p.uniforms.size) {
+        string un = (string)p.uniforms.data[k].name.data;
+        if (p.offsets.data[k] >= 0) {
+            // the AR camera image's mapping, kept current from the scene
+            if (strcmp(un, "camera_image_transform") == 0) {
+                for (j in 0..16) g.mod_values.data[p.offsets.data[k] / 4 + j] = self.camera_image_transform.m[j];
+            } else if (strcmp(un, "semantic_transform") == 0) {
+                for (j in 0..16) g.mod_values.data[p.offsets.data[k] / 4 + j] = self.semantic_transform.m[j];
+            } else if (strcmp(un, "semantic_size") == 0) {
+                *GpuTexture st = _scene_tex(self, self.semantic_texture);
+                g.mod_values.data[p.offsets.data[k] / 4] = (float)st.width;
+                g.mod_values.data[p.offsets.data[k] / 4 + 1] = (float)st.height;
+            }
+            continue;
+        }
+        if (strcmp(un, "scene_depth_texture") == 0) {
+            g.mod_group.view((uint32)(2 + t), &self._r.depth_prev_view);
+        } else if (strcmp(un, "camera_texture") == 0) {
+            g.mod_group.texture((uint32)(2 + t), _scene_tex(self, self.camera_texture));
+        } else if (strcmp(un, "semantic_texture") == 0) {
+            g.mod_group.texture((uint32)(2 + t), _scene_tex(self, self.semantic_texture));
+        } else if (strcmp(un, "semantic_confidence_texture") == 0) {
+            g.mod_group.texture((uint32)(2 + t), _scene_tex(self, self.semantic_confidence_texture));
+        } else {
+            g.mod_group.texture((uint32)(2 + t), _scene_tex(self, g.mod_textures.data[k]));
+        }
+        t++;
+    }
+    g.mod_buffer.write(0, g.mod_values.data, (uint64)p.uniform_bytes);
+    return Ok<int, string>(0);
+}
+
+// Adds a program of shader modifiers (ViroReact's shaderModifiers) and returns its id, for
+// SceneMaterial.shader. GLSL bodies are translated to WGSL here; a body WGSL cannot take
+// fails when the first material using it is drawn, with the GPU's message.
+Result<int, string> Scene_add_shader(*Scene self, *List<SceneShaderModifier> modifiers) {
+    if (self.shaders.size == 0) {
+        SceneShader none;
+        List_push(&self.shaders, none);
+    }
+    SceneShader p = scene_shader(modifiers)?;
+    List_push(&self.shaders, p);
+    return Ok<int, string>(self.shaders.size - 1);
+}
+
+int _scene_uniform_index(*Scene self, int material, string name) {
+    if (material <= 0 || material >= self.materials.size) return -1;
+    int sid = self.materials.data[material].shader;
+    if (sid <= 0 || sid >= self.shaders.size) return -1;
+    *SceneShader p = &self.shaders.data[sid];
+    for (k in 0..p.uniforms.size) {
+        if (strcmp((string)p.uniforms.data[k].name.data, name) == 0) return k;
+    }
+    return -1;
+}
+
+// Sets count floats of material's uniform name (a float, vec2, vec3, vec4, mat3 or mat4,
+// matrices column by column), ViroReact's materialUniforms and updateShaderUniform. False
+// when the material's program has no such uniform. Shows at the next render.
+bool Scene_set_uniform(*Scene self, int material, string name, *float values, int count) {
+    int k = _scene_uniform_index(self, material, name);
+    if (k < 0) return false;
+    *SceneShader p = &self.shaders.data[self.materials.data[material].shader];
+    int off = p.offsets.data[k];
+    if (off < 0) return false;
+    *_SceneMatGpu g = &self._r.mats.data[material];
+    while (g.mod_values.size < p.uniform_bytes / 4) List_push(&g.mod_values, 0.0);
+    string t = (string)p.uniforms.data[k].type.data;
+    if (strcmp(t, "mat3") == 0) {
+        // three columns, each in 16 bytes
+        for (c in 0..3) {
+            for (rr in 0..3) {
+                if (c * 3 + rr < count) g.mod_values.data[off / 4 + c * 4 + rr] = values[c * 3 + rr];
+            }
+        }
+        return true;
+    }
+    int cap = strcmp(t, "mat4") == 0 ? 16 : 4;
+    for (i in 0..(count < cap ? count : cap)) g.mod_values.data[off / 4 + i] = values[i];
+    return true;
+}
+
+// Scene_set_uniform for a float.
+bool Scene_set_uniform_float(*Scene self, int material, string name, float value) {
+    return Scene_set_uniform(self, material, name, &value, 1);
+}
+
+// Scene_set_uniform for a vec2.
+bool Scene_set_uniform_vec2(*Scene self, int material, string name, Vec2 value) {
+    float[2] v = {value.x, value.y};
+    return Scene_set_uniform(self, material, name, &v[0], 2);
+}
+
+// Scene_set_uniform for a vec3.
+bool Scene_set_uniform_vec3(*Scene self, int material, string name, Vec3 value) {
+    float[3] v = {value.x, value.y, value.z};
+    return Scene_set_uniform(self, material, name, &v[0], 3);
+}
+
+// Scene_set_uniform for a vec4.
+bool Scene_set_uniform_vec4(*Scene self, int material, string name, Vec4 value) {
+    float[4] v = {value.x, value.y, value.z, value.w};
+    return Scene_set_uniform(self, material, name, &v[0], 4);
+}
+
+// Scene_set_uniform for a mat4.
+bool Scene_set_uniform_mat4(*Scene self, int material, string name, Mat4 value) {
+    return Scene_set_uniform(self, material, name, &value.m[0], 16);
+}
+
+// Binds texture (an id, 0 for white) to material's sampler2D uniform name.
+bool Scene_set_uniform_texture(*Scene self, int material, string name, int texture) {
+    int k = _scene_uniform_index(self, material, name);
+    if (k < 0) return false;
+    *SceneShader p = &self.shaders.data[self.materials.data[material].shader];
+    if (p.offsets.data[k] >= 0) return false;
+    *_SceneMatGpu g = &self._r.mats.data[material];
+    while (g.mod_textures.size < p.uniforms.size) List_push(&g.mod_textures, 0);
+    g.mod_textures.data[k] = texture;
+    return true;
+}
+
+// How many times a node's mesh is drawn: once per instance, or once.
+uint32 _scene_instance_count(*Scene self, int id) {
+    int n = self.nodes.data[id].instances.size;
+    return n > 0 ? (uint32)n : (uint32)1;
+}
+
+// Uploads a node's instance transforms; true when it has any.
+Result<bool, string> _scene_node_instances(*Scene self, int id) {
+    *SceneNode n = &self.nodes.data[id];
+    if (n.instances.size == 0) return Ok<bool, string>(false);
+    *_SceneNodeGpu g = &self._r.nodes.data[id];
+    uint64 bytes = (uint64)n.instances.size * 64;
+    if (g.instances.handle == null || g.instances.size < bytes) {
+        g.instances.release();
+        g.instances = self.gpu.buffer(bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+        g.group.buffer(4, &g.instances);
+    }
+    g.instances.write(0, n.instances.data, bytes);
+    return Ok<bool, string>(true);
+}
+
+// A sphere around every instance of a node's mesh (its middle `mid` and half diagonal `r` in
+// the mesh's space), for culling.
+void _scene_instance_bounds(*SceneNode n, Vec3 mid, float r, *Vec3 center, *float radius) {
+    Vec3 lo = Vec3{1e30, 1e30, 1e30};
+    Vec3 hi = Vec3{-1e30, -1e30, -1e30};
+    float grow = 0.0;
+    for (i in 0..n.instances.size) {
+        Mat4 m = n.world * n.instances.data[i];
+        Vec3 c = m.point(mid);
+        float s = r * _scene_max_scale(m);
+        if (s > grow) grow = s;
+        if (c.x < lo.x) lo.x = c.x;
+        if (c.y < lo.y) lo.y = c.y;
+        if (c.z < lo.z) lo.z = c.z;
+        if (c.x > hi.x) hi.x = c.x;
+        if (c.y > hi.y) hi.y = c.y;
+        if (c.z > hi.z) hi.z = c.z;
+    }
+    *center = (lo + hi) * 0.5;
+    *radius = ((hi - lo) * 0.5).length() + grow;
+}
+
+// Draws node's mesh once per transform (each under the node's own), in one draw call:
+// many copies of a mesh (ViroReact's instancing). The transforms are copied; an empty list
+// draws the mesh once again. Instances should be rigid with a uniform scale, as their
+// normals turn with them.
+void Scene_set_instances(*Scene self, int node, *Mat4 transforms, int count) {
+    *SceneNode n = &self.nodes.data[node];
+    List_clear(&n.instances);
+    for (i in 0..count) List_push(&n.instances, transforms[i]);
+}
+
+Result<int, string> _scene_node_gpu(*Scene self, int id) {
+    *_SceneNodeGpu g = &self._r.nodes.data[id];
+    if (g.made) return Ok<int, string>(0);
+    g.uniforms = self.gpu.uniform(null, sizeof(_SceneDrawU))?;
+    Result<GpuBindGroup, string> bg = self._r.draw_layout.group();
+    if (!bg.ok) {
+        g.uniforms.release();
+        return Err<int, string>(bg.error);
+    }
+    g.group = bg.value;
+    g.group.buffer(0, &g.uniforms);
+    for (b in 1..5) g.group.buffer((uint32)b, &self._r.no_storage);
+    g.bound_mesh = -1;
+    g.made = true;
+    return Ok<int, string>(0);
+}
+
+// Uploads node's joints and weights and binds its mesh's morph targets; returns whether
+// it skins and how many targets it blends.
+Result<int, string> _scene_node_deform(*Scene self, int id, int mesh, *bool skinned) {
+    *_SceneNodeGpu g = &self._r.nodes.data[id];
+    *SceneNode n = &self.nodes.data[id];
+    *SceneMesh m = &self.meshes.data[mesh];
+    *skinned = n.joints.size > 0;
+    if (n.joints.size > 0) {
+        uint64 bytes = (uint64)n.joints.size * 64;
+        if (g.joints.handle == null || g.joints.size < bytes) {
+            g.joints.release();
+            g.joints = self.gpu.buffer(bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+            g.group.buffer(1, &g.joints);
+        }
+        g.joints.write(0, n.joints.data, bytes);
+    }
+    int targets = m.targets < n.weights.size ? m.targets : n.weights.size;
+    if (targets > 0) {
+        uint64 bytes = (uint64)n.weights.size * 4;
+        if (bytes < 16) bytes = 16;
+        if (g.weights.handle == null || g.weights.size < bytes) {
+            g.weights.release();
+            g.weights = self.gpu.buffer(bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+            g.group.buffer(3, &g.weights);
+        }
+        g.weights.write(0, n.weights.data, (uint64)n.weights.size * 4);
+    }
+    if (g.bound_mesh != mesh) {
+        g.group.buffer(2, m.targets > 0 ? &m.morph : &self._r.no_storage);
+        g.bound_mesh = mesh;
+    }
+    return Ok<int, string>(targets);
+}
+
+float _scene_max_scale(Mat4 m) {
+    float sx = Vec3{m.m[0], m.m[1], m.m[2]}.length();
+    float sy = Vec3{m.m[4], m.m[5], m.m[6]}.length();
+    float sz = Vec3{m.m[8], m.m[9], m.m[10]}.length();
+    float s = sx > sy ? sx : sy;
+    return s > sz ? s : sz;
+}
+
+// Whether a sphere is at least partly inside the view frustum of view_proj (clip space
+// with depth 0 to 1): it is outside when it lies wholly beyond one of the six planes.
+bool _scene_sphere_in_view(Mat4 m, Vec3 c, float r) {
+    // the rows of the matrix (column-major storage)
+    Vec4 r0 = Vec4{m.m[0], m.m[4], m.m[8], m.m[12]};
+    Vec4 r1 = Vec4{m.m[1], m.m[5], m.m[9], m.m[13]};
+    Vec4 r2 = Vec4{m.m[2], m.m[6], m.m[10], m.m[14]};
+    Vec4 r3 = Vec4{m.m[3], m.m[7], m.m[11], m.m[15]};
+    Vec4[6] planes = {r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2};
+    for (i in 0..6) {
+        Vec4 p = planes[i];
+        float len = Vec3{p.x, p.y, p.z}.length();
+        if (len <= 0.0) continue;
+        float dist = (p.x * c.x + p.y * c.y + p.z * c.z + p.w) / len;
+        if (dist < -r) return false;
+    }
+    return true;
+}
+
+void _scene_collect(*Scene self, int id, float parent_opacity, int world, int frame) {
+    *SceneNode n = &self.nodes.data[id];
+    if (!n.alive || !n.visible) return;
+    if (n.portal && id != 0) {
+        List_push(&self._r.portals, _ScenePortalRec{id, world, -1});
+        // the portal's contents are its own world; its entrance stays in the outer one
+        for (i in 0..n.children.size) {
+            int c = n.children.data[i];
+            *SceneNode cn = &self.nodes.data[c];
+            bool entrance = cn.portal_entrance;
+            float op = parent_opacity * (n.opacity < 0.0 ? 0.0 : (n.opacity > 1.0 ? 1.0 : n.opacity));
+            if (entrance) _scene_collect(self, c, op, world, id);
+            else _scene_collect(self, c, op, id, 0);
+            n = &self.nodes.data[id];
+        }
+        return;
+    }
+    float opacity = parent_opacity * (n.opacity < 0.0 ? 0.0 : (n.opacity > 1.0 ? 1.0 : n.opacity));
+    if (opacity <= 0.0) return;
+    if (n.mesh > 0 && n.mesh < self.meshes.size && self.meshes.data[n.mesh].index_count > 0) {
+        *SceneMesh mesh = &self.meshes.data[n.mesh];
+        _SceneDraw d;
+        d.node = id;
+        d.mesh = n.mesh;
+        d.material = n.material > 0 && n.material < self.materials.size ? n.material : 0;
+        d.key = scene_material_key(&self.materials.data[d.material]);
+        if (opacity < 1.0) d.key = scene_key_fade(d.key);
+        d.blend = scene_key_blended(d.key);
+        d.opacity = opacity;
+        d.order = n.rendering_order;
+        d.world = world;
+        d.frame = frame;
+        Vec3 mid = (mesh.min + mesh.max) * 0.5;
+        d.center = n.world.point(mid);
+        d.radius = ((mesh.max - mesh.min) * 0.5).length() * _scene_max_scale(n.world);
+        if (n.instances.size > 0) _scene_instance_bounds(n, mid, ((mesh.max - mesh.min) * 0.5).length(), &d.center, &d.radius);
+        d.depth = (d.center - self._r.eye).dot(self._r.forward);
+        d.in_view = _scene_sphere_in_view(self._r.view_proj, d.center, d.radius);
+        List_push(&self._r.draws, d);
+    }
+    for (i in 0..n.children.size) _scene_collect(self, n.children.data[i], opacity, world, frame);
+}
+
+int _scene_draw_order(*_SceneDraw a, *_SceneDraw b) {
+    if (a.order != b.order) return a.order < b.order ? -1 : 1;
+    if (a.blend != b.blend) return a.blend ? 1 : -1;
+    if (a.depth != b.depth) {
+        bool closer = a.depth < b.depth;
+        if (a.blend) return closer ? 1 : -1;
+        return closer ? -1 : 1;
+    }
+    return a.node - b.node;
+}
+
+// The matrices the scene's camera renders a width x height target with: view (world to
+// camera), proj (camera to clip space) and the camera node's world matrix (the
+// identity for the default camera). Read after Scene_update or a render.
+void Scene_camera_matrices(*Scene self, uint32 width, uint32 height, *Mat4 view, *Mat4 proj, *Mat4 camera_world) {
+    SceneCamera cam = scene_perspective(1.0, 0.1, 100.0);
+    Mat4 world = mat4_identity();
+    *SceneCamera c = Scene_camera(self, self.camera);
+    if (c != null && _scene_valid(self, self.camera)) {
+        cam = *c;
+        world = self.nodes.data[self.camera].world;
+    }
+    float aspect = cam.aspect > 0.0 ? cam.aspect : (float)width / (float)(height > 0 ? height : (uint32)1);
+    float near = cam.near > 0.0 ? cam.near : 0.1;
+    float far = cam.far > near ? cam.far : near * 1000.0;
+    if (cam.projection == SCENE_CUSTOM) {
+        *proj = cam.matrix;
+    } else if (cam.projection == SCENE_ORTHOGRAPHIC) {
+        float h = cam.height > 0.0 ? cam.height * 0.5 : 1.0;
+        *proj = mat4_ortho(-h * aspect, h * aspect, -h, h, near, far);
+    } else {
+        *proj = mat4_perspective(cam.fov > 0.0 ? cam.fov : 1.0, aspect, near, far);
+    }
+    *view = world.inverse();
+    *camera_world = world;
+}
+
+// True when the scene's camera is orthographic.
+bool Scene_camera_is_ortho(*Scene self) {
+    *SceneCamera c = Scene_camera(self, self.camera);
+    return c != null && _scene_valid(self, self.camera) && c.projection == SCENE_ORTHOGRAPHIC;
+}
+
+void _scene_camera(*Scene self, uint32 width, uint32 height) {
+    *_SceneRenderer r = &self._r;
+    Mat4 view;
+    Mat4 proj;
+    Mat4 world;
+    Scene_camera_matrices(self, width, height, &view, &proj, &world);
+    r.ortho = Scene_camera_is_ortho(self);
+    r.view_proj = proj * view;
+    r.view = view;
+    r.proj = proj;
+    r.eye = Vec3{world.m[12], world.m[13], world.m[14]};
+    r.forward = (Vec3{-world.m[8], -world.m[9], -world.m[10]}).normalize();
+}

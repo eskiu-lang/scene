@@ -1,0 +1,365 @@
+// glsl_stmt.esk: GLSL statements and declarations into WGSL (part of glsl.esk, which imports it in order after the ones before it)
+
+// --- statements ---
+
+void _g_statement(*GlslTranslator self, *String out, int depth);
+
+void _g_indent(*String out, int depth) {
+    for (i in 0..depth) out.append("    ");
+}
+
+// A declaration: [const] [precision] type name [= value] (, name [= value])* ; consumed
+// from the type on.
+void _g_declaration(*GlslTranslator self, *String out, int depth, bool constant, bool in_for) {
+    string type = _g_type_of(_g_peek(self, 0));
+    self.at++;
+    bool first = true;
+    while (true) {
+        string name = _g_peek(self, 0);
+        self.at++;
+        string vt = type;
+        String wt;
+        wt.append(glsl_wgsl_type(type));
+        if (_g_is(self, "[")) {
+            self.at++;
+            string count = _g_peek(self, 0);
+            self.at++;
+            _g_expect(self, "]");
+            String arr;
+            arr.appendf("array<%s, %s>", (string)wt.data, count);
+            wt.free();
+            wt = arr;
+            vt = "";
+        }
+        GlslTranslator_declare(self, name, vt);
+        if (!first) {
+            out.append(in_for ? ", " : "");
+            if (!in_for) _g_indent(out, depth);
+        } else if (!in_for) {
+            _g_indent(out, depth);
+        }
+        out.appendf("%s %s: %s", constant ? "let" : "var", name, (string)wt.data);
+        wt.free();
+        if (_g_is(self, "=")) {
+            self.at++;
+            _GExpr e = _g_assign(self);
+            _g_splat(&e, _g_width(vt));
+            out.appendf(" = %s", (string)e.text.data);
+            e.text.free();
+        }
+        if (!in_for) out.append(";\n");
+        first = false;
+        if (_g_is(self, ",")) {
+            self.at++;
+            continue;
+        }
+        break;
+    }
+    if (!in_for) _g_expect(self, ";");
+}
+
+bool _g_starts_declaration(*GlslTranslator self) {
+    int k = 0;
+    if (_g_streq(_g_peek(self, k), "const")) k++;
+    while (_g_is_precision(_g_peek(self, k))) k++;
+    string t = _g_type_of(_g_peek(self, k));
+    return t[0] != 0 && _g_kind(self, k + 1) == _GT_IDENT;
+}
+
+void _g_skip_qualifiers(*GlslTranslator self, *bool constant) {
+    *constant = false;
+    if (_g_is(self, "const")) {
+        *constant = true;
+        self.at++;
+    }
+    while (_g_is_precision(_g_peek(self, 0))) self.at++;
+}
+
+// A statement as the body of if, for or while: always in braces in WGSL.
+void _g_body(*GlslTranslator self, *String out, int depth) {
+    out.append("{\n");
+    if (_g_is(self, "{")) {
+        self.at++;
+        while (!_g_is(self, "}") && _g_kind(self, 0) != _GT_END && self.error.len == 0) _g_statement(self, out, depth + 1);
+        _g_expect(self, "}");
+    } else {
+        _g_statement(self, out, depth + 1);
+    }
+    _g_indent(out, depth);
+    out.append("}");
+}
+
+void _g_statement(*GlslTranslator self, *String out, int depth) {
+    if (_g_is(self, ";")) {
+        self.at++;
+        return;
+    }
+    if (_g_is(self, "{")) {
+        _g_indent(out, depth);
+        _g_body(self, out, depth);
+        out.append("\n");
+        return;
+    }
+    if (_g_is(self, "if")) {
+        self.at++;
+        _g_expect(self, "(");
+        _GExpr c = _g_assign(self);
+        _g_expect(self, ")");
+        _g_indent(out, depth);
+        out.appendf("if (%s) ", (string)c.text.data);
+        c.text.free();
+        _g_body(self, out, depth);
+        while (_g_is(self, "else")) {
+            self.at++;
+            if (_g_is(self, "if")) {
+                self.at++;
+                _g_expect(self, "(");
+                _GExpr c2 = _g_assign(self);
+                _g_expect(self, ")");
+                out.appendf(" else if (%s) ", (string)c2.text.data);
+                c2.text.free();
+                _g_body(self, out, depth);
+            } else {
+                out.append(" else ");
+                _g_body(self, out, depth);
+                break;
+            }
+        }
+        out.append("\n");
+        return;
+    }
+    if (_g_is(self, "for")) {
+        self.at++;
+        _g_expect(self, "(");
+        _g_indent(out, depth);
+        out.append("for (");
+        if (_g_starts_declaration(self)) {
+            bool cst = false;
+            _g_skip_qualifiers(self, &cst);
+            _g_declaration(self, out, depth, false, true);
+        } else if (!_g_is(self, ";")) {
+            _GExpr i = _g_assign(self);
+            out.append((string)i.text.data);
+            i.text.free();
+        }
+        _g_expect(self, ";");
+        out.append("; ");
+        if (!_g_is(self, ";")) {
+            _GExpr c = _g_assign(self);
+            out.append((string)c.text.data);
+            c.text.free();
+        }
+        _g_expect(self, ";");
+        out.append("; ");
+        if (!_g_is(self, ")")) {
+            _GExpr s = _g_assign(self);
+            out.append((string)s.text.data);
+            s.text.free();
+        }
+        _g_expect(self, ")");
+        out.append(") ");
+        _g_body(self, out, depth);
+        out.append("\n");
+        return;
+    }
+    if (_g_is(self, "while")) {
+        self.at++;
+        _g_expect(self, "(");
+        _GExpr c = _g_assign(self);
+        _g_expect(self, ")");
+        _g_indent(out, depth);
+        out.appendf("while (%s) ", (string)c.text.data);
+        c.text.free();
+        _g_body(self, out, depth);
+        out.append("\n");
+        return;
+    }
+    if (_g_is(self, "discard") || _g_is(self, "break") || _g_is(self, "continue")) {
+        _g_indent(out, depth);
+        out.appendf("%s;\n", _g_peek(self, 0));
+        self.at++;
+        _g_expect(self, ";");
+        return;
+    }
+    if (_g_is(self, "return")) {
+        self.at++;
+        _g_indent(out, depth);
+        if (_g_is(self, ";")) out.append("return;\n");
+        else {
+            _GExpr e = _g_assign(self);
+            out.appendf("return %s;\n", (string)e.text.data);
+            e.text.free();
+        }
+        _g_expect(self, ";");
+        return;
+    }
+    if (_g_starts_declaration(self)) {
+        bool cst = false;
+        _g_skip_qualifiers(self, &cst);
+        _g_declaration(self, out, depth, cst, false);
+        return;
+    }
+    _GExpr e = _g_assign(self);
+    _g_indent(out, depth);
+    if (e.type != null && _g_streq(e.type, "block")) out.appendf("%s\n", (string)e.text.data);
+    else out.appendf("%s;\n", (string)e.text.data);
+    e.text.free();
+    _g_expect(self, ";");
+}
+
+// A translator that knows the given names (the modifier's structures, uniforms and
+// varyings) and samples textures with sampler.
+GlslTranslator glsl_translator(string sampler) {
+    GlslTranslator t;
+    t.sampler.append(sampler);
+    string[6] st = {"_surface", "_geometry", "_transforms", "_vertex", "_lightingContribution", "_light"};
+    string[6] ty = {"_surface", "_geometry", "_transforms", "_vertex", "_lighting", "_light"};
+    for (k in 0..6) GlslTranslator_declare(&t, st[k], ty[k]);
+    GlslTranslator_declare(&t, "_output_color", "vec4");
+    GlslTranslator_declare(&t, "camera_position", "vec3");
+    GlslTranslator_declare(&t, "v_texcoord", "vec2");
+    GlslTranslator_declare(&t, "v_surface_position", "vec3");
+    GlslTranslator_declare(&t, "gl_FragCoord", "vec4");
+    GlslTranslator_declare(&t, "viewport_size", "vec2");
+    return t;
+}
+
+// Translates the GLSL statements of body into WGSL, appended to out at depth; false with
+// self.error set when it cannot.
+bool GlslTranslator_body(*GlslTranslator self, string body, *String out, int depth) {
+    List_clear(&self.toks);
+    self.at = 0;
+    _g_tokenize(self, body);
+    while (_g_kind(self, 0) != _GT_END && self.error.len == 0) _g_statement(self, out, depth);
+    for (i in 0..self.toks.size) self.toks.data[i].text.free();
+    List_clear(&self.toks);
+    return self.error.len == 0;
+}
+
+// A uniform or varying a modifier declares: its name and type (translator spelling).
+struct GlslDecl {
+    String name;
+    String type;
+}
+
+// Reads declarations from text: GLSL ("uniform highp float time;", "highp float d", one per
+// line or ';'-separated, "uniform" and the precision optional) or WGSL ("time: f32;",
+// "tex: texture_2d<f32>;"). Appends to out; false with error set on a line it cannot read.
+bool glsl_declarations(string text, *List<GlslDecl> out, *String error) {
+    if (text == null) return true;
+    String line;
+    int64 i = 0;
+    int64 n = (int64)strlen(text);
+    while (i <= n) {
+        char c = i < n ? text[i] : ';';
+        if (c == ';' || c == '\n' || c == ',') {
+            String t;
+            // trim
+            int64 a = 0;
+            int64 b = (int64)line.len;
+            while (a < b && (line.data[a] == ' ' || line.data[a] == '\t' || line.data[a] == '\r')) a++;
+            while (b > a && (line.data[b - 1] == ' ' || line.data[b - 1] == '\t' || line.data[b - 1] == '\r')) b--;
+            for (k in a..b) t.push(line.data[k]);
+            line.clear();
+            i++;
+            if (t.len == 0) {
+                t.free();
+                continue;
+            }
+            GlslDecl d;
+            string s = (string)t.data;
+            // WGSL: name: type
+            int64 colon = -1;
+            for (k in 0..(int64)t.len) {
+                if (s[k] == ':') {
+                    colon = k;
+                    break;
+                }
+            }
+            if (colon > 0) {
+                int64 ne = colon;
+                while (ne > 0 && s[ne - 1] == ' ') ne--;
+                int64 ns = 0;
+                if (strncmp(s, "var ", 4) == 0) ns = 4;
+                for (k in ns..ne) d.name.push(s[k]);
+                int64 ts = colon + 1;
+                while (ts < (int64)t.len && s[ts] == ' ') ts++;
+                String wt;
+                for (k in ts..(int64)t.len) wt.push(s[k]);
+                // back to the translator's spelling
+                string[17] w = {"f32", "i32", "u32", "vec2<f32>", "vec3<f32>", "vec4<f32>", "mat4x4<f32>", "mat3x3<f32>",
+                    "texture_2d<f32>", "vec2f", "vec3f", "vec4f", "mat4x4f", "mat3x3f", "vec2<i32>", "vec3<i32>", "vec4<i32>"};
+                string[17] g = {"f32", "i32", "u32", "vec2", "vec3", "vec4", "mat4", "mat3", "sampler", "vec2", "vec3", "vec4",
+                    "mat4", "mat3", "ivec2", "ivec3", "ivec4"};
+                bool known = false;
+                for (k in 0..17) {
+                    if (_g_streq((string)wt.data, w[k])) {
+                        d.type.append(g[k]);
+                        known = true;
+                        break;
+                    }
+                }
+                wt.free();
+                if (!known) {
+                    error.appendf("modifier: unknown type in '%s'", s);
+                    t.free();
+                    d.name.free();
+                    line.free();
+                    return false;
+                }
+            } else {
+                // GLSL: [uniform] [precision] type name
+                List<String> words;
+                String w;
+                for (k in 0..(int64)t.len + 1) {
+                    char ch = k < (int64)t.len ? s[k] : ' ';
+                    if (ch == ' ' || ch == '\t') {
+                        if (w.len > 0) {
+                            List_push(&words, w);
+                            String fresh;
+                            w = fresh;
+                        }
+                    } else {
+                        w.push(ch);
+                    }
+                }
+                w.free();
+                int at = 0;
+                while (at < words.size && (_g_streq((string)words.data[at].data, "uniform") || _g_streq((string)words.data[at].data, "in") ||
+                    _g_streq((string)words.data[at].data, "out") || _g_is_precision((string)words.data[at].data))) at++;
+                bool ok = at + 1 < words.size && _g_type_of((string)words.data[at].data)[0] != 0;
+                if (ok) {
+                    d.type.append(_g_type_of((string)words.data[at].data));
+                    d.name.append((string)words.data[at + 1].data);
+                }
+                for (k in 0..words.size) words.data[k].free();
+                words.free();
+                if (!ok) {
+                    error.appendf("modifier: cannot read the declaration '%s'", s);
+                    t.free();
+                    d.type.free();
+                    d.name.free();
+                    line.free();
+                    return false;
+                }
+            }
+            List_push(out, d);
+            t.free();
+            continue;
+        }
+        line.push(c);
+        i++;
+    }
+    line.free();
+    return true;
+}
+
+// Frees a translator.
+void GlslTranslator_free(*GlslTranslator self) {
+    for (i in 0..self.toks.size) self.toks.data[i].text.free();
+    self.toks.free();
+    for (i in 0..self.syms.size) self.syms.data[i].name.free();
+    self.syms.free();
+    self.error.free();
+    self.sampler.free();
+}

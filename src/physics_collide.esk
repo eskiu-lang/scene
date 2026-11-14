@@ -1,0 +1,396 @@
+// physics_collide.esk: contacts between shapes: spheres, boxes, capsules and triangle meshes (part of physics.esk, which imports it in order after the ones before it)
+
+struct _PhPart {
+    int kind;
+    Vec3 center;
+    Quat rot;
+    Vec3 half;
+    float radius;
+    *_PhTriangles tris;
+}
+
+_PhPart _ph_world_part(*ScenePhysicsBody b, *ScenePhysicsPart p) {
+    _PhPart w;
+    w.kind = p.kind;
+    w.rot = b._rot * p.rotation;
+    w.center = b._pos + b._rot.rotate(p.offset - b._com);
+    w.half = p.size * 0.5;
+    w.radius = p.size.x;
+    w.tris = p.tris;
+    return w;
+}
+
+void _ph_add_contact(*ScenePhysicsWorld self, int a, int b, Vec3 point, Vec3 normal, float depth) {
+    _PhContact c;
+    c.a = a;
+    c.b = b;
+    c.point = point;
+    c.normal = normal;
+    c.depth = depth;
+    List_push(&self._contacts, c);
+}
+
+// normal points from b into a
+void _ph_sphere_sphere(*ScenePhysicsWorld self, int a, int b, _PhPart pa, _PhPart pb) {
+    Vec3 d = pa.center - pb.center;
+    float dist = d.length();
+    float r = pa.radius + pb.radius;
+    if (dist >= r) return;
+    Vec3 n = dist > 1e-6 ? d / dist : Vec3{0.0, 1.0, 0.0};
+    _ph_add_contact(self, a, b, pb.center + n * pb.radius, n, r - dist);
+}
+
+// sphere a against box b
+void _ph_sphere_box(*ScenePhysicsWorld self, int a, int b, _PhPart s, _PhPart bx, bool flip) {
+    Quat inv = bx.rot.conjugate();
+    Vec3 local = inv.rotate(s.center - bx.center);
+    Vec3 h = bx.half;
+    Vec3 q = Vec3{local.x < -h.x ? -h.x : (local.x > h.x ? h.x : local.x), local.y < -h.y ? -h.y : (local.y > h.y ? h.y : local.y),
+        local.z < -h.z ? -h.z : (local.z > h.z ? h.z : local.z)};
+    Vec3 d = local - q;
+    float dist = d.length();
+    Vec3 n_local;
+    float depth = 0.0;
+    if (dist > 1e-6) {
+        if (dist >= s.radius) return;
+        n_local = d / dist;
+        depth = s.radius - dist;
+    } else {
+        // the center is inside: out through the nearest face
+        float[3] gaps = {h.x - (local.x < 0.0 ? -local.x : local.x), h.y - (local.y < 0.0 ? -local.y : local.y),
+            h.z - (local.z < 0.0 ? -local.z : local.z)};
+        int k = 0;
+        if (gaps[1] < gaps[k]) k = 1;
+        if (gaps[2] < gaps[k]) k = 2;
+        float[3] lc = {local.x, local.y, local.z};
+        float sign = lc[k] < 0.0 ? -1.0 : 1.0;
+        n_local = k == 0 ? Vec3{sign, 0.0, 0.0} : (k == 1 ? Vec3{0.0, sign, 0.0} : Vec3{0.0, 0.0, sign});
+        depth = gaps[k] + s.radius;
+        if (k == 0) q.x = sign * h.x;
+        if (k == 1) q.y = sign * h.y;
+        if (k == 2) q.z = sign * h.z;
+    }
+    Vec3 n = bx.rot.rotate(n_local);
+    Vec3 p = bx.center + bx.rot.rotate(q);
+    if (flip) _ph_add_contact(self, b, a, p, -n, depth);
+    else _ph_add_contact(self, a, b, p, n, depth);
+}
+
+Vec3 _ph_axis(Quat r, int k) {
+    if (k == 0) return r.rotate(Vec3{1.0, 0.0, 0.0});
+    if (k == 1) return r.rotate(Vec3{0.0, 1.0, 0.0});
+    return r.rotate(Vec3{0.0, 0.0, 1.0});
+}
+
+float _ph_project(_PhPart p, Vec3 axis) {
+    float e = 0.0;
+    float[3] h = {p.half.x, p.half.y, p.half.z};
+    for (k in 0..3) {
+        float d = _ph_axis(p.rot, k).dot(axis);
+        e += h[k] * (d < 0.0 ? -d : d);
+    }
+    return e;
+}
+
+// box a against box b by separating axes; contacts from clipping the incident face to the
+// reference face, or one point between the closest edges
+void _ph_box_box(*ScenePhysicsWorld self, int a, int b, _PhPart pa, _PhPart pb) {
+    Vec3 t = pa.center - pb.center;
+    float best = 1e30;
+    Vec3 best_axis;
+    int best_kind = -1;
+    int ea = 0;
+    int eb = 0;
+    for (i in 0..15) {
+        Vec3 axis;
+        int kind = 0;
+        if (i < 3) {
+            axis = _ph_axis(pa.rot, i);
+            kind = 0;
+        } else if (i < 6) {
+            axis = _ph_axis(pb.rot, i - 3);
+            kind = 1;
+        } else {
+            axis = _ph_axis(pa.rot, (i - 6) / 3).cross(_ph_axis(pb.rot, (i - 6) % 3));
+            float l = axis.length();
+            if (l < 1e-5) continue;
+            axis = axis / l;
+            kind = 2;
+        }
+        float dist = t.dot(axis);
+        float overlap = _ph_project(pa, axis) + _ph_project(pb, axis) - (dist < 0.0 ? -dist : dist);
+        if (overlap < 0.0) return;
+        // prefer face axes over nearly equal edge axes, for stable resting contacts
+        float score = kind == 2 ? overlap * 1.05 + 1e-4 : overlap;
+        if (score < best) {
+            best = score;
+            best_axis = dist < 0.0 ? -axis : axis;
+            best_kind = kind;
+            ea = (i - 6) / 3;
+            eb = (i - 6) % 3;
+        }
+    }
+    Vec3 n = best_axis;
+    float depth = _ph_project(pa, n) + _ph_project(pb, n) - (t.dot(n) < 0.0 ? -t.dot(n) : t.dot(n));
+    if (best_kind == 2) {
+        // closest points between the two edges along the axis
+        Vec3 da = _ph_axis(pa.rot, ea);
+        Vec3 db = _ph_axis(pb.rot, eb);
+        Vec3 ca = pa.center;
+        Vec3 cb = pb.center;
+        float[3] ha = {pa.half.x, pa.half.y, pa.half.z};
+        float[3] hb = {pb.half.x, pb.half.y, pb.half.z};
+        for (k in 0..3) {
+            if (k != ea) {
+                Vec3 ax = _ph_axis(pa.rot, k);
+                ca = ca + ax * (ax.dot(n) > 0.0 ? -ha[k] : ha[k]);
+            }
+            if (k != eb) {
+                Vec3 bx = _ph_axis(pb.rot, k);
+                cb = cb + bx * (bx.dot(n) > 0.0 ? hb[k] : -hb[k]);
+            }
+        }
+        Vec3 r = cb - ca;
+        float dd = da.dot(db);
+        float denom = 1.0 - dd * dd;
+        float sa = 0.0;
+        float sb = 0.0;
+        if (denom > 1e-6) {
+            sa = (da.dot(r) - dd * db.dot(r)) / denom;
+            sb = (dd * da.dot(r) - db.dot(r)) / denom;
+        }
+        if (sa > ha[ea]) sa = ha[ea];
+        if (sa < -ha[ea]) sa = -ha[ea];
+        if (sb > hb[eb]) sb = hb[eb];
+        if (sb < -hb[eb]) sb = -hb[eb];
+        Vec3 pa_pt = ca + da * sa;
+        Vec3 pb_pt = cb + db * sb;
+        _ph_add_contact(self, a, b, (pa_pt + pb_pt) * 0.5, n, depth);
+        return;
+    }
+    // reference box: the one whose face is the axis; the other is incident
+    _PhPart ref = best_kind == 0 ? pa : pb;
+    _PhPart inc = best_kind == 0 ? pb : pa;
+    Vec3 rn = best_kind == 0 ? -n : n;   // reference face normal, toward the incident box
+    // the reference face
+    int rf = 0;
+    float bestd = -1e30;
+    for (k in 0..3) {
+        float d = _ph_axis(ref.rot, k).dot(rn);
+        float ad = d < 0.0 ? -d : d;
+        if (ad > bestd) {
+            bestd = ad;
+            rf = k;
+        }
+    }
+    Vec3 rax = _ph_axis(ref.rot, rf);
+    float rsign = rax.dot(rn) > 0.0 ? 1.0 : -1.0;
+    float[3] rh = {ref.half.x, ref.half.y, ref.half.z};
+    Vec3 rface_c = ref.center + rax * (rsign * rh[rf]);
+    Vec3 rnorm = rax * rsign;
+    int u = (rf + 1) % 3;
+    int v = (rf + 2) % 3;
+    Vec3 ru = _ph_axis(ref.rot, u);
+    Vec3 rv = _ph_axis(ref.rot, v);
+    // the incident face: most anti-parallel to the reference normal
+    int f = 0;
+    float most = 1e30;
+    for (k in 0..3) {
+        float d = _ph_axis(inc.rot, k).dot(rnorm);
+        float s = d < 0.0 ? d : -d;
+        if (s < most) {
+            most = s;
+            f = k;
+        }
+    }
+    Vec3 iax = _ph_axis(inc.rot, f);
+    float isign = iax.dot(rnorm) > 0.0 ? -1.0 : 1.0;
+    float[3] ih = {inc.half.x, inc.half.y, inc.half.z};
+    Vec3 ic = inc.center + iax * (isign * ih[f]);
+    Vec3 iu = _ph_axis(inc.rot, (f + 1) % 3) * ih[(f + 1) % 3];
+    Vec3 iv = _ph_axis(inc.rot, (f + 2) % 3) * ih[(f + 2) % 3];
+    Vec3[16] poly;
+    int count = 4;
+    poly[0] = ic + iu + iv;
+    poly[1] = ic - iu + iv;
+    poly[2] = ic - iu - iv;
+    poly[3] = ic + iu - iv;
+    // clip against the 4 side planes of the reference face
+    Vec3[4] pn = {ru, -ru, rv, -rv};
+    float[4] pd = {ru.dot(ref.center) + rh[u], -ru.dot(ref.center) + rh[u], rv.dot(ref.center) + rh[v], -rv.dot(ref.center) + rh[v]};
+    for (pl in 0..4) {
+        Vec3[16] out;
+        int oc = 0;
+        for (i in 0..count) {
+            Vec3 p = poly[i];
+            Vec3 q = poly[(i + 1) % count];
+            float dp = pn[pl].dot(p) - pd[pl];
+            float dq = pn[pl].dot(q) - pd[pl];
+            if (dp <= 0.0 && oc < 16) {
+                out[oc] = p;
+                oc++;
+            }
+            if ((dp < 0.0 && dq > 0.0) || (dp > 0.0 && dq < 0.0)) {
+                if (oc < 16) {
+                    out[oc] = p + (q - p) * (dp / (dp - dq));
+                    oc++;
+                }
+            }
+        }
+        count = oc;
+        for (i in 0..count) poly[i] = out[i];
+        if (count == 0) return;
+    }
+    for (i in 0..count) {
+        float sep = rnorm.dot(poly[i] - rface_c);
+        if (sep <= 0.0) {
+            // normal from b into a
+            _ph_add_contact(self, a, b, poly[i] - rnorm * (sep * 0.5), n, -sep);
+        }
+    }
+}
+
+// The closest point to p on triangle abc (Ericson's region tests).
+Vec3 _ph_closest_on_triangle(Vec3 p, Vec3 a, Vec3 b, Vec3 c) {
+    Vec3 ab = b - a;
+    Vec3 ac = c - a;
+    Vec3 ap = p - a;
+    float d1 = ab.dot(ap);
+    float d2 = ac.dot(ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return a;
+    Vec3 bp = p - b;
+    float d3 = ab.dot(bp);
+    float d4 = ac.dot(bp);
+    if (d3 >= 0.0 && d4 <= d3) return b;
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) return a + ab * (d1 / (d1 - d3));
+    Vec3 cp = p - c;
+    float d5 = ab.dot(cp);
+    float d6 = ac.dot(cp);
+    if (d6 >= 0.0 && d5 <= d6) return c;
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) return a + ac * (d2 / (d2 - d6));
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0) return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    float denom = 1.0 / (va + vb + vc);
+    return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
+// sphere a against triangle mesh b: a contact per triangle it reaches
+void _ph_sphere_mesh(*ScenePhysicsWorld self, int a, int b, _PhPart s, _PhPart m) {
+    Quat inv = m.rot.conjugate();
+    Vec3 c = inv.rotate(s.center - m.center);
+    float r = s.radius;
+    for (t in 0..m.tris.corners.size / 3) {
+        Vec3 v0 = m.tris.corners.data[t * 3];
+        Vec3 v1 = m.tris.corners.data[t * 3 + 1];
+        Vec3 v2 = m.tris.corners.data[t * 3 + 2];
+        Vec3 q = _ph_closest_on_triangle(c, v0, v1, v2);
+        Vec3 d = c - q;
+        float dist = d.length();
+        if (dist >= r) continue;
+        Vec3 n = dist > 1e-6 ? d / dist : (v1 - v0).cross(v2 - v0).normalize();
+        _ph_add_contact(self, a, b, m.center + m.rot.rotate(q), m.rot.rotate(n), r - dist);
+    }
+}
+
+// box a against triangle mesh b: separating axes per triangle (the box's three, the
+// triangle's normal and the nine edge crosses); a contact at the box's deepest corner
+void _ph_box_mesh(*ScenePhysicsWorld self, int a, int b, _PhPart bx, _PhPart m) {
+    // the triangles in the box's space
+    Quat to_box = bx.rot.conjugate();
+    Vec3 h = bx.half;
+    float reach = h.length();
+    for (t in 0..m.tris.corners.size / 3) {
+        Vec3[3] v;
+        for (k in 0..3) v[k] = to_box.rotate(m.center + m.rot.rotate(m.tris.corners.data[t * 3 + k]) - bx.center);
+        Vec3 tn = (v[1] - v[0]).cross(v[2] - v[0]);
+        float tl = tn.length();
+        if (tl < 1e-9) continue;
+        tn = tn / tl;
+        // quick rejection: the triangle's plane farther than the box's reach
+        float pd = tn.dot(v[0]);
+        if (pd > reach || pd < -reach) continue;
+        Vec3[3] edges = {v[1] - v[0], v[2] - v[1], v[0] - v[2]};
+        Vec3[13] axes;
+        int n = 0;
+        axes[n] = Vec3{1.0, 0.0, 0.0};
+        n++;
+        axes[n] = Vec3{0.0, 1.0, 0.0};
+        n++;
+        axes[n] = Vec3{0.0, 0.0, 1.0};
+        n++;
+        axes[n] = tn;
+        n++;
+        for (i in 0..3) {
+            Vec3 e = i == 0 ? Vec3{1.0, 0.0, 0.0} : (i == 1 ? Vec3{0.0, 1.0, 0.0} : Vec3{0.0, 0.0, 1.0});
+            for (j in 0..3) {
+                Vec3 x = e.cross(edges[j]);
+                float l = x.length();
+                if (l < 1e-6) continue;
+                axes[n] = x / l;
+                n++;
+            }
+        }
+        float best = 1e30;
+        Vec3 best_axis;
+        bool separated = false;
+        for (k in 0..n) {
+            Vec3 ax = axes[k];
+            float br = h.x * (ax.x < 0.0 ? -ax.x : ax.x) + h.y * (ax.y < 0.0 ? -ax.y : ax.y) + h.z * (ax.z < 0.0 ? -ax.z : ax.z);
+            float p0 = ax.dot(v[0]);
+            float p1 = ax.dot(v[1]);
+            float p2 = ax.dot(v[2]);
+            float lo = p0 < p1 ? (p0 < p2 ? p0 : p2) : (p1 < p2 ? p1 : p2);
+            float hi = p0 > p1 ? (p0 > p2 ? p0 : p2) : (p1 > p2 ? p1 : p2);
+            if (lo > br || hi < -br) {
+                separated = true;
+                break;
+            }
+            // push the box along +ax (the triangle under it) or -ax
+            float up = hi + br;
+            float down = br - lo;
+            // the triangle's own normal is preferred: it is how a surface pushes back
+            float bias = k == 3 ? 0.0 : 1e-4;
+            if (up + bias < best) {
+                best = up + bias;
+                best_axis = ax;
+            }
+            if (down + bias < best) {
+                best = down + bias;
+                best_axis = -ax;
+            }
+        }
+        if (separated) continue;
+        // the deepest corner of the box against the axis
+        Vec3 corner = Vec3{best_axis.x > 0.0 ? -h.x : h.x, best_axis.y > 0.0 ? -h.y : h.y, best_axis.z > 0.0 ? -h.z : h.z};
+        Vec3 normal = bx.rot.rotate(best_axis);
+        Vec3 point = bx.center + bx.rot.rotate(corner);
+        _ph_add_contact(self, a, b, point, normal, best);
+    }
+}
+
+void _ph_collide(*ScenePhysicsWorld self, int a, int b) {
+    *ScenePhysicsBody ba = &self.bodies.data[a];
+    *ScenePhysicsBody bb = &self.bodies.data[b];
+    for (i in 0..ba.shape.parts.size) {
+        _PhPart pa = _ph_world_part(ba, &ba.shape.parts.data[i]);
+        for (j in 0..bb.shape.parts.size) {
+            _PhPart pb = _ph_world_part(bb, &bb.shape.parts.data[j]);
+            if (pa.kind == _PH_MESH && pb.kind == _PH_MESH) {
+                // two meshes do not collide (static and kinematic bodies)
+            } else if (pb.kind == _PH_MESH) {
+                if (pa.kind == _PH_SPHERE) _ph_sphere_mesh(self, a, b, pa, pb);
+                else _ph_box_mesh(self, a, b, pa, pb);
+            } else if (pa.kind == _PH_MESH) {
+                if (pb.kind == _PH_SPHERE) _ph_sphere_mesh(self, b, a, pb, pa);
+                else _ph_box_mesh(self, b, a, pb, pa);
+            } else if (pa.kind == _PH_SPHERE && pb.kind == _PH_SPHERE) _ph_sphere_sphere(self, a, b, pa, pb);
+            else if (pa.kind == _PH_SPHERE) _ph_sphere_box(self, a, b, pa, pb, false);
+            else if (pb.kind == _PH_SPHERE) _ph_sphere_box(self, b, a, pb, pa, true);
+            else _ph_box_box(self, a, b, pa, pb);
+            ba = &self.bodies.data[a];
+            bb = &self.bodies.data[b];
+        }
+    }
+}
