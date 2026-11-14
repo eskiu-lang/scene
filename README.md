@@ -38,6 +38,8 @@ pipeline.
   Reinhard, exposure and Hable tone mapping, bloom, and sRGB output.
 - **Sky.** A solid color, a cube map from `<gpu/ibl>` or six images, and image-based
   lighting for PBR materials.
+- **Text.** TrueType text from eskiu-lang/font in a box, wrapped, aligned, justified and
+  clipped as ViroText lays it out.
 - **Animation.** Position, scale, rotation, opacity and color animated in groups and
   chains with ViroReact's easing curves, node opacity down the tree, rendering order,
   billboards and frustum culling.

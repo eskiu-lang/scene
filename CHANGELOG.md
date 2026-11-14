@@ -25,6 +25,12 @@ All notable changes to this package are documented here. The format follows
   camera with ViroReact's billboard rotation.
 - Frustum culling: nodes wholly outside the camera's view are not drawn (they still cast
   shadows).
+- `<scene/text>`: `Scene_add_text` and `SceneText_set` draw TrueType text (eskiu-lang/font,
+  now a dependency) from a glyph atlas, laid out as ViroText: points at 0.01 world units, a
+  box, word, character or no wrapping, justification, alignment, clipping, a line cap,
+  `scene_text_size`. `docs/text.md`.
+- `Scene_set_geometry` and `Scene_set_texture` replace a mesh's or a texture's contents in
+  place.
 - `<scene/animation>`: `SceneAnimations` animates position, scale, Euler rotation,
   opacity and material color in groups (duration, delay, easing) and serial or parallel
   chains, with ViroReact's easing curves, relative values and property strings, loops,

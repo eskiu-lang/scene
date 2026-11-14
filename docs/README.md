@@ -7,6 +7,7 @@ Guides and reference for scene. The [README](../README.md) has the overview.
 - [Materials](materials.md): lighting models, textures, alpha and blending
 - [Lights and shadows](lights.md)
 - [Rendering, post-processing and the sky](rendering.md)
+- [Text](text.md): TrueType text laid out as ViroText
 - [Property animations](animation.md): groups, easing, chains, loops
 - [Hit testing and events](input.md): rays, hit tests, click, drag, pinch, rotate, hover and fuse
 - [API reference](api.md): every public function and type
@@ -43,6 +44,7 @@ macOS; on Linux and Windows, an SDL3 build from your package manager or libsdl.o
 | `<scene/light>` | `SceneLight`, its constructors and falloff curves |
 | `<scene/post>` | `ScenePost`, tone mapping operators, CPU versions of the curves |
 | `<scene/sky>` | cube maps from six images |
+| `<scene/text>` | `SceneText`, `SceneTextStyle`, layout and glyph atlases over eskiu-lang/font |
 | `<scene/animation>` | `SceneAnimations`: groups, easing curves, chains, playback |
 | `<scene/input>` | screen rays, hit tests, `SceneInput` and node events |
 
@@ -55,6 +57,7 @@ Each test renders small images and reads them back:
 | `tests/graph.esk` | world matrices through parents, `look_at` under a rotated and scaled parent, reparenting, removal, the shapes' winding, normals and bounds, matrix decomposition, material keys, the CPU falloff and tone curves |
 | `tests/lighting.esk` | each lighting model on a sphere against its formula at ten pixels (linear output, within 0.006 + 1%) |
 | `tests/attenuation.esk` | point light falloff (exponent 2 and 1) and the spot cone along a profile, the influence mask, eight lights per draw |
+| `tests/text.esk` | sizes at 0.01 world units a point, word, character and no wrapping, justification, clipping and the line cap, alignment, rebuilding, the glyphs drawn inside their bounds |
 | `tests/transparency.esk` | back-to-front order of two transparent quads whatever order they were added, an opaque quad between them, each blend mode against its formula, node opacity on opaque and blended materials and down the tree, a texture with a masked quadrant |
 | `tests/post.esk` | each tone mapping operator at three exposures against `scene_tone_map`, sRGB encoding by the shader and by an sRGB target, bloom spreading and fading, its strength and threshold |
 | `tests/sky.esk` | background color, skybox faces by view direction, sky intensity, six-image orientation, image-based lighting from a constant environment against its expected value |
@@ -70,7 +73,7 @@ These ViroReact renderer features are planned for later versions:
 - Portals (a window into another scene, through the stencil buffer).
 - Particle emitters.
 - Polylines and lines with a width.
-- 3D text, on [eskiu-font](https://github.com/eskiu-lang/font).
+- Extruded 3D text, outlined and drop-shadow text strokes, and Knuth-Plass line breaks for justified text.
 - Post effects beyond bloom (color grading, vignette, depth of field, SSAO).
 - Shader modifiers (user WGSL inserted into the generated shaders).
 - Shadows from spot and point lights, and cascaded shadow maps for large scenes.
