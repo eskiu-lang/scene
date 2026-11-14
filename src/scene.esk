@@ -1309,7 +1309,9 @@ Result<*GpuPipeline, string> _scene_pipeline(*Scene self, int key) {
         d.depth_read_only = true;
         d.depth_compare = WGPUCompareFunction_LessEqual;
         d.cull = WGPUCullMode_None;
-        d.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_Always, pass: WGPUStencilOperation_Replace};
+        // only inside the window of the world it is seen from (stencil equal to the
+        // reference), raising the stencil there by one: the next world's level
+        d.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_Equal, pass: WGPUStencilOperation_IncrementClamp};
     }
     GpuPipeline p = self.gpu.pipeline(&d)?;
     List_push(&r.pipes, _ScenePipe{key, p});
@@ -1906,40 +1908,54 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     int active = _scene_active_world(self);
     // the world the camera is in, with the entrances that lead out of it
     _scene_world_pass(self, &pass, active, active, 0, false)?;
-    // every world seen through a window: the window into the stencil, the depth behind it
-    // cleared, then that world's sky and contents only there, and the window's own frame
-    // over them
-    uint32 reference = 0;
+    // every world seen through a window, and the worlds seen through their windows in
+    // turn, as ViroReact walks its portal tree
+    _scene_portals_from(self, &pass, active, -1, 0)?;
+    pass.end()?;
+    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post);
+}
+
+// How many portals deep the scene draws from the world the camera is in.
+const int SCENE_PORTAL_DEPTH = 4;
+
+// Draws the worlds next to world (its portals, and the world around it when it is a
+// portal), except the one it was entered from, each through its window: the window into
+// the stencil where world is (level), the depth there cleared, then that world's sky and
+// contents at level + 1, the window's frame over them, and its own neighbors.
+Result<int, string> _scene_portals_from(*Scene self, *GpuPass pass, int world, int from, int level) {
+    *_SceneRenderer r = &self._r;
+    if (level >= SCENE_PORTAL_DEPTH) return Ok<int, string>(0);
     for (k in 0..r.portals.size) {
         _ScenePortalRec pr = r.portals.data[k];
         int other = -1;
-        if (pr.outer == active) other = pr.node;
-        else if (pr.node == active) other = pr.outer;
-        if (other < 0 || reference >= 255) continue;
-        reference++;
-        pass.set_stencil_reference(reference);
+        if (pr.outer == world && pr.node != from) other = pr.node;
+        else if (pr.node == world && pr.outer != from) other = pr.outer;
+        if (other < 0) continue;
+        pass.set_stencil_reference((uint32)level);
         bool any = false;
         for (i in 0..r.draws.size) {
             *_SceneDraw d = &r.draws.data[i];
             if (d.frame != pr.node || !d.in_view) continue;
             *GpuPipeline sp = _scene_pipeline(self, d.key + _SCENE_KEY_SILHOUETTE)?;
-            _scene_draw(self, &pass, d, sp);
+            _scene_draw(self, pass, d, sp);
             any = true;
         }
         if (!any) continue;
-        _scene_depth_reset(self, &pass)?;
-        _scene_world_pass(self, &pass, other, -1, pr.node, true)?;
+        pass.set_stencil_reference((uint32)(level + 1));
+        _scene_depth_reset(self, pass)?;
+        _scene_world_pass(self, pass, other, -1, pr.node, true)?;
         if (other == pr.node) {
             for (i in 0..r.draws.size) {
                 *_SceneDraw d = &r.draws.data[i];
                 if (d.frame != pr.node || !d.in_view) continue;
                 *GpuPipeline fp = _scene_pipeline(self, d.key + _SCENE_KEY_MASKED)?;
-                _scene_draw(self, &pass, d, fp);
+                _scene_draw(self, pass, d, fp);
             }
         }
+        _scene_portals_from(self, pass, other, world, level + 1)?;
+        pass.set_stencil_reference((uint32)level);
     }
-    pass.end()?;
-    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post);
+    return Ok<int, string>(0);
 }
 
 // The node of the world the camera is in: 0 (the root) or a portal node.
