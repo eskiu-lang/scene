@@ -532,12 +532,12 @@ Result<int, string> _xr_animation(int root) {
         float x = ((float)i - 2.0) * 0.36;
         int n = xr_scene.add_object(root, box, _xr_material(SCENE_BLINN, Vec4{0.3 + 0.15 * (float)i, 0.5, 0.95 - 0.15 * (float)i, 1.0}));
         xr_scene.node(n).position = Vec3{x, 0.9, -1.8};
-        int up = xr_anims.group(0.8, easings[i]);
+        int up = xr_anims.group(1.6, easings[i]);
         xr_anims.set(up, SCENE_ANIM_POSITION_Y, SCENE_ANIM_ADD, 0.5);
-        xr_anims.set(up, SCENE_ANIM_ROTATE_Y, SCENE_ANIM_ADD, 90.0);
-        int down = xr_anims.group(0.8, easings[i]);
+        xr_anims.set(up, SCENE_ANIM_ROTATE_Y, SCENE_ANIM_ADD, 45.0);
+        int down = xr_anims.group(1.6, easings[i]);
         xr_anims.set(down, SCENE_ANIM_POSITION_Y, SCENE_ANIM_ADD, -0.5);
-        xr_anims.set(down, SCENE_ANIM_ROTATE_Y, SCENE_ANIM_ADD, 90.0);
+        xr_anims.set(down, SCENE_ANIM_ROTATE_Y, SCENE_ANIM_ADD, 45.0);
         int[2] steps = {up, down};
         int hop = xr_anims.chain(&steps[0], 2, false);
         xr_anims.play(&xr_scene, n, hop, true, 0.0);
