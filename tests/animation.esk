@@ -1,0 +1,168 @@
+// Property animations: the easing curves against ViroReact's formulas, Euler angles in
+// ViroReact's order, groups over time with delays, serial and parallel chains, a frame
+// that skips past several groups, ViroReact's property strings, relative values across
+// loops, opacity and color, pause and resume, stop, and the finished callback.
+import <io>;
+import <mem>;
+import <list>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/animation>;
+
+int fails = 0;
+int finished_calls = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b, float tol) {
+    return a - b < tol && b - a < tol;
+}
+
+bool near3(Vec3 a, Vec3 b, float tol) {
+    return near(a.x, b.x, tol) && near(a.y, b.y, tol) && near(a.z, b.z, tol);
+}
+
+void curves() {
+    check("linear", near(scene_ease(SCENE_EASE_LINEAR, 0.3), 0.3, 1e-6));
+    check("ease in: 2t^2 then t", near(scene_ease(SCENE_EASE_IN, 0.25), 0.125, 1e-6) && near(scene_ease(SCENE_EASE_IN, 0.75), 0.75, 1e-6));
+    check("ease out: t then a slowing curve", near(scene_ease(SCENE_EASE_OUT, 0.25), 0.25, 1e-6) && near(scene_ease(SCENE_EASE_OUT, 0.75), 0.875, 1e-6));
+    check("ease in out", near(scene_ease(SCENE_EASE_IN_OUT, 0.25), 0.125, 1e-6) && near(scene_ease(SCENE_EASE_IN_OUT, 0.75), 0.875, 1e-6));
+    check("bounce overshoots at half time", near(scene_ease(SCENE_EASE_BOUNCE, 0.5), 1.1111111, 1e-5));
+    check("bounce settles to 1", scene_ease(SCENE_EASE_BOUNCE, 1.0) == 1.0);
+    check("power decel", near(scene_ease(SCENE_EASE_POWER_DECEL, 0.5), 0.75, 1e-6));
+    check("step", scene_ease(SCENE_EASE_STEP, 0.99) == 0.0 && scene_ease(SCENE_EASE_STEP, 1.0) == 1.0);
+    check("names", scene_easing_named("easeineaseout") == SCENE_EASE_IN_OUT && scene_easing_named("Bounce") == SCENE_EASE_BOUNCE);
+    check("PowerAccel is linear, as in ViroReact", scene_easing_named("PowerAccel") == SCENE_EASE_LINEAR);
+
+    // X first, then Y, then Z
+    Vec3 e = Vec3{0.4, -0.7, 1.1};
+    Quat q = scene_euler_quat(e);
+    Vec3 v = Vec3{0.3, 0.5, -0.8};
+    Vec3 want = quat_axis_angle(Vec3{0.0, 0.0, 1.0}, e.z).rotate(quat_axis_angle(Vec3{0.0, 1.0, 0.0}, e.y).rotate(quat_axis_angle(Vec3{1.0, 0.0, 0.0}, e.x).rotate(v)));
+    check("euler order X, Y, Z", near3(q.rotate(v), want, 1e-5));
+    check("euler round trip", near3(scene_quat_euler(q), e, 1e-4));
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    int node = scene.add_node(0, "n");
+    SceneAnimations a = scene_animations();
+
+    // one group: position y += 2 over 1 s after a 0.5 s delay
+    int up = a.group(1.0, SCENE_EASE_LINEAR);
+    a.set(up, SCENE_ANIM_POSITION_Y, SCENE_ANIM_ADD, 2.0);
+    a.set_delay(up, 0.5);
+    int p = a.play(&scene, node, up, false, 10.0);
+    a.update(&scene, 10.25);
+    check("waits for the delay", scene.node(node).position.y == 0.0);
+    a.update(&scene, 11.0);
+    check("half way", near(scene.node(node).position.y, 1.0, 1e-5));
+    a.update(&scene, 12.0);
+    check("ends at start + 2", near(scene.node(node).position.y, 2.0, 1e-6) && !a.playing(p));
+
+    // serial: x to 1, then scale *= 3; parallel with an opacity fade
+    int right = a.group(1.0, SCENE_EASE_LINEAR);
+    a.set(right, SCENE_ANIM_POSITION_X, SCENE_ANIM_ASSIGN, 1.0);
+    int grow = a.group(1.0, SCENE_EASE_LINEAR);
+    a.set(grow, SCENE_ANIM_SCALE_X, SCENE_ANIM_MULTIPLY, 3.0);
+    int[2] seq = {right, grow};
+    int serial = a.chain(&seq[0], 2, false);
+    int fade = a.group(2.0, SCENE_EASE_LINEAR);
+    a.set(fade, SCENE_ANIM_OPACITY, SCENE_ANIM_ASSIGN, 0.0);
+    int[2] par = {serial, fade};
+    int both = a.chain(&par[0], 2, true);
+    p = a.play(&scene, node, both, false, 20.0);
+    a.update(&scene, 20.5);
+    check("serial: first group half way", near(scene.node(node).position.x, 0.5, 1e-5) && scene.node(node).scale.x == 1.0);
+    check("parallel: fade a quarter", near(scene.node(node).opacity, 0.75, 1e-5));
+    a.update(&scene, 21.5);
+    check("serial: second group from the first's end", near(scene.node(node).position.x, 1.0, 1e-6) && near(scene.node(node).scale.x, 2.0, 1e-5));
+    a.update(&scene, 30.0);
+    check("all at their ends", near(scene.node(node).scale.x, 3.0, 1e-5) && scene.node(node).opacity == 0.0 && !a.playing(p));
+
+    // one frame past a whole serial chain still runs every group, in order
+    scene.node(node).position = Vec3{0.0, 0.0, 0.0};
+    scene.node(node).scale = Vec3{1.0, 1.0, 1.0};
+    p = a.play(&scene, node, serial, false, 40.0);
+    a.update(&scene, 45.0);
+    check("skipped frame: x set, then scale tripled", scene.node(node).position.x == 1.0 && near(scene.node(node).scale.x, 3.0, 1e-5));
+
+    // ViroReact's strings: rotateY "+=90" in degrees, looping: each loop adds 90 more
+    int spin = a.group(1.0, SCENE_EASE_LINEAR);
+    check("property strings", a.property(spin, "rotateY", "+=90") && !a.property(spin, "wobble", "1"));
+    int halve = a.group(1.0, SCENE_EASE_LINEAR);
+    a.property(halve, "scaleZ", "/=2");
+    a.property(halve, "positionZ", "-=1.5");
+    scene.node(node).rotation = quat_identity();
+    p = a.play(&scene, node, spin, true, 50.0);
+    a.update(&scene, 50.5);
+    check("half a loop: 45 degrees", near(scene_quat_euler(scene.node(node).rotation).y, 0.785398, 1e-4));
+    a.update(&scene, 51.5);
+    check("second loop builds on the first: 135 degrees", near(a.eulers.data[node].y, 2.356194, 1e-4));
+    a.stop(&scene, p, false);
+    check("stopped", !a.playing(p));
+    scene.node(node).scale = Vec3{1.0, 1.0, 4.0};
+    scene.node(node).position = Vec3{0.0, 0.0, 0.0};
+    p = a.play(&scene, node, halve, false, 60.0);
+    a.update(&scene, 61.0);
+    check("/= and -=", near(scene.node(node).scale.z, 2.0, 1e-5) && near(scene.node(node).position.z, -1.5, 1e-5));
+
+    // color of the node's material
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = Vec4{0.0, 0.0, 0.0, 1.0};
+    scene.node(node).material = scene.add_material(m);
+    int tint = a.group(1.0, SCENE_EASE_LINEAR);
+    a.set_color(tint, scene_argb_color((uint32)0xFFFF0000));
+    p = a.play(&scene, node, tint, false, 70.0);
+    a.update(&scene, 70.5);
+    Vec4 c = scene.material(scene.node(node).material).diffuse;
+    check("color half way to red", near(c.x, 0.5, 1e-5) && c.y == 0.0 && c.w == 1.0);
+
+    // pause, resume, stop at the end, finished callback
+    scene.node(node).position = Vec3{0.0, 0.0, 0.0};
+    int slide = a.group(2.0, SCENE_EASE_LINEAR);
+    a.set(slide, SCENE_ANIM_POSITION_X, SCENE_ANIM_ASSIGN, 2.0);
+    p = a.play_then(&scene, node, slide, false, 80.0, void(int id) {
+        finished_calls++;
+    });
+    a.update(&scene, 80.5);
+    a.pause(p, 80.5);
+    a.update(&scene, 85.0);
+    check("paused holds", near(scene.node(node).position.x, 0.5, 1e-5));
+    a.resume(p, 85.0);
+    a.update(&scene, 85.5);
+    check("resumed where it was", near(scene.node(node).position.x, 1.0, 1e-5));
+    a.update(&scene, 87.0);
+    check("finished called once", finished_calls == 1 && !a.playing(p));
+    scene.node(node).position = Vec3{0.0, 0.0, 0.0};
+    p = a.play_then(&scene, node, slide, false, 90.0, void(int id) {
+        finished_calls++;
+    });
+    a.update(&scene, 90.5);
+    a.stop(&scene, p, true);
+    check("stop jumps to the end without finished", scene.node(node).position.x == 2.0 && finished_calls == 1);
+
+    a.free();
+    return Ok<int, string>(0);
+}
+
+int main() {
+    curves();
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("animation: ok\n");
+    return 0;
+}

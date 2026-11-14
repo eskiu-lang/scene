@@ -1,0 +1,582 @@
+// animation.esk: property animations of nodes (`<scene/animation>`).
+//
+// The model of ViroReact's ViroAnimations. A group animates some of a node's properties
+// (position, scale, rotation in Euler angles, opacity, the color of its material) to new
+// values over a duration, after a delay, along an easing curve. A chain runs groups and
+// other chains one after another (serial) or all at once (parallel). Each group reads the
+// node's values when it starts, so a relative value (SCENE_ANIM_ADD: "+=90" in
+// ViroReact) builds on where the earlier groups left the node, and again on each loop.
+//
+//     SceneAnimations anims = scene_animations();
+//     defer anims.free();
+//     int up = anims.group(0.5, SCENE_EASE_IN_OUT);
+//     anims.set(up, SCENE_ANIM_POSITION_Y, SCENE_ANIM_ADD, 1.0);
+//     int spin = anims.group(1.0, SCENE_EASE_LINEAR);
+//     anims.set(spin, SCENE_ANIM_ROTATE_Y, SCENE_ANIM_ADD, 3.14159265);
+//     int[2] both = {up, spin};
+//     int hop = anims.chain(&both[0], 2, false);
+//     anims.play(&scene, node, hop, true, now);
+//     ...each frame, before rendering:
+//     anims.update(&scene, now);
+//
+// Times are seconds on any clock that only goes forward (the frame time).
+
+import <mem>;
+import <list>;
+import <libc>;
+import <gpu/math>;
+import <scene>;
+import <scene/material>;
+
+// Easing curves, ViroReact's timing functions: LINEAR; EASE_IN accelerates through the
+// first half (2t^2) and is linear after; EASE_OUT is linear through the first half and
+// slows to a stop; EASE_IN_OUT does both; BOUNCE overshoots to 1.11 at half time and
+// settles back to 1; POWER_DECEL is 1 - (1 - t)^2; STEP holds the start until the end.
+const int SCENE_EASE_LINEAR = 0;
+const int SCENE_EASE_IN = 1;
+const int SCENE_EASE_OUT = 2;
+const int SCENE_EASE_IN_OUT = 3;
+const int SCENE_EASE_BOUNCE = 4;
+const int SCENE_EASE_POWER_DECEL = 5;
+const int SCENE_EASE_STEP = 6;
+
+// Animated properties (SceneAnimations_set). Rotations are Euler angles in radians,
+// applied about X, then Y, then Z, as in ViroReact.
+const int SCENE_ANIM_POSITION_X = 0;
+const int SCENE_ANIM_POSITION_Y = 1;
+const int SCENE_ANIM_POSITION_Z = 2;
+const int SCENE_ANIM_SCALE_X = 3;
+const int SCENE_ANIM_SCALE_Y = 4;
+const int SCENE_ANIM_SCALE_Z = 5;
+const int SCENE_ANIM_ROTATE_X = 6;
+const int SCENE_ANIM_ROTATE_Y = 7;
+const int SCENE_ANIM_ROTATE_Z = 8;
+const int SCENE_ANIM_OPACITY = 9;
+const int _SCENE_ANIM_PROPS = 10;
+
+// How a value applies to the property's value at the group's start: replace it, add to
+// it, or multiply it.
+const int SCENE_ANIM_ASSIGN = 0;
+const int SCENE_ANIM_ADD = 1;
+const int SCENE_ANIM_MULTIPLY = 2;
+
+// The value of easing curve easing at t (0 to 1).
+float scene_ease(int easing, float t) {
+    if (t <= 0.0) return 0.0;
+    if (t >= 1.0) return 1.0;
+    if (easing == SCENE_EASE_IN) return t <= 0.5 ? 2.0 * t * t : t;
+    if (easing == SCENE_EASE_OUT) {
+        if (t <= 0.5) return t;
+        float u = t - 0.5;
+        return 2.0 * u * (1.0 - u) + 0.5;
+    }
+    if (easing == SCENE_EASE_IN_OUT) {
+        if (t <= 0.5) return 2.0 * t * t;
+        float u = t - 0.5;
+        return 2.0 * u * (1.0 - u) + 0.5;
+    }
+    if (easing == SCENE_EASE_BOUNCE) {
+        if (t < 0.5) return t / 0.45;
+        if (t < 0.67) return 0.5 / 0.45 - (t - 0.5) / 0.85;
+        return 0.5 / 0.45 - (0.67 - 0.5) / 0.85 + (t - 0.67) / 3.3;
+    }
+    if (easing == SCENE_EASE_POWER_DECEL) return 1.0 - (1.0 - t) * (1.0 - t);
+    if (easing == SCENE_EASE_STEP) return 0.0;
+    return t;
+}
+
+bool _scene_name_is(string a, string b) {
+    int i = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        char x = a[i];
+        char y = b[i];
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return false;
+        i++;
+    }
+    return a[i] == 0 && b[i] == 0;
+}
+
+// The easing named name as ViroReact spells it ("Linear", "EaseIn", "EaseOut",
+// "EaseInEaseOut", "Bounce", "PowerDecel", any case). Other names, PowerAccel among them,
+// are LINEAR, as in ViroReact.
+int scene_easing_named(string name) {
+    if (name == null) return SCENE_EASE_LINEAR;
+    if (_scene_name_is(name, "EaseIn")) return SCENE_EASE_IN;
+    if (_scene_name_is(name, "EaseOut")) return SCENE_EASE_OUT;
+    if (_scene_name_is(name, "EaseInEaseOut")) return SCENE_EASE_IN_OUT;
+    if (_scene_name_is(name, "Bounce")) return SCENE_EASE_BOUNCE;
+    if (_scene_name_is(name, "PowerDecel")) return SCENE_EASE_POWER_DECEL;
+    return SCENE_EASE_LINEAR;
+}
+
+// The rotation of Euler angles e (radians): about X, then Y, then Z (ViroReact's order).
+Quat scene_euler_quat(Vec3 e) {
+    Quat qx = quat_axis_angle(Vec3{1.0, 0.0, 0.0}, e.x);
+    Quat qy = quat_axis_angle(Vec3{0.0, 1.0, 0.0}, e.y);
+    Quat qz = quat_axis_angle(Vec3{0.0, 0.0, 1.0}, e.z);
+    return qz * qy * qx;
+}
+
+// The Euler angles of a rotation, in scene_euler_quat's order (ViroReact's toEuler).
+Vec3 scene_quat_euler(Quat q) {
+    double x = (double)q.x;
+    double y = (double)q.y;
+    double z = (double)q.z;
+    double w = (double)q.w;
+    double test = 2.0 * (y * w - x * z);
+    if (test > 0.999999) return Vec3{0.0, 1.5707963, (float)(-2.0 * atan2(x, w))};
+    if (test < -0.999999) return Vec3{0.0, -1.5707963, (float)(2.0 * atan2(x, w))};
+    double ez = atan2(2.0 * (x * y + z * w), x * x - y * y - z * z + w * w);
+    double ex = atan2(2.0 * (y * z + x * w), -x * x - y * y + z * z + w * w);
+    return Vec3{(float)ex, (float)asin(test), (float)ez};
+}
+
+struct _SceneAnimProp {
+    int prop;
+    int op;
+    float value;
+}
+
+struct _SceneAnimDef {
+    int kind;
+    double duration;
+    double delay;
+    int easing;
+    List<_SceneAnimProp> props;
+    bool has_color;
+    Vec4 color;
+    int material;
+    List<int> children;
+}
+
+struct _SceneAnimInst {
+    int def;
+    int kind;
+    List<int> children;
+    double length;
+    bool started;
+    bool done;
+    float[10] start;
+    float[10] end;
+    Vec4 color0;
+    Vec4 color1;
+}
+
+struct _ScenePlay {
+    bool active;
+    int node;
+    int root;
+    double t0;
+    bool loop;
+    bool paused;
+    double paused_at;
+    List<_SceneAnimInst> insts;
+    bool has_done;
+    fn(int)->void finished;
+}
+
+const int _SCENE_GROUP = 0;
+const int _SCENE_SERIAL = 1;
+const int _SCENE_PARALLEL = 2;
+
+// Animation definitions and the animations playing from them.
+struct SceneAnimations {
+    List<_SceneAnimDef> defs;
+    List<_ScenePlay> plays;
+    List<Vec3> eulers;
+    List<Quat> euler_rot;
+}
+
+// An empty SceneAnimations.
+SceneAnimations scene_animations() {
+    SceneAnimations a;
+    return a;
+}
+
+// A new group lasting duration seconds along easing; returns its id. Add its properties
+// with SceneAnimations_set.
+int SceneAnimations_group(*SceneAnimations self, double duration, int easing) {
+    _SceneAnimDef d;
+    d.kind = _SCENE_GROUP;
+    d.duration = duration < 0.0 ? 0.0 : duration;
+    d.easing = easing;
+    List_push(&self.defs, d);
+    return self.defs.size - 1;
+}
+
+*_SceneAnimDef _scene_def(*SceneAnimations self, int anim) {
+    if (anim < 0 || anim >= self.defs.size) return null;
+    return &self.defs.data[anim];
+}
+
+// Animates property prop (SCENE_ANIM_*) of group anim: op applies value to the value the
+// node has when the group starts. A property set twice keeps the last value.
+void SceneAnimations_set(*SceneAnimations self, int anim, int prop, int op, float value) {
+    *_SceneAnimDef d = _scene_def(self, anim);
+    if (d == null || d.kind != _SCENE_GROUP || prop < 0 || prop >= _SCENE_ANIM_PROPS) return;
+    for (i in 0..d.props.size) {
+        if (d.props.data[i].prop == prop) {
+            d.props.data[i] = _SceneAnimProp{prop, op, value};
+            return;
+        }
+    }
+    List_push(&d.props, _SceneAnimProp{prop, op, value});
+}
+
+// Sets a property of group anim the way a ViroReact animation's properties name it:
+// name is positionX/Y/Z, scaleX/Y/Z, rotateX/Y/Z (value in degrees) or opacity, and value
+// a number, or "+=", "-=", "*=" or "/=" followed by one. False for an unknown name.
+bool SceneAnimations_property(*SceneAnimations self, int anim, string name, string value) {
+    string[10] names = {"positionX", "positionY", "positionZ", "scaleX", "scaleY", "scaleZ", "rotateX", "rotateY", "rotateZ", "opacity"};
+    int prop = -1;
+    for (i in 0..10) {
+        if (_scene_name_is(name, names[i])) prop = i;
+    }
+    if (prop < 0 || value == null) return false;
+    int op = SCENE_ANIM_ASSIGN;
+    bool inverse = false;
+    int at = 0;
+    if (value[0] != 0 && value[1] == '=') {
+        if (value[0] == '+') op = SCENE_ANIM_ADD;
+        if (value[0] == '-') {
+            op = SCENE_ANIM_ADD;
+            inverse = true;
+        }
+        if (value[0] == '*') op = SCENE_ANIM_MULTIPLY;
+        if (value[0] == '/') {
+            op = SCENE_ANIM_MULTIPLY;
+            inverse = true;
+        }
+        if (op != SCENE_ANIM_ASSIGN || inverse) at = 2;
+    }
+    float v = (float)atof((string)&value[at]);
+    if (inverse) v = op == SCENE_ANIM_ADD ? -v : 1.0 / v;
+    if (prop >= SCENE_ANIM_ROTATE_X && prop <= SCENE_ANIM_ROTATE_Z) v = v * 3.14159265358979 / 180.0;
+    SceneAnimations_set(self, anim, prop, op, v);
+    return true;
+}
+
+// Waits delay seconds before group anim starts.
+void SceneAnimations_set_delay(*SceneAnimations self, int anim, double delay) {
+    *_SceneAnimDef d = _scene_def(self, anim);
+    if (d != null) d.delay = delay < 0.0 ? 0.0 : delay;
+}
+
+// Animates the diffuse color of the node's material to color (linear RGBA). The material
+// is shared by every node that uses it. ViroReact's color is an ARGB int:
+// scene_argb_color converts one.
+void SceneAnimations_set_color(*SceneAnimations self, int anim, Vec4 color) {
+    *_SceneAnimDef d = _scene_def(self, anim);
+    if (d == null || d.kind != _SCENE_GROUP) return;
+    d.has_color = true;
+    d.color = color;
+}
+
+// The color of an ARGB int (ViroReact's color property), channels divided by 255.
+Vec4 scene_argb_color(uint32 argb) {
+    return Vec4{(float)((argb >> 16) & 255) / 255.0, (float)((argb >> 8) & 255) / 255.0,
+        (float)(argb & 255) / 255.0, (float)((argb >> 24) & 255) / 255.0};
+}
+
+// Gives the node material when group anim starts (ViroReact's material property).
+void SceneAnimations_set_material(*SceneAnimations self, int anim, int material) {
+    *_SceneAnimDef d = _scene_def(self, anim);
+    if (d != null && d.kind == _SCENE_GROUP) d.material = material;
+}
+
+// A chain of count animations (groups or chains): one after another, or all at once when
+// parallel. Returns its id.
+int SceneAnimations_chain(*SceneAnimations self, *int anims, int count, bool parallel) {
+    _SceneAnimDef d;
+    d.kind = parallel ? _SCENE_PARALLEL : _SCENE_SERIAL;
+    for (i in 0..count) List_push(&d.children, anims[i]);
+    List_push(&self.defs, d);
+    return self.defs.size - 1;
+}
+
+int _scene_inst(*SceneAnimations self, *_ScenePlay p, int anim, int depth) {
+    _SceneAnimInst inst;
+    inst.def = anim;
+    *_SceneAnimDef d = _scene_def(self, anim);
+    inst.kind = d == null ? _SCENE_GROUP : d.kind;
+    List_push(&p.insts, inst);
+    int id = p.insts.size - 1;
+    if (d == null) return id;
+    if (d.kind == _SCENE_GROUP) {
+        p.insts.data[id].length = d.delay + d.duration;
+        return id;
+    }
+    double len = 0.0;
+    if (depth < 64) {
+        for (i in 0..d.children.size) {
+            int c = _scene_inst(self, p, self.defs.data[anim].children.data[i], depth + 1);
+            List_push(&p.insts.data[id].children, c);
+            double cl = p.insts.data[c].length;
+            if (d.kind == _SCENE_SERIAL) len += cl;
+            else if (cl > len) len = cl;
+            d = _scene_def(self, anim);
+        }
+    }
+    p.insts.data[id].length = len;
+    return id;
+}
+
+Vec3 _scene_node_euler(*SceneAnimations self, *Scene scene, int node) {
+    *SceneNode n = Scene_node(scene, node);
+    if (node < self.eulers.size) {
+        Quat q = self.euler_rot.data[node];
+        Quat r = n.rotation;
+        if (q.x == r.x && q.y == r.y && q.z == r.z && q.w == r.w) return self.eulers.data[node];
+    }
+    return scene_quat_euler(n.rotation);
+}
+
+void _scene_set_euler(*SceneAnimations self, *Scene scene, int node, Vec3 e) {
+    while (self.eulers.size <= node) {
+        List_push(&self.eulers, Vec3{0.0, 0.0, 0.0});
+        List_push(&self.euler_rot, Quat{0.0, 0.0, 0.0, 0.0});
+    }
+    Quat q = scene_euler_quat(e);
+    Scene_node(scene, node).rotation = q;
+    self.eulers.data[node] = e;
+    self.euler_rot.data[node] = q;
+}
+
+float _scene_prop_value(*SceneNode n, Vec3 euler, int prop) {
+    if (prop == SCENE_ANIM_POSITION_X) return n.position.x;
+    if (prop == SCENE_ANIM_POSITION_Y) return n.position.y;
+    if (prop == SCENE_ANIM_POSITION_Z) return n.position.z;
+    if (prop == SCENE_ANIM_SCALE_X) return n.scale.x;
+    if (prop == SCENE_ANIM_SCALE_Y) return n.scale.y;
+    if (prop == SCENE_ANIM_SCALE_Z) return n.scale.z;
+    if (prop == SCENE_ANIM_ROTATE_X) return euler.x;
+    if (prop == SCENE_ANIM_ROTATE_Y) return euler.y;
+    if (prop == SCENE_ANIM_ROTATE_Z) return euler.z;
+    return n.opacity;
+}
+
+void _scene_group_start(*SceneAnimations self, *Scene scene, int node, *_SceneAnimInst inst) {
+    *_SceneAnimDef d = &self.defs.data[inst.def];
+    *SceneNode n = Scene_node(scene, node);
+    if (d.material > 0) n.material = d.material;
+    Vec3 e = _scene_node_euler(self, scene, node);
+    for (i in 0..d.props.size) {
+        _SceneAnimProp pr = d.props.data[i];
+        float v = _scene_prop_value(n, e, pr.prop);
+        inst.start[pr.prop] = v;
+        if (pr.op == SCENE_ANIM_ADD) inst.end[pr.prop] = v + pr.value;
+        else if (pr.op == SCENE_ANIM_MULTIPLY) inst.end[pr.prop] = v * pr.value;
+        else inst.end[pr.prop] = pr.value;
+    }
+    if (d.has_color && n.material > 0) {
+        inst.color0 = Scene_material(scene, n.material).diffuse;
+        inst.color1 = d.color;
+    }
+}
+
+void _scene_group_apply(*SceneAnimations self, *Scene scene, int node, *_SceneAnimInst inst, float k) {
+    *_SceneAnimDef d = &self.defs.data[inst.def];
+    *SceneNode n = Scene_node(scene, node);
+    bool rotates = false;
+    Vec3 e = _scene_node_euler(self, scene, node);
+    for (i in 0..d.props.size) {
+        int prop = d.props.data[i].prop;
+        float v = inst.start[prop] + (inst.end[prop] - inst.start[prop]) * k;
+        if (prop == SCENE_ANIM_POSITION_X) n.position.x = v;
+        if (prop == SCENE_ANIM_POSITION_Y) n.position.y = v;
+        if (prop == SCENE_ANIM_POSITION_Z) n.position.z = v;
+        if (prop == SCENE_ANIM_SCALE_X) n.scale.x = v;
+        if (prop == SCENE_ANIM_SCALE_Y) n.scale.y = v;
+        if (prop == SCENE_ANIM_SCALE_Z) n.scale.z = v;
+        if (prop == SCENE_ANIM_OPACITY) n.opacity = v;
+        if (prop == SCENE_ANIM_ROTATE_X) {
+            e.x = v;
+            rotates = true;
+        }
+        if (prop == SCENE_ANIM_ROTATE_Y) {
+            e.y = v;
+            rotates = true;
+        }
+        if (prop == SCENE_ANIM_ROTATE_Z) {
+            e.z = v;
+            rotates = true;
+        }
+    }
+    if (rotates) _scene_set_euler(self, scene, node, e);
+    if (d.has_color && n.material > 0) {
+        Scene_material(scene, n.material).diffuse = inst.color0 + (inst.color1 - inst.color0) * k;
+    }
+}
+
+void _scene_walk(*SceneAnimations self, *Scene scene, int play, int id, double local) {
+    *_SceneAnimInst inst = &self.plays.data[play].insts.data[id];
+    int node = self.plays.data[play].node;
+    if (inst.kind == _SCENE_GROUP) {
+        if (inst.done || inst.def < 0 || inst.def >= self.defs.size) return;
+        *_SceneAnimDef d = &self.defs.data[inst.def];
+        if (local < d.delay) return;
+        if (!inst.started) {
+            _scene_group_start(self, scene, node, inst);
+            inst.started = true;
+        }
+        double p = d.duration > 0.0 ? (local - d.delay) / d.duration : 1.0;
+        if (p >= 1.0) {
+            p = 1.0;
+            inst.done = true;
+        }
+        _scene_group_apply(self, scene, node, inst, scene_ease(d.easing, (float)p));
+        return;
+    }
+    double off = 0.0;
+    for (i in 0..inst.children.size) {
+        int c = self.plays.data[play].insts.data[id].children.data[i];
+        double cl = self.plays.data[play].insts.data[c].length;
+        if (inst.kind == _SCENE_SERIAL) {
+            _scene_walk(self, scene, play, c, local - off);
+            off += cl;
+            if (local < off) break;
+        } else {
+            _scene_walk(self, scene, play, c, local);
+        }
+        inst = &self.plays.data[play].insts.data[id];
+    }
+}
+
+void _scene_play_reset(*_ScenePlay p) {
+    for (i in 0..p.insts.size) {
+        p.insts.data[i].started = false;
+        p.insts.data[i].done = false;
+    }
+}
+
+// Plays animation anim on node from time (seconds), and again from its end when loop.
+// Returns the id of this playback.
+int SceneAnimations_play(*SceneAnimations self, *Scene scene, int node, int anim, bool loop, double time) {
+    _ScenePlay p;
+    p.active = true;
+    p.node = node;
+    p.t0 = time;
+    p.loop = loop;
+    List_push(&self.plays, p);
+    int id = self.plays.size - 1;
+    self.plays.data[id].root = _scene_inst(self, &self.plays.data[id], anim, 0);
+    return id;
+}
+
+// SceneAnimations_play that calls finished with the playback id when it ends (not when
+// it is stopped, and never for a loop).
+int SceneAnimations_play_then(*SceneAnimations self, *Scene scene, int node, int anim, bool loop, double time, escaping fn(int)->void finished) {
+    int id = SceneAnimations_play(self, scene, node, anim, loop, time);
+    self.plays.data[id].has_done = true;
+    self.plays.data[id].finished = finished;
+    return id;
+}
+
+void _scene_play_free(*_ScenePlay p) {
+    for (i in 0..p.insts.size) p.insts.data[i].children.free();
+    p.insts.free();
+    if (p.has_done) free_closure(p.finished);
+    p.has_done = false;
+}
+
+// Advances every playing animation to time and sets the nodes' properties. Call it once
+// a frame, before rendering.
+void SceneAnimations_update(*SceneAnimations self, *Scene scene, double time) {
+    List<int> ended;
+    for (i in 0..self.plays.size) {
+        if (!self.plays.data[i].active || self.plays.data[i].paused) continue;
+        int node = self.plays.data[i].node;
+        if (node < 0 || node >= scene.nodes.size || !scene.nodes.data[node].alive) {
+            self.plays.data[i].active = false;
+            _scene_play_free(&self.plays.data[i]);
+            continue;
+        }
+        int guard = 0;
+        while (true) {
+            *_ScenePlay p = &self.plays.data[i];
+            double local = time - p.t0;
+            int root = p.root;
+            double len = p.insts.data[root].length;
+            _scene_walk(self, scene, i, root, local);
+            p = &self.plays.data[i];
+            if (local < len) break;
+            if (!p.loop) {
+                p.active = false;
+                List_push(&ended, i);
+                break;
+            }
+            _scene_play_reset(p);
+            if (len <= 0.0) {
+                p.t0 = time;
+                break;
+            }
+            p.t0 += len;
+            guard++;
+            if (guard > 1000) {
+                p.t0 = time;
+                break;
+            }
+        }
+    }
+    for (k in 0..ended.size) {
+        int i = ended.data[k];
+        if (self.plays.data[i].has_done) {
+            fn(int)->void f = self.plays.data[i].finished;
+            f(i);
+        }
+        _scene_play_free(&self.plays.data[i]);
+    }
+    ended.free();
+}
+
+// Whether playback play is still running (paused counts as running).
+bool SceneAnimations_playing(*SceneAnimations self, int play) {
+    return play >= 0 && play < self.plays.size && self.plays.data[play].active;
+}
+
+// Pauses playback play at time; SceneAnimations_resume continues it from there.
+void SceneAnimations_pause(*SceneAnimations self, int play, double time) {
+    if (!SceneAnimations_playing(self, play) || self.plays.data[play].paused) return;
+    self.plays.data[play].paused = true;
+    self.plays.data[play].paused_at = time;
+}
+
+// Resumes a paused playback at time.
+void SceneAnimations_resume(*SceneAnimations self, int play, double time) {
+    if (!SceneAnimations_playing(self, play) || !self.plays.data[play].paused) return;
+    *_ScenePlay p = &self.plays.data[play];
+    p.paused = false;
+    p.t0 += time - p.paused_at;
+}
+
+// Stops playback play. With jump_to_end, every group that has not finished first jumps
+// to its end values (one more pass of the animation, without looping); otherwise the node
+// keeps the values it has now. Its finished callback is not called.
+void SceneAnimations_stop(*SceneAnimations self, *Scene scene, int play, bool jump_to_end) {
+    if (!SceneAnimations_playing(self, play)) return;
+    if (jump_to_end) {
+        int node = self.plays.data[play].node;
+        if (node >= 0 && node < scene.nodes.size && scene.nodes.data[node].alive) {
+            _scene_walk(self, scene, play, self.plays.data[play].root, 1e30);
+        }
+    }
+    self.plays.data[play].active = false;
+    _scene_play_free(&self.plays.data[play]);
+}
+
+// Frees the definitions and every playback.
+void SceneAnimations_free(*SceneAnimations self) {
+    for (i in 0..self.plays.size) {
+        if (self.plays.data[i].active) _scene_play_free(&self.plays.data[i]);
+    }
+    self.plays.free();
+    for (i in 0..self.defs.size) {
+        self.defs.data[i].props.free();
+        self.defs.data[i].children.free();
+    }
+    self.defs.free();
+    self.eulers.free();
+    self.euler_rot.free();
+}
