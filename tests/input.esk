@@ -1,0 +1,278 @@
+// Hit testing and node events: screen rays, exact tests of rotated, scaled and nested
+// nodes, hidden and ignore_events nodes, bubbling to an ancestor's handler, click
+// states, the drag types, pinch, rotation, hover hysteresis and fuse.
+import <io>;
+import <mem>;
+import <list>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/touch>;
+import <scene>;
+import <scene/input>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b, float tol) {
+    return a - b < tol && b - a < tol;
+}
+
+bool near3(Vec3 a, Vec3 b, float tol) {
+    return near(a.x, b.x, tol) && near(a.y, b.y, tol) && near(a.z, b.z, tol);
+}
+
+const uint32 W = 400;
+const uint32 H = 400;
+
+// Every event a handler got, in order.
+List<SceneEvent> got;
+
+void record(*SceneEvent e) {
+    List_push(&got, *e);
+}
+
+int count_kind(int kind, int state) {
+    int n = 0;
+    for (i in 0..got.size) {
+        if (got.data[i].kind == kind && got.data[i].state == state) n++;
+    }
+    return n;
+}
+
+GpuTouch touch(int id, int phase, float x, float y, double time) {
+    return GpuTouch{id, phase, x, y, time};
+}
+
+void rays(*Scene scene, int box_mesh) {
+    int cam = scene.add_camera(0, scene_perspective(0.9, 0.1, 100.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+
+    SceneRay center = scene.screen_ray(200.0, 200.0, W, H);
+    check("center ray starts at the camera", near3(center.origin, Vec3{0.0, 0.0, 5.0}, 1e-4));
+    check("center ray looks down -Z", near3(center.dir, Vec3{0.0, 0.0, -1.0}, 1e-4));
+    SceneRay right = scene.screen_ray(400.0, 200.0, W, H);
+    // the image's right edge is at tan(fov / 2) * aspect from the axis
+    check("edge ray at half the field of view", near(right.dir.x / -right.dir.z, 0.48305, 1e-3));
+
+    int a = scene.add_object(0, box_mesh, 0);
+    SceneHit hit;
+    check("hits the box", scene.hit_test(center, &hit) && hit.node == a);
+    check("front face at z 0.5", near(hit.distance, 4.5, 1e-4) && near3(hit.point, Vec3{0.0, 0.0, 0.5}, 1e-4));
+    check("misses beside it", !scene.hit_test(scene.screen_ray(390.0, 200.0, W, H), &hit) && hit.background && hit.node == 0);
+    check("background 8 units out", near(hit.distance, SCENE_BACKGROUND_DISTANCE, 1e-6));
+
+    // a box behind the first, seen through it when the first is hidden or ignores events
+    int b = scene.add_object(0, box_mesh, 0);
+    scene.node(b).position = Vec3{0.0, 0.0, -3.0};
+    List<SceneHit> all;
+    check("two hits, nearest first", scene.hit_test_all(center, &all) == 2 && all.data[0].node == a && all.data[1].node == b);
+    scene.node(a).ignore_events = true;
+    check("ignore_events lets the ray through", scene.hit_test(center, &hit) && hit.node == b);
+    scene.node(a).ignore_events = false;
+    scene.node(a).visible = false;
+    check("a hidden node is not hit", scene.hit_test(center, &hit) && hit.node == b);
+    scene.remove(b);
+    scene.node(a).visible = true;
+
+    // a long thin box turned 45 degrees: the ray at x 0.6 is inside its world-aligned
+    // bounds but misses the box itself
+    scene.node(a).scale = Vec3{2.0, 0.2, 0.2};
+    scene.node(a).rotation = quat_axis_angle(Vec3{0.0, 0.0, 1.0}, 0.78539816);
+    SceneRay off = SceneRay{Vec3{0.6, 0.0, 5.0}, Vec3{0.0, 0.0, -1.0}};
+    check("rotated box: off its diagonal is a miss", !scene.hit_test(off, &hit));
+    SceneRay on = SceneRay{Vec3{0.5, 0.5, 5.0}, Vec3{0.0, 0.0, -1.0}};
+    check("rotated box: on its diagonal is a hit", scene.hit_test(on, &hit) && hit.node == a);
+
+    // nested: a child of a moved and scaled parent
+    int parent = scene.add_node(0, "parent");
+    scene.node(parent).position = Vec3{2.0, 0.0, 0.0};
+    scene.node(parent).scale = Vec3{2.0, 2.0, 2.0};
+    int child = scene.add_object(parent, box_mesh, 0);
+    scene.node(child).position = Vec3{0.5, 0.0, 0.0};
+    // the child's box spans x 2.0 .. 4.0 in the world, z -1 .. 1
+    SceneRay at = SceneRay{Vec3{3.9, 0.0, 5.0}, Vec3{0.0, 0.0, -1.0}};
+    check("nested child hit at its world size", scene.hit_test(at, &hit) && hit.node == child && near(hit.distance, 4.0, 1e-4));
+    SceneRay past = SceneRay{Vec3{4.1, 0.0, 5.0}, Vec3{0.0, 0.0, -1.0}};
+    check("nested child missed past its edge", !scene.hit_test(past, &hit));
+    scene.remove(parent);
+    scene.remove(a);
+    all.free();
+}
+
+void events(*Scene scene, int box_mesh) {
+    // a model: a root node with the handler and a box below it
+    int model = scene.add_node(0, "model");
+    int part = scene.add_object(model, box_mesh, 0);
+    SceneInput input = scene_input();
+    input.on(model, SCENE_ON_CLICK | SCENE_ON_DRAG | SCENE_ON_PINCH | SCENE_ON_ROTATE | SCENE_ON_HOVER, void(*SceneEvent e) {
+        record(e);
+    });
+
+    // tap: down, up, clicked, on the handler's node with the part as target
+    input.touch(scene, touch(1, GPU_TOUCH_DOWN, 200.0, 200.0, 0.0), W, H);
+    input.touch(scene, touch(1, GPU_TOUCH_UP, 200.0, 200.0, 0.1), W, H);
+    check("tap: down, up, clicked", count_kind(SCENE_EVENT_CLICK, SCENE_CLICK_DOWN) == 1 && count_kind(SCENE_EVENT_CLICK, SCENE_CLICK_UP) == 1 && count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == 1);
+    bool bubbled = true;
+    for (i in 0..got.size) {
+        if (got.data[i].kind == SCENE_EVENT_CLICK && (got.data[i].node != model || got.data[i].target != part)) bubbled = false;
+    }
+    check("clicks bubble to the model with the part as target", bubbled);
+    check("tap is a drag of zero length", count_kind(SCENE_EVENT_DRAG, SCENE_GESTURE_START) == 1 && count_kind(SCENE_EVENT_DRAG, SCENE_GESTURE_END) == 1);
+    check("hover entered", count_kind(SCENE_EVENT_HOVER, 1) == 1);
+    List_clear(&got);
+
+    // a press that leaves the node and is released over the background: up without a
+    // point, no clicked
+    input.off(model);
+    input.on(model, SCENE_ON_CLICK, void(*SceneEvent e) {
+        record(e);
+    });
+    input.touch(scene, touch(1, GPU_TOUCH_DOWN, 200.0, 200.0, 1.0), W, H);
+    input.touch(scene, touch(1, GPU_TOUCH_MOVE, 390.0, 200.0, 1.1), W, H);
+    input.touch(scene, touch(1, GPU_TOUCH_UP, 390.0, 200.0, 1.2), W, H);
+    check("release off the node: up, no clicked", count_kind(SCENE_EVENT_CLICK, SCENE_CLICK_UP) == 1 && count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == 0);
+    bool nopoint = false;
+    for (i in 0..got.size) {
+        if (got.data[i].state == SCENE_CLICK_UP) nopoint = !got.data[i].has_point;
+    }
+    check("the up off the node has no point", nopoint);
+    List_clear(&got);
+
+    // fixed-distance drag: grabbed on the front face 4.5 away, moved to the pixel whose
+    // ray is 0.5 to the right at that distance
+    input.off(model);
+    input.on(model, SCENE_ON_DRAG, void(*SceneEvent e) {
+        record(e);
+    });
+    input.touch(scene, touch(1, GPU_TOUCH_DOWN, 200.0, 200.0, 2.0), W, H);
+    SceneRay r = scene.screen_ray(250.0, 200.0, W, H);
+    Vec3 grab = Vec3{0.0, 0.0, 0.5};
+    Vec3 want = r.origin + r.dir * 4.5 - grab;
+    input.touch(scene, touch(1, GPU_TOUCH_MOVE, 250.0, 200.0, 2.1), W, H);
+    check("drag moves the model", near3(scene.node(model).position, want, 1e-4));
+    check("drag moves and reports", count_kind(SCENE_EVENT_DRAG, SCENE_GESTURE_MOVE) >= 1);
+    // a move below the threshold is not reported
+    int before = got.size;
+    input.touch(scene, touch(1, GPU_TOUCH_MOVE, 250.01, 200.0, 2.2), W, H);
+    check("tiny drag not reported", got.size == before);
+    input.touch(scene, touch(1, GPU_TOUCH_UP, 250.0, 200.0, 2.3), W, H);
+    check("drag ends", count_kind(SCENE_EVENT_DRAG, SCENE_GESTURE_END) == 1);
+    scene.node(model).position = Vec3{0.0, 0.0, 0.0};
+    List_clear(&got);
+
+    // drag on the plane y = 0 (the box rests at the origin, on it)
+    input.set_drag(model, SCENE_DRAG_FIXED_TO_PLANE, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0}, 50.0);
+    int cam = scene.camera;
+    scene.node(cam).position = Vec3{0.0, 3.0, 5.0};
+    scene.look_at(cam, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0});
+    input.touch(scene, touch(1, GPU_TOUCH_DOWN, 200.0, 200.0, 3.0), W, H);
+    input.touch(scene, touch(1, GPU_TOUCH_MOVE, 260.0, 230.0, 3.1), W, H);
+    check("plane drag keeps y", near(scene.node(model).position.y, 0.0, 1e-4));
+    check("plane drag moved", scene.node(model).position.x > 0.1);
+    input.touch(scene, touch(1, GPU_TOUCH_UP, 260.0, 230.0, 3.2), W, H);
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.node(cam).rotation = quat_identity();
+    scene.node(model).position = Vec3{0.0, 0.0, 0.0};
+    List_clear(&got);
+
+    // pinch and rotate with two fingers
+    input.off(model);
+    input.on(model, SCENE_ON_PINCH | SCENE_ON_ROTATE | SCENE_ON_CLICK, void(*SceneEvent e) {
+        record(e);
+    });
+    input.touch(scene, touch(1, GPU_TOUCH_DOWN, 190.0, 200.0, 4.0), W, H);
+    input.touch(scene, touch(2, GPU_TOUCH_DOWN, 210.0, 200.0, 4.0), W, H);
+    check("second finger cancels the click", count_kind(SCENE_EVENT_CLICK, SCENE_CLICK_UP) == 0);
+    check("pinch and rotate start", count_kind(SCENE_EVENT_PINCH, SCENE_GESTURE_START) == 1 && count_kind(SCENE_EVENT_ROTATE, SCENE_GESTURE_START) == 1);
+    input.touch(scene, touch(2, GPU_TOUCH_MOVE, 230.0, 200.0, 4.1), W, H);
+    float scale = 0.0;
+    for (i in 0..got.size) {
+        if (got.data[i].kind == SCENE_EVENT_PINCH && got.data[i].state == SCENE_GESTURE_MOVE) scale = got.data[i].scale;
+    }
+    check("pinch scale 2", near(scale, 2.0, 1e-4));
+    input.touch(scene, touch(2, GPU_TOUCH_MOVE, 190.0, 240.0, 4.2), W, H);
+    float turn = 0.0;
+    for (i in 0..got.size) {
+        if (got.data[i].kind == SCENE_EVENT_ROTATE && got.data[i].state == SCENE_GESTURE_MOVE) turn = got.data[i].rotation;
+    }
+    check("rotation a quarter turn", near(turn, 1.5707963, 1e-4));
+    input.touch(scene, touch(2, GPU_TOUCH_UP, 190.0, 240.0, 4.3), W, H);
+    input.touch(scene, touch(1, GPU_TOUCH_UP, 190.0, 200.0, 4.3), W, H);
+    check("pinch and rotate end", count_kind(SCENE_EVENT_PINCH, SCENE_GESTURE_END) == 1 && count_kind(SCENE_EVENT_ROTATE, SCENE_GESTURE_END) == 1);
+    check("no click after a gesture", count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == 0);
+    List_clear(&got);
+
+    // hover: leaving waits for the change to hold
+    input.off(model);
+    input.on(model, SCENE_ON_HOVER, void(*SceneEvent e) {
+        record(e);
+    });
+    SceneRay c = scene.screen_ray(200.0, 200.0, W, H);
+    SceneRay away = scene.screen_ray(390.0, 200.0, W, H);
+    SceneInput hov = scene_input();
+    hov.on(model, SCENE_ON_HOVER, void(*SceneEvent e) {
+        record(e);
+    });
+    hov.pointer(scene, c, 10.0);
+    check("hover enters at once", count_kind(SCENE_EVENT_HOVER, 1) == 1);
+    hov.pointer(scene, away, 10.01);
+    hov.pointer(scene, c, 10.03);
+    hov.pointer(scene, away, 10.05);
+    check("a flicker does not leave", count_kind(SCENE_EVENT_HOVER, 0) == 0);
+    hov.pointer(scene, away, 10.2);
+    check("a held change leaves", count_kind(SCENE_EVENT_HOVER, 0) == 1);
+    hov.free();
+    List_clear(&got);
+
+    // fuse: 1 down to 0 over the fuse time, once, then -1 when the gaze leaves
+    SceneInput fz = scene_input();
+    fz.on(model, SCENE_ON_FUSE, void(*SceneEvent e) {
+        record(e);
+    });
+    fz.set_fuse_time(model, 1.0);
+    fz.gaze(scene, c, 20.0);
+    fz.gaze(scene, c, 20.5);
+    fz.gaze(scene, c, 21.2);
+    fz.gaze(scene, c, 21.5);
+    check("fuse counts down", got.size == 3 && near(got.data[0].fuse, 1.0, 1e-5) && near(got.data[1].fuse, 0.5, 1e-5) && got.data[2].fuse == 0.0);
+    fz.gaze(scene, away, 22.0);
+    check("fuse resets when the gaze leaves", got.size == 4 && got.data[3].fuse == -1.0);
+    fz.free();
+    List_clear(&got);
+
+    input.free();
+    scene.remove(model);
+    scene.remove(part);
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    SceneGeometry g = scene_box(1.0, 1.0, 1.0);
+    int box = scene.add_geometry(&g)?;
+    g.free();
+    rays(&scene, box);
+    events(&scene, box);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    got.free();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("input: ok\n");
+    return 0;
+}
