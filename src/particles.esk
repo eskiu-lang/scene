@@ -1,0 +1,562 @@
+// particles.esk: particle emitters (`<scene/particles>`).
+//
+// The model of ViroReact's ViroParticleEmitter: an emitter attached to a node spawns
+// textured quads that face the camera, at a rate per second, per distance the node moves,
+// and in bursts, from a point, a box or a sphere. Each particle starts with values drawn
+// from ranges (color, alpha, scale, rotation, velocity, acceleration) that modifiers then
+// change over its life, its distance travelled or its speed. It moves with constant
+// acceleration, or away from an explosion.
+//
+//     SceneParticleEmitter fire = scene_particles(&scene, emitter_node)?;
+//     defer fire.free(&scene);
+//     fire.image(&scene, scene.load_texture("spark.png", true)?, 0.1, 0.1);
+//     fire.rate_per_second = Vec2{40.0, 60.0};
+//     fire.lifetime = Vec2{0.6, 1.0};
+//     fire.velocity.min = Vec3{-0.2, 1.0, -0.2};
+//     fire.velocity.max = Vec3{0.2, 1.5, 0.2};
+//     fire.alpha.over(SCENE_PARTICLE_TIME, Vec3{0.0, 0.0, 0.0}, 0.4, 1.0);   // fade out
+//     ...each frame, after moving nodes and before rendering:
+//     fire.update(&scene, now);
+//
+// Times are seconds (ViroReact's properties are milliseconds) on any clock that only goes
+// forward. The particles are drawn by a node the emitter adds at the root, with an unlit
+// material that adds its color (ViroReact's default) and does not write depth.
+
+import <mem>;
+import <list>;
+import <result>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/geometry>;
+import <scene/material>;
+
+// What a modifier's intervals measure (SceneParticleModifier.factor): the particle's age
+// in seconds, the distance it has travelled, or its speed.
+const int SCENE_PARTICLE_TIME = 0;
+const int SCENE_PARTICLE_DISTANCE = 1;
+const int SCENE_PARTICLE_VELOCITY = 2;
+
+// Spawn volumes (SceneParticleEmitter.volume).
+const int SCENE_SPAWN_POINT = 0;
+const int SCENE_SPAWN_BOX = 1;
+const int SCENE_SPAWN_SPHERE = 2;
+
+// One step of a modifier: from the value before it (the particle's initial value for the
+// first) to target, while the factor goes from start to end.
+struct SceneParticleInterval {
+    Vec3 target;
+    float start;
+    float end;
+}
+
+// A particle property: its initial value, uniform between min and max, then the
+// intervals it moves through, measured by factor (ViroReact's particle modifiers).
+struct SceneParticleModifier {
+    Vec3 min;
+    Vec3 max;
+    int factor;
+    List<SceneParticleInterval> intervals;
+}
+
+// A modifier whose initial value is v, with no intervals.
+SceneParticleModifier scene_particle_constant(Vec3 v) {
+    SceneParticleModifier m;
+    m.min = v;
+    m.max = v;
+    return m;
+}
+
+// Adds an interval: towards target while the factor goes from start to end. Intervals
+// are kept in order and must not overlap.
+void SceneParticleModifier_over(*SceneParticleModifier self, int factor, Vec3 target, float start, float end) {
+    self.factor = factor;
+    List_push(&self.intervals, SceneParticleInterval{target, start, end});
+}
+
+// The value of a modifier with initial value v at factor f (ViroReact's getFinalValue).
+Vec3 scene_particle_modifier_value(*SceneParticleModifier m, Vec3 v, float f) {
+    int n = m.intervals.size;
+    for (i in 0..n) {
+        SceneParticleInterval iv = m.intervals.data[i];
+        if (f >= iv.start && f <= iv.end) {
+            float w = iv.end - iv.start;
+            float r = w > 0.0 ? (f - iv.start) / w : 1.0;
+            Vec3 from = i == 0 ? v : m.intervals.data[i - 1].target;
+            if (r >= 1.0) return iv.target;
+            return from + (iv.target - from) * r;
+        }
+        if (i != 0 && f >= m.intervals.data[i - 1].end && f <= iv.end) return m.intervals.data[i - 1].target;
+        if (i == n - 1 && f > iv.end) return iv.target;
+    }
+    return v;
+}
+
+// A burst: count particles (between min and max) once the factor (SCENE_PARTICLE_TIME,
+// seconds since the cycle began, or SCENE_PARTICLE_DISTANCE, distance the emitter moved)
+// passes start, then again every interval, cycles times in all.
+struct SceneParticleBurst {
+    int factor;
+    Vec2 count;
+    float start;
+    float interval;
+    int cycles;
+}
+
+struct _SceneParticle {
+    Vec3 spawn_pos;
+    Mat4 spawn_world;
+    Vec3 pos;
+    Vec4 color;
+    Vec3 scale;
+    Vec3 rotation;
+    Vec3 init_color;
+    Vec3 init_scale;
+    Vec3 init_rotation;
+    float init_alpha;
+    Vec3 init_velocity;
+    Vec3 init_accel;
+    double born;
+    double life;
+    float age;
+    float distance;
+    float speed;
+}
+
+// An emitter. node is the node it emits from (its world matrix moves the volume and, with
+// fixed_to_emitter, the particles); draw is the node drawing them, material its material.
+// The fields are ViroReact's ViroParticleEmitter props in seconds:
+// - duration, loop, delay: one emission cycle lasts duration; loop starts the next; delay
+//   waits before the first.
+// - run: emitting; turned off, the particles alive keep moving. paused freezes everything.
+// - fixed_to_emitter: particles move with the node after they spawn (else they stay
+//   where they were born).
+// - max_particles, lifetime (min, max seconds), rate_per_second and rate_per_meter (min,
+//   max), bursts.
+// - volume (SCENE_SPAWN_*), volume_size (box width, height, length; sphere radii, or one
+//   radius in x), volume_point (a point volume's position), on_surface.
+// - color, alpha (x), scale, rotation (radians, about X, Y, Z), velocity, acceleration:
+//   modifiers; explosion_impulse > 0 replaces the initial velocity by an impulse from
+//   explosion_center falling off with the square of the distance, and explosion_decel > 0
+//   slows it to a stop over that many seconds.
+// - width, height: the particle quad's size before scale.
+struct SceneParticleEmitter {
+    int node;
+    int draw;
+    int mesh;
+    int material;
+    double duration;
+    bool loop;
+    double delay;
+    bool run;
+    bool paused;
+    bool fixed_to_emitter;
+    int max_particles;
+    Vec2 lifetime;
+    Vec2 rate_per_second;
+    Vec2 rate_per_meter;
+    List<SceneParticleBurst> bursts;
+    int volume;
+    Vec3 volume_size;
+    Vec3 volume_point;
+    bool on_surface;
+    SceneParticleModifier color;
+    SceneParticleModifier alpha;
+    SceneParticleModifier scale;
+    SceneParticleModifier rotation;
+    SceneParticleModifier velocity;
+    SceneParticleModifier acceleration;
+    Vec3 explosion_center;
+    float explosion_impulse;
+    float explosion_decel;
+    float width;
+    float height;
+    List<_SceneParticle> _alive;
+    List<SceneParticleBurst> _scheduled;
+    uint64 _rng;
+    double _cycle_start;
+    double _passed;
+    double _delay_until;
+    bool _started;
+    bool _running;
+    Vec3 _start_pos;
+    double _passed_distance;
+    double _rate_ms;
+    double _rate_init;
+    double _rate_last;
+    double _meter_rate;
+    Vec3 _meter_last;
+    Vec3 _meter_init;
+    double _pause_at;
+    double _paused_total;
+    Mat4 _world;
+}
+
+float _sp_rand(*SceneParticleEmitter self) {
+    // xorshift64*
+    uint64 x = self._rng;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    self._rng = x;
+    return (float)((x * (uint64)2685821657736338717) >> 40) / 16777216.0;
+}
+
+float _sp_range(*SceneParticleEmitter self, float a, float b) {
+    return a + (b - a) * _sp_rand(self);
+}
+
+Vec3 _sp_initial(*SceneParticleEmitter self, *SceneParticleModifier m) {
+    return Vec3{_sp_range(self, m.min.x, m.max.x), _sp_range(self, m.min.y, m.max.y), _sp_range(self, m.min.z, m.max.z)};
+}
+
+// An emitter on node with ViroReact's defaults: a 2 second looping cycle, 10 particles a
+// second living 2 seconds, at most 500, from a point, white, opaque, scale 1, rising with a
+// velocity between (-2, 6, 0) and (2, 6, 0), fixed to the emitter, a 1 x 1 quad, emitting.
+// It adds the node and material that draw the particles.
+Result<SceneParticleEmitter, string> scene_particles(*Scene scene, int node) {
+    SceneParticleEmitter e;
+    e.node = node;
+    e.duration = 2.0;
+    e.loop = true;
+    e.run = true;
+    e.fixed_to_emitter = true;
+    e.max_particles = 500;
+    e.lifetime = Vec2{2.0, 2.0};
+    e.rate_per_second = Vec2{10.0, 10.0};
+    e.volume_size = Vec3{1.0, 1.0, 1.0};
+    e.color = scene_particle_constant(Vec3{1.0, 1.0, 1.0});
+    e.alpha = scene_particle_constant(Vec3{1.0, 0.0, 0.0});
+    e.scale = scene_particle_constant(Vec3{1.0, 1.0, 1.0});
+    e.rotation = scene_particle_constant(Vec3{0.0, 0.0, 0.0});
+    e.velocity = scene_particle_constant(Vec3{-2.0, 6.0, 0.0});
+    e.velocity.max = Vec3{2.0, 6.0, 0.0};
+    e.acceleration = scene_particle_constant(Vec3{0.0, 0.0, 0.0});
+    e.width = 1.0;
+    e.height = 1.0;
+    e._rng = (uint64)0x9E3779B97F4A7C15 ^ (uint64)(node + 1);
+    e._started = false;
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.alpha_mode = SCENE_ALPHA_BLEND;
+    m.blend_mode = SCENE_BLEND_ADD;
+    m.skip_depth_write = true;
+    m.double_sided = true;
+    e.material = Scene_add_material(scene, m);
+    e.draw = Scene_add_node(scene, 0, "particles");
+    Scene_node(scene, e.draw).material = e.material;
+    Scene_node(scene, e.draw).ignore_events = true;
+    Scene_node(scene, e.draw).casts_shadows = false;
+    return Ok<SceneParticleEmitter, string>(e);
+}
+
+// The particle image: texture (0 for none) on a width x height quad.
+void SceneParticleEmitter_image(*SceneParticleEmitter self, *Scene scene, int texture, float width, float height) {
+    Scene_material(scene, self.material).diffuse_texture = texture;
+    self.width = width;
+    self.height = height;
+}
+
+// The number of particles alive.
+int SceneParticleEmitter_count(*SceneParticleEmitter self) {
+    return self._alive.size;
+}
+
+// Starts the emission cycle over (ViroReact's resetEmissionCycle); with clear, the
+// particles alive go too.
+void SceneParticleEmitter_reset(*SceneParticleEmitter self, bool clear) {
+    if (clear) List_clear(&self._alive);
+    self._started = false;
+}
+
+Vec3 _sp_spawn_point(*SceneParticleEmitter self) {
+    Vec3 s = self.volume_size;
+    if (self.volume == SCENE_SPAWN_BOX) {
+        if (!self.on_surface) {
+            return Vec3{_sp_range(self, -s.x / 2.0, s.x / 2.0), _sp_range(self, -s.y / 2.0, s.y / 2.0), _sp_range(self, -s.z / 2.0, s.z / 2.0)};
+        }
+        float[6] sides = {s.x * s.y, s.y * s.z, s.z * s.x, s.x * s.y, s.y * s.z, s.z * s.x};
+        float total = 0.0;
+        for (i in 0..6) total += sides[i];
+        float pick = _sp_range(self, 0.0, total);
+        float sum = 0.0;
+        int side = 0;
+        while (side < 6) {
+            sum += sides[side];
+            if (pick <= sum) break;
+            side++;
+        }
+        if (side > 5) side = 5;
+        int k = side % 3;
+        if (k == 0) return Vec3{_sp_range(self, -s.x / 2.0, s.x / 2.0), _sp_range(self, -s.y / 2.0, s.y / 2.0), side == 0 ? s.z / 2.0 : -s.z / 2.0};
+        if (k == 1) return Vec3{side == 1 ? s.x / 2.0 : -s.x / 2.0, _sp_range(self, -s.y / 2.0, s.y / 2.0), _sp_range(self, -s.z / 2.0, s.z / 2.0)};
+        return Vec3{_sp_range(self, -s.x / 2.0, s.x / 2.0), side == 2 ? s.y / 2.0 : -s.y / 2.0, _sp_range(self, -s.z / 2.0, s.z / 2.0)};
+    }
+    if (self.volume == SCENE_SPAWN_SPHERE) {
+        float a = s.x;
+        float b = s.y;
+        float c = s.z;
+        float theta = 6.282 * _sp_rand(self);
+        float phi = (float)acos((double)(2.0 * _sp_rand(self) - 1.0));
+        float w = _sp_range(self, self.on_surface ? a : 0.0, a);
+        float l = _sp_range(self, self.on_surface ? b : 0.0, b);
+        float h = _sp_range(self, self.on_surface ? c : 0.0, c);
+        return Vec3{w * (float)cos((double)theta) * (float)sin((double)phi), l * (float)sin((double)theta) * (float)sin((double)phi),
+            h * (float)cos((double)phi)};
+    }
+    return self.volume_point;
+}
+
+void _sp_spawn(*SceneParticleEmitter self, int count, double now) {
+    for (k in 0..count) {
+        _SceneParticle p;
+        p.life = (double)_sp_range(self, self.lifetime.x, self.lifetime.y);
+        p.born = now;
+        p.spawn_world = self._world;
+        p.init_scale = _sp_initial(self, &self.scale);
+        p.spawn_pos = _sp_spawn_point(self);
+        p.pos = p.spawn_pos;
+        p.init_color = _sp_initial(self, &self.color);
+        p.init_rotation = _sp_initial(self, &self.rotation);
+        p.init_alpha = _sp_initial(self, &self.alpha).x;
+        if (self.explosion_impulse > 0.0) {
+            Vec3 dir = p.spawn_pos - self.explosion_center;
+            float d = dir.length();
+            float inv = d > 0.0 ? 1.0 / d : 0.0;
+            p.init_velocity = dir * (self.explosion_impulse * inv * inv);
+        } else {
+            p.init_velocity = _sp_initial(self, &self.velocity);
+        }
+        if (self.explosion_decel > 0.0) p.init_accel = p.init_velocity * (-1.0 / self.explosion_decel);
+        else p.init_accel = _sp_initial(self, &self.acceleration);
+        p.speed = p.init_velocity.length();
+        p.color = Vec4{p.init_color.x, p.init_color.y, p.init_color.z, p.init_alpha};
+        p.scale = p.init_scale;
+        p.rotation = p.init_rotation;
+        List_push(&self._alive, p);
+    }
+}
+
+int _sp_per_second(*SceneParticleEmitter self, double now_ms) {
+    if (self.rate_per_second.x == 0.0 && self.rate_per_second.y == 0.0) return 0;
+    int n = 0;
+    double since = now_ms - self._rate_last;
+    if (self._rate_last != 0.0 && self._rate_ms > 0.0 && since >= self._rate_ms) {
+        double parts = floor(since / self._rate_ms);
+        self._rate_last = self._rate_last + parts * self._rate_ms;
+        n = (int)parts;
+        if (self._rate_last - self._rate_init > 1000.0) {
+            double over = self._rate_last - self._rate_init - 1000.0;
+            n = n - (int)(over / self._rate_ms);
+        }
+    }
+    if (self._rate_init == 0.0 || now_ms - self._rate_init > 1000.0) {
+        double per = ceil((double)_sp_range(self, self.rate_per_second.x, self.rate_per_second.y));
+        self._rate_ms = per > 0.0 ? 1000.0 / per : 0.0;
+        self._rate_init = now_ms;
+        self._rate_last = now_ms;
+        n = 0;
+    }
+    return n;
+}
+
+int _sp_per_meter(*SceneParticleEmitter self, Vec3 pos) {
+    if (self.rate_per_meter.x == 0.0 && self.rate_per_meter.y == 0.0) return 0;
+    int n = 0;
+    float travelled = (pos - self._meter_last).length();
+    if (self._meter_rate != 0.0 && (double)travelled > self._meter_rate) {
+        n = (int)floor((double)travelled / self._meter_rate);
+        self._meter_last = pos;
+    }
+    if (self._meter_rate == 0.0 || (pos - self._meter_init).length() > 1.0) {
+        double per = (double)_sp_range(self, self.rate_per_meter.x, self.rate_per_meter.y);
+        self._meter_rate = per > 0.0 ? 1.0 / per : 0.0;
+        self._meter_last = pos;
+        self._meter_init = pos;
+    }
+    return n;
+}
+
+int _sp_bursts(*SceneParticleEmitter self) {
+    int n = 0;
+    int i = 0;
+    while (i < self._scheduled.size) {
+        *SceneParticleBurst b = &self._scheduled.data[i];
+        double at = b.factor == SCENE_PARTICLE_DISTANCE ? self._passed_distance : self._passed;
+        if (at > (double)b.start) {
+            n += (int)_sp_range(self, b.count.x, b.count.y + 0.999);
+            b.start = b.start + b.interval;
+            b.cycles = b.cycles - 1;
+        }
+        if (b.cycles <= 0) {
+            List_remove(&self._scheduled, i);
+        } else {
+            i++;
+        }
+    }
+    return n;
+}
+
+void _sp_restart(*SceneParticleEmitter self, double now) {
+    self._cycle_start = now;
+    self._passed = 0.0;
+    self._passed_distance = 0.0;
+    self._start_pos = Vec3{self._world.m[12], self._world.m[13], self._world.m[14]};
+    List_clear(&self._scheduled);
+    for (i in 0..self.bursts.size) List_push(&self._scheduled, self.bursts.data[i]);
+}
+
+void _sp_simulate(*SceneParticleEmitter self) {
+    for (i in 0..self._alive.size) {
+        *_SceneParticle p = &self._alive.data[i];
+        Vec3 v = scene_particle_modifier_value(&self.velocity, p.init_velocity, _sp_factor(&self.velocity, p));
+        Vec3 a = scene_particle_modifier_value(&self.acceleration, p.init_accel, _sp_factor(&self.acceleration, p));
+        float t = p.age;
+        if (self.explosion_decel > 0.0 && t > self.explosion_decel) t = self.explosion_decel;
+        Vec3 disp = v * t + a * (0.5 * t * t);
+        p.pos = p.spawn_pos + disp;
+        p.distance = disp.length();
+        p.speed = (v + a * t).length();
+        float al = scene_particle_modifier_value(&self.alpha, Vec3{p.init_alpha, 0.0, 0.0}, _sp_factor(&self.alpha, p)).x;
+        Vec3 c = scene_particle_modifier_value(&self.color, p.init_color, _sp_factor(&self.color, p));
+        p.color = Vec4{c.x, c.y, c.z, al};
+        p.scale = scene_particle_modifier_value(&self.scale, p.init_scale, _sp_factor(&self.scale, p));
+        p.rotation = scene_particle_modifier_value(&self.rotation, p.init_rotation, _sp_factor(&self.rotation, p));
+    }
+}
+
+float _sp_factor(*SceneParticleModifier m, *_SceneParticle p) {
+    if (m.factor == SCENE_PARTICLE_DISTANCE) return p.distance;
+    if (m.factor == SCENE_PARTICLE_VELOCITY) return p.speed;
+    return p.age;
+}
+
+// Advances the emitter to time (seconds): spawns, moves, ages and removes particles, and
+// rebuilds the quads facing the scene's camera. Call it once a frame after moving nodes.
+Result<int, string> SceneParticleEmitter_update(*SceneParticleEmitter self, *Scene scene, double time) {
+    Scene_update(scene);
+    if (self.node < 0 || self.node >= scene.nodes.size || !scene.nodes.data[self.node].alive) return Ok<int, string>(0);
+    self._world = scene.nodes.data[self.node].world;
+    if (self.paused) {
+        if (self._pause_at == 0.0) self._pause_at = time;
+        return Ok<int, string>(self._alive.size);
+    }
+    if (self._pause_at != 0.0) {
+        self._paused_total += time - self._pause_at;
+        self._pause_at = 0.0;
+    }
+    double now = time - self._paused_total;
+    if (!self._started) {
+        self._started = true;
+        self._delay_until = now + self.delay;
+        self._running = false;
+        self._rate_init = 0.0;
+        self._meter_rate = 0.0;
+        _sp_restart(self, now + self.delay);
+    }
+    bool delayed = now < self._delay_until;
+    Vec3 here = Vec3{self._world.m[12], self._world.m[13], self._world.m[14]};
+    if (!delayed) {
+        self._passed = now - self._cycle_start;
+        self._passed_distance = (double)(here - self._start_pos).length();
+        if (self._passed > self.duration && self.loop && self.run) _sp_restart(self, now);
+    }
+    // age, then drop the dead
+    int w = 0;
+    for (i in 0..self._alive.size) {
+        _SceneParticle p = self._alive.data[i];
+        if (p.born + p.life < now) continue;
+        p.age = (float)(now - p.born);
+        self._alive.data[w] = p;
+        w++;
+    }
+    while (self._alive.size > w) List_pop(&self._alive);
+    bool finished = self._passed > self.duration && !self.loop;
+    if (!delayed && self.run && !finished) {
+        int n = _sp_per_second(self, now * 1000.0) + _sp_per_meter(self, here) + _sp_bursts(self);
+        if (n > 0 && self._alive.size + n <= self.max_particles) _sp_spawn(self, n, now);
+    }
+    _sp_simulate(self);
+    _sp_build(self, scene)?;
+    return Ok<int, string>(self._alive.size);
+}
+
+Result<int, string> _sp_build(*SceneParticleEmitter self, *Scene scene) {
+    int n = self._alive.size;
+    if (n == 0) {
+        Scene_node(scene, self.draw).mesh = 0;
+        return Ok<int, string>(0);
+    }
+    Vec3 eye = Vec3{0.0, 0.0, 0.0};
+    if (scene.camera >= 0 && scene.camera < scene.nodes.size) {
+        Mat4 c = scene.nodes.data[scene.camera].world;
+        eye = Vec3{c.m[12], c.m[13], c.m[14]};
+    }
+    SceneGeometry g = scene_geometry((uint32)(n * 4), (uint32)(n * 6));
+    defer g.free();
+    float hw = self.width / 2.0;
+    float hh = self.height / 2.0;
+    Vec3[4] corners = {Vec3{-hw, -hh, 0.0}, Vec3{hw, -hh, 0.0}, Vec3{hw, hh, 0.0}, Vec3{-hw, hh, 0.0}};
+    Vec2[4] uvs = {Vec2{0.0, 1.0}, Vec2{1.0, 1.0}, Vec2{1.0, 0.0}, Vec2{0.0, 0.0}};
+    for (i in 0..n) {
+        *_SceneParticle p = &self._alive.data[i];
+        Mat4 base = self.fixed_to_emitter ? self._world : p.spawn_world;
+        Quat r = quat_axis_angle(Vec3{0.0, 0.0, 1.0}, p.rotation.z) * quat_axis_angle(Vec3{0.0, 1.0, 0.0}, p.rotation.y) *
+            quat_axis_angle(Vec3{1.0, 0.0, 0.0}, p.rotation.x);
+        // ViroReact builds the particle's matrix as Rz Ry Rx S T(position): its rotation and
+        // scale apply to its position from the emitter too
+        Mat4 world = base * mat4_trs(Vec3{0.0, 0.0, 0.0}, r, p.scale) * mat4_translate(p.pos);
+        Vec3 pos = Vec3{world.m[12], world.m[13], world.m[14]};
+        // ViroReact's billboard, around the particle's position
+        SceneNode tmp;
+        tmp.billboard = SCENE_BILLBOARD_ALL;
+        tmp.rotation = quat_identity();
+        tmp.world = mat4_trs(pos, quat_identity(), Vec3{1.0, 1.0, 1.0});
+        Mat4 bb = _scene_billboard(&tmp, eye);
+        Mat4 rs = world;
+        rs.m[12] = 0.0;
+        rs.m[13] = 0.0;
+        rs.m[14] = 0.0;
+        Mat4 m = bb * rs;
+        Vec4 col = p.color;
+        for (k in 0..4) {
+            uint32 vi = (uint32)(i * 4 + k);
+            g.set(vi, m.point(corners[k]), Vec3{0.0, 0.0, 1.0}, uvs[k]);
+            *float v = g.vertices + (int64)vi * SCENE_VERTEX_FLOATS;
+            v[12] = col.x;
+            v[13] = col.y;
+            v[14] = col.z;
+            v[15] = col.w;
+        }
+        uint32 b = (uint32)(i * 4);
+        uint32[6] idx = {b, b + 1, b + 2, b, b + 2, b + 3};
+        for (t in 0..6) g.indices[i * 6 + t] = idx[t];
+    }
+    g.bounds();
+    if (self.mesh > 0) {
+        if (!Scene_set_geometry(scene, self.mesh, &g)) return Err<int, string>("scene: particle upload failed");
+    } else {
+        self.mesh = Scene_add_geometry(scene, &g)?;
+    }
+    Scene_node(scene, self.draw).mesh = self.mesh;
+    return Ok<int, string>(n);
+}
+
+void _sp_modifier_free(*SceneParticleModifier m) {
+    m.intervals.free();
+}
+
+// Removes the drawing node and frees the emitter's lists (the mesh and material stay in
+// the scene, unused).
+void SceneParticleEmitter_free(*SceneParticleEmitter self, *Scene scene) {
+    Scene_remove(scene, self.draw);
+    self._alive.free();
+    self._scheduled.free();
+    self.bursts.free();
+    _sp_modifier_free(&self.color);
+    _sp_modifier_free(&self.alpha);
+    _sp_modifier_free(&self.scale);
+    _sp_modifier_free(&self.rotation);
+    _sp_modifier_free(&self.velocity);
+    _sp_modifier_free(&self.acceleration);
+}

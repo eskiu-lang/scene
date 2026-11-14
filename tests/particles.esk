@@ -1,0 +1,219 @@
+// Particle emitters: modifier intervals as ViroReact interpolates them, the emission rate
+// per second, the particle cap, bursts, a cycle that does not loop, motion with velocity and
+// acceleration, particles fixed to the emitter or left behind, spawn volumes, an explosion,
+// and the quads drawn with additive blending.
+import <io>;
+import <mem>;
+import <list>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/particles>;
+
+const int N = 32;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b, float tol) {
+    return a - b < tol && b - a < tol;
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+void modifiers() {
+    SceneParticleModifier m = scene_particle_constant(Vec3{1.0, 0.0, 0.0});
+    m.over(SCENE_PARTICLE_TIME, Vec3{0.0, 0.0, 0.0}, 1.0, 2.0);
+    m.over(SCENE_PARTICLE_TIME, Vec3{5.0, 0.0, 0.0}, 3.0, 4.0);
+    check("before the first interval: the initial value", scene_particle_modifier_value(&m, Vec3{1.0, 0.0, 0.0}, 0.5).x == 1.0);
+    check("inside the first: from the initial value", near(scene_particle_modifier_value(&m, Vec3{1.0, 0.0, 0.0}, 1.5).x, 0.5, 1e-6));
+    check("between intervals: the last target", scene_particle_modifier_value(&m, Vec3{1.0, 0.0, 0.0}, 2.5).x == 0.0);
+    check("inside the second: from the first's target", near(scene_particle_modifier_value(&m, Vec3{1.0, 0.0, 0.0}, 3.5).x, 2.5, 1e-6));
+    check("past the last: its target", scene_particle_modifier_value(&m, Vec3{1.0, 0.0, 0.0}, 9.0).x == 5.0);
+    m.intervals.free();
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    int at = scene.add_node(0, "emitter");
+
+    // 10 a second (ViroReact's default): none in the first second's setup frame, then one
+    // every 100 ms; particles live 2 s, so the count settles near 20
+    SceneParticleEmitter e = scene_particles(&scene, at)?;
+    double t = 1.0;
+    e.update(&scene, t)?;
+    check("first frame spawns none", e.count() == 0);
+    for (i in 0..10) {
+        t += 0.1;
+        e.update(&scene, t)?;
+    }
+    check("about 10 after a second", e.count() >= 9 && e.count() <= 11);
+    for (i in 0..30) {
+        t += 0.1;
+        e.update(&scene, t)?;
+    }
+    check("steady near 20 with a 2 s life", e.count() >= 18 && e.count() <= 22);
+    e.free(&scene);
+
+    // the cap
+    SceneParticleEmitter capped = scene_particles(&scene, at)?;
+    capped.rate_per_second = Vec2{100.0, 100.0};
+    capped.max_particles = 15;
+    t = 10.0;
+    for (i in 0..30) {
+        capped.update(&scene, t)?;
+        t += 0.05;
+    }
+    check("never more than max_particles", capped.count() <= 15 && capped.count() >= 10);
+    capped.free(&scene);
+
+    // bursts: 5 at 0.5 s, then 5 more 0.5 s later; no rate
+    SceneParticleEmitter b = scene_particles(&scene, at)?;
+    b.rate_per_second = Vec2{0.0, 0.0};
+    b.lifetime = Vec2{10.0, 10.0};
+    List_push(&b.bursts, SceneParticleBurst{SCENE_PARTICLE_TIME, Vec2{5.0, 5.0}, 0.5, 0.5, 2});
+    t = 20.0;
+    b.update(&scene, t)?;
+    b.update(&scene, t + 0.4)?;
+    check("no burst before its start", b.count() == 0);
+    b.update(&scene, t + 0.6)?;
+    check("first burst", b.count() == 5);
+    b.update(&scene, t + 1.1)?;
+    b.update(&scene, t + 1.6)?;
+    check("second burst, then no more", b.count() == 10);
+    b.free(&scene);
+
+    // one cycle without looping: spawning stops after duration, then they all die
+    SceneParticleEmitter once = scene_particles(&scene, at)?;
+    once.loop = false;
+    once.duration = 1.0;
+    once.lifetime = Vec2{0.5, 0.5};
+    t = 30.0;
+    for (i in 0..40) {
+        once.update(&scene, t)?;
+        t += 0.05;
+    }
+    check("a finished cycle leaves nothing", once.count() == 0);
+    once.free(&scene);
+
+    // motion: one particle rising at 1 unit a second under a downward pull of 2
+    SceneParticleEmitter m = scene_particles(&scene, at)?;
+    m.rate_per_second = Vec2{0.0, 0.0};
+    m.lifetime = Vec2{10.0, 10.0};
+    m.velocity = scene_particle_constant(Vec3{0.0, 1.0, 0.0});
+    m.acceleration = scene_particle_constant(Vec3{0.0, -2.0, 0.0});
+    List_push(&m.bursts, SceneParticleBurst{SCENE_PARTICLE_TIME, Vec2{1.0, 1.0}, -1.0, 1.0, 1});
+    t = 40.0;
+    m.update(&scene, t)?;
+    m.update(&scene, t + 0.5)?;
+    check("y = v t + a t^2 / 2", m.count() == 1 && near(m._alive.data[0].pos.y, 0.25, 1e-4));
+    // fixed to the emitter: the quad follows the node; not fixed, it stays
+    scene.node(at).position = Vec3{3.0, 0.0, 0.0};
+    m.update(&scene, t + 0.5)?;
+    *SceneMesh mm = &scene.meshes.data[m.mesh];
+    check("fixed to the emitter: follows it", (mm.min.x + mm.max.x) * 0.5 > 2.5);
+    m.fixed_to_emitter = false;
+    m.update(&scene, t + 0.5)?;
+    mm = &scene.meshes.data[m.mesh];
+    check("not fixed: stays where it was born", near((mm.min.x + mm.max.x) * 0.5, 0.0, 0.6));
+    scene.node(at).position = Vec3{0.0, 0.0, 0.0};
+    m.free(&scene);
+
+    // spawn volumes: points on a box's faces, inside a sphere's radius
+    SceneParticleEmitter v = scene_particles(&scene, at)?;
+    v.volume = SCENE_SPAWN_BOX;
+    v.volume_size = Vec3{2.0, 4.0, 6.0};
+    v.on_surface = true;
+    bool on_face = true;
+    for (i in 0..200) {
+        Vec3 p = _sp_spawn_point(&v);
+        bool face = near(p.x * p.x, 1.0, 1e-4) || near(p.y * p.y, 4.0, 1e-4) || near(p.z * p.z, 9.0, 1e-4);
+        if (!face || p.x * p.x > 1.0001 || p.y * p.y > 4.0001 || p.z * p.z > 9.0001) on_face = false;
+    }
+    check("box surface points are on a face", on_face);
+    v.volume = SCENE_SPAWN_SPHERE;
+    v.volume_size = Vec3{0.5, 0.5, 0.5};
+    v.on_surface = false;
+    bool inside = true;
+    for (i in 0..200) {
+        if (_sp_spawn_point(&v).length() > 0.5001) inside = false;
+    }
+    check("sphere points within the radius", inside);
+    v.free(&scene);
+
+    // an explosion pushes particles away from its center
+    SceneParticleEmitter x = scene_particles(&scene, at)?;
+    x.rate_per_second = Vec2{0.0, 0.0};
+    x.lifetime = Vec2{10.0, 10.0};
+    x.volume = SCENE_SPAWN_SPHERE;
+    x.volume_size = Vec3{1.0, 1.0, 1.0};
+    x.on_surface = true;
+    x.explosion_impulse = 2.0;
+    List_push(&x.bursts, SceneParticleBurst{SCENE_PARTICLE_TIME, Vec2{20.0, 20.0}, -1.0, 1.0, 1});
+    t = 50.0;
+    x.update(&scene, t)?;
+    x.update(&scene, t + 0.5)?;
+    bool outward = x.count() == 20;
+    for (i in 0..x.count()) {
+        _SceneParticle p = x._alive.data[i];
+        if (p.pos.length() <= p.spawn_pos.length() + 0.5) outward = false;
+    }
+    check("explosion: each moved 1 unit outward", outward);
+    x.free(&scene);
+
+    // drawn: one red particle filling the view, added onto black
+    int cam = scene.add_camera(0, scene_orthographic(1.0, 0.1, 10.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 2.0};
+    scene.set_camera(cam);
+    scene.post.gamma = false;
+    SceneParticleEmitter d = scene_particles(&scene, at)?;
+    d.rate_per_second = Vec2{0.0, 0.0};
+    d.lifetime = Vec2{10.0, 10.0};
+    d.velocity = scene_particle_constant(Vec3{0.0, 0.0, 0.0});
+    d.color = scene_particle_constant(Vec3{1.0, 0.0, 0.0});
+    d.alpha = scene_particle_constant(Vec3{0.5, 0.0, 0.0});
+    d.width = 2.0;
+    d.height = 2.0;
+    List_push(&d.bursts, SceneParticleBurst{SCENE_PARTICLE_TIME, Vec2{1.0, 1.0}, -1.0, 1.0, 1});
+    d.update(&scene, 60.0)?;
+    d.update(&scene, 60.1)?;
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    float r = half_to_float(px[(16 * N + 16) * 4]);
+    float g = half_to_float(px[(16 * N + 16) * 4 + 1]);
+    check("additive red at half alpha", near(r, 0.5, 0.01) && near(g, 0.0, 0.01));
+    d.free(&scene);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    modifiers();
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("particles: ok\n");
+    return 0;
+}
