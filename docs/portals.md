@@ -1,0 +1,47 @@
+# Portals
+
+A portal is a world of its own inside the scene, seen only through a window, as
+ViroReact's `ViroPortalScene` and `ViroPortal` are: a door into another room, a picture
+frame showing another place, a window onto a 360 image.
+
+```c
+int room = scene.add_node(0, "room");
+scene.node(room).portal = true;            // ViroPortalScene
+scene.node(room).passable = true;          // the camera can walk in
+int door = scene.add_object(room, window_mesh, clear_material);
+scene.node(door).portal_entrance = true;   // ViroPortal: its meshes are the window
+scene.add_object(room, sofa_mesh, sofa_material);   // inside the room
+scene.node(room).portal_sky = scene.add_texture(panorama)?;
+scene.node(room).portal_sky_pano = true;
+```
+
+A node with `portal` set makes its subtree a world: its contents are drawn only where its
+window shows, never around it. The window is every mesh of the portal's children marked
+`portal_entrance` (and of their descendants), drawn in the world around the portal. A
+window mesh is drawn like any other, so give its see-through part a material with alpha 0
+(blended) and keep the frame around it opaque; the frame is drawn again over the portal's
+world, so it stays in front of what is behind the window.
+
+Each frame the scene draws:
+
+1. The world the camera is in, with the windows of its portals, and its sky.
+2. For each portal of that world: its window into the stencil buffer where it is visible
+   (an object in front of the window still covers it), the depth cleared there, then the
+   portal's sky and contents only there, and its window again on top.
+
+`portal_sky` is a texture id from `Scene_add_texture`: a cube map, or a 360 image with
+`portal_sky_pano`. A portal without a sky shows, where its contents leave room, what was
+drawn there before (in AR, the camera image).
+
+## Walking through
+
+When `passable` is set and the camera moves through the bounds of a window between two
+frames, it enters the portal: `Scene.active_portal` becomes the portal node, the portal's
+world is drawn around the camera, and the world it came from is seen through the window
+(the same window, from the other side). Moving back through it returns to the outer world
+(`active_portal` 0). Set `active_portal` to put the camera in a portal directly. A portal
+that is not passable is only looked into.
+
+This covers one level: the world the camera is in and the portals of that world, or, inside
+a portal, the world around it. Portals inside portals are drawn as part of their portal's
+world, without their own windows. Lights reach every world.

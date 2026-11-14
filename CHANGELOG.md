@@ -25,6 +25,11 @@ All notable changes to this package are documented here. The format follows
   camera with ViroReact's billboard rotation.
 - Frustum culling: nodes wholly outside the camera's view are not drawn (they still cast
   shadows).
+- Portals: `SceneNode.portal`, `portal_entrance`, `passable`, `portal_sky` and
+  `Scene.active_portal` (ViroPortalScene and ViroPortal): a portal's world drawn only
+  through its window with the stencil buffer, its own sky, walking in through a passable
+  window and seeing out. The scene's depth buffer now has a stencil
+  (`SCENE_DEPTH_FORMAT`, Depth24PlusStencil8). `docs/portals.md`.
 - `<scene/shapes>`: `scene_polygon` (ViroPolygon: holes, uv over the bounds) and
   `ScenePolyline` (ViroPolyline: camera-facing ribbons with round ends and joins).
   `docs/shapes.md`.

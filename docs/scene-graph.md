@@ -43,6 +43,7 @@ walking up its parents.
 | `opacity` | 1 | fades the node and its subtree; multiplied down the tree, drawn blended below 1, not drawn at 0 |
 | `rendering_order` | 0 | draws the node before (lower) or after (higher) the others, ahead of every other ordering |
 | `billboard` | `SCENE_BILLBOARD_NONE` | turns it to face the camera: `_ALL`, or about the world `_X`, `_Y` or `_Z` axis only (ViroReact's transformBehaviors); its own rotation applies after |
+| `portal`, `portal_entrance`, `passable`, `portal_sky`, `portal_sky_pano` | false, false, false, 0, false | [portals](portals.md) |
 | `ignore_events` | false | rays pass through it ([hit testing](input.md)) |
 | `mesh`, `material` | 0, 0 | what the node draws |
 | `camera` | -1 | the camera it holds |

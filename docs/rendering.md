@@ -22,7 +22,9 @@ surface.present(&frame);
    `Scene.background`: by `SceneNode.rendering_order` first (lower first), then opaque and
    masked nodes front to back (fewer shaded pixels), the skybox, then blended and faded
    nodes back to front. A node whose bounds are wholly outside the camera's view is not
-   drawn in this pass (it still casts shadows).
+   drawn in this pass (it still casts shadows). Then each [portal](portals.md) seen
+   from there: its window into the stencil, and its world drawn only where the stencil
+   says. The depth buffer is `SCENE_DEPTH_FORMAT` (Depth24PlusStencil8).
 4. Bloom, when on: a bright pass into a half-size image and `bloom_passes` pairs of
    horizontal and vertical Gaussian blurs.
 5. The final pass into `view`: the HDR image plus the bloom, tone mapped, sRGB-encoded when
