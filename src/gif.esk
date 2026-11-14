@@ -1,0 +1,414 @@
+// gif.esk: animated GIF images (`<scene/gif>`).
+//
+// gif_decode reads a GIF (87a or 89a) into full-canvas RGBA frames, each already
+// composited over the ones before it as the file's disposal methods say, with its delay. A
+// SceneAnimatedImage plays one into a scene texture, ViroReact's ViroAnimatedImage:
+//
+//     Gif g = gif_load("spinner.gif")?;
+//     SceneAnimatedImage anim = scene_animated_image(&scene, g)?;
+//     SceneMaterial m = scene_material(SCENE_CONSTANT);
+//     m.diffuse_texture = anim.texture;
+//     m.alpha_mode = SCENE_ALPHA_BLEND;
+//     ...each frame: anim.update(&scene, now)?;
+
+import <mem>;
+import <list>;
+import <result>;
+import <libc>;
+import <gpu>;
+import <scene>;
+
+// One frame: the whole canvas in RGBA (width * height * 4 bytes, top row first) and how long
+// it shows, in seconds.
+struct GifFrame {
+    *uint8 rgba;
+    double delay;
+}
+
+// A decoded GIF: canvas size, frames, and loops (the file's loop count: 0 is forever, -1
+// when the file has none, which plays once).
+struct Gif {
+    int width;
+    int height;
+    int loops;
+    List<GifFrame> frames;
+}
+
+struct _GifReader {
+    *uint8 data;
+    int64 len;
+    int64 at;
+    bool bad;
+}
+
+int _gif_u8(*_GifReader r) {
+    if (r.at >= r.len) {
+        r.bad = true;
+        return 0;
+    }
+    int v = (int)r.data[r.at];
+    r.at++;
+    return v;
+}
+
+int _gif_u16(*_GifReader r) {
+    int a = _gif_u8(r);
+    int b = _gif_u8(r);
+    return a | (b << 8);
+}
+
+void _gif_skip_blocks(*_GifReader r) {
+    while (!r.bad) {
+        int n = _gif_u8(r);
+        if (n == 0) return;
+        r.at += (int64)n;
+        if (r.at > r.len) r.bad = true;
+    }
+}
+
+// Decodes the LZW data of one image (its sub-blocks) into count color indices.
+bool _gif_lzw(*_GifReader r, int min_size, *uint8 out, int count) {
+    if (min_size < 2 || min_size > 11) return false;
+    int16[4096] prefix;
+    uint8[4096] suffix;
+    uint8[4097] stack;
+    int clear = 1 << min_size;
+    int end = clear + 1;
+    int size = min_size + 1;
+    int next = clear + 2;
+    int old = -1;
+    int first = 0;
+    for (i in 0..clear) {
+        prefix[i] = (int16)-1;
+        suffix[i] = (uint8)i;
+    }
+    int written = 0;
+    uint32 bits = 0;
+    int nbits = 0;
+    int block = 0;
+    bool done = false;
+    while (!done) {
+        while (nbits < size) {
+            if (block == 0) {
+                block = _gif_u8(r);
+                if (block == 0 || r.bad) {
+                    done = true;
+                    break;
+                }
+            }
+            bits |= (uint32)_gif_u8(r) << (uint32)nbits;
+            nbits += 8;
+            block--;
+        }
+        if (done) break;
+        int code = (int)(bits & (uint32)((1 << size) - 1));
+        bits = bits >> (uint32)size;
+        nbits -= size;
+        if (code == clear) {
+            size = min_size + 1;
+            next = clear + 2;
+            old = -1;
+            continue;
+        }
+        if (code == end) break;
+        int sp = 0;
+        int c = code;
+        if (old < 0) {
+            if (code >= clear) return false;
+            if (written < count) out[written] = (uint8)code;
+            written++;
+            old = code;
+            first = code;
+            continue;
+        }
+        if (code >= next) {
+            if (code != next) return false;
+            stack[sp] = (uint8)first;
+            sp++;
+            c = old;
+        }
+        while (c >= clear) {
+            if (sp >= 4096 || c >= 4096) return false;
+            stack[sp] = suffix[c];
+            sp++;
+            c = (int)prefix[c];
+        }
+        stack[sp] = (uint8)c;
+        sp++;
+        first = c;
+        while (sp > 0) {
+            sp--;
+            if (written < count) out[written] = stack[sp];
+            written++;
+        }
+        if (next < 4096) {
+            prefix[next] = (int16)old;
+            suffix[next] = (uint8)first;
+            next++;
+            if (next == (1 << size) && size < 12) size++;
+        }
+        old = code;
+    }
+    // the rest of the image's sub-blocks
+    while (block > 0 && !r.bad) {
+        _gif_u8(r);
+        block--;
+    }
+    _gif_skip_blocks(r);
+    return written >= count;
+}
+
+// Decodes a GIF from len bytes at data.
+Result<Gif, string> gif_decode(*uint8 data, int64 len) {
+    _GifReader r = _GifReader{data, len, 0, false};
+    Gif g;
+    g.loops = -1;
+    if (len < 13 || data[0] != 'G' || data[1] != 'I' || data[2] != 'F') return Err<Gif, string>("gif: not a GIF file");
+    r.at = 6;
+    g.width = _gif_u16(&r);
+    g.height = _gif_u16(&r);
+    int flags = _gif_u8(&r);
+    int bg = _gif_u8(&r);
+    _gif_u8(&r);
+    if (g.width <= 0 || g.height <= 0 || g.width > 16384 || g.height > 16384) return Err<Gif, string>("gif: bad size");
+    uint8[768] global;
+    int global_n = 0;
+    if ((flags & 0x80) != 0) {
+        global_n = 1 << ((flags & 7) + 1);
+        for (i in 0..global_n * 3) global[i] = (uint8)_gif_u8(&r);
+    }
+    int64 canvas_bytes = (int64)g.width * g.height * 4;
+    *uint8 canvas = alloc<uint8>(canvas_bytes);
+    *uint8 saved = alloc<uint8>(canvas_bytes);
+    int disposal = 0;
+    int delay_cs = 0;
+    int transparent = -1;
+    bool ok = true;
+    while (!r.bad) {
+        int kind = _gif_u8(&r);
+        if (kind == 0x3B) break;
+        if (kind == 0x21) {
+            int label = _gif_u8(&r);
+            if (label == 0xF9) {
+                int n = _gif_u8(&r);
+                int gf = _gif_u8(&r);
+                delay_cs = _gif_u16(&r);
+                int ti = _gif_u8(&r);
+                disposal = (gf >> 2) & 7;
+                transparent = (gf & 1) != 0 ? ti : -1;
+                r.at += (int64)(n - 4);
+                _gif_skip_blocks(&r);
+            } else if (label == 0xFF) {
+                int n = _gif_u8(&r);
+                bool netscape = n == 11 && r.at + 11 <= len && memcmp(data + r.at, "NETSCAPE2.0", 11) == 0;
+                r.at += (int64)n;
+                if (netscape) {
+                    int sub = _gif_u8(&r);
+                    if (sub == 3 && _gif_u8(&r) == 1) {
+                        g.loops = _gif_u16(&r);
+                        r.at += (int64)(sub - 3);
+                    } else {
+                        r.at += (int64)(sub - 1);
+                    }
+                }
+                _gif_skip_blocks(&r);
+            } else {
+                _gif_skip_blocks(&r);
+            }
+            continue;
+        }
+        if (kind != 0x2C) {
+            ok = false;
+            break;
+        }
+        int ix = _gif_u16(&r);
+        int iy = _gif_u16(&r);
+        int iw = _gif_u16(&r);
+        int ih = _gif_u16(&r);
+        int iflags = _gif_u8(&r);
+        uint8[768] local;
+        *uint8 palette = &global[0];
+        int palette_n = global_n;
+        if ((iflags & 0x80) != 0) {
+            palette_n = 1 << ((iflags & 7) + 1);
+            for (i in 0..palette_n * 3) local[i] = (uint8)_gif_u8(&r);
+            palette = &local[0];
+        }
+        bool interlaced = (iflags & 0x40) != 0;
+        int min_size = _gif_u8(&r);
+        int count = iw * ih;
+        *uint8 idx = alloc<uint8>((int64)count + 1);
+        if (!_gif_lzw(&r, min_size, idx, count)) {
+            free(idx);
+            ok = false;
+            break;
+        }
+        if (disposal == 3) memcpy(saved, canvas, canvas_bytes);
+        // the image's rows, in interlaced order when it is interlaced
+        int[4] start = {0, 4, 2, 1};
+        int[4] step = {8, 8, 4, 2};
+        int row = 0;
+        for (pass in 0..(interlaced ? 4 : 1)) {
+            int y = interlaced ? start[pass] : 0;
+            int dy = interlaced ? step[pass] : 1;
+            while (y < ih) {
+                int cy = iy + y;
+                if (cy >= 0 && cy < g.height) {
+                    for (x in 0..iw) {
+                        int cx = ix + x;
+                        if (cx < 0 || cx >= g.width) continue;
+                        int ci = (int)idx[row * iw + x];
+                        if (ci == transparent || ci >= palette_n) continue;
+                        *uint8 p = canvas + ((int64)cy * g.width + cx) * 4;
+                        p[0] = palette[ci * 3];
+                        p[1] = palette[ci * 3 + 1];
+                        p[2] = palette[ci * 3 + 2];
+                        p[3] = 255;
+                    }
+                }
+                row++;
+                y += dy;
+            }
+        }
+        free(idx);
+        GifFrame f;
+        f.rgba = alloc<uint8>(canvas_bytes);
+        memcpy(f.rgba, canvas, canvas_bytes);
+        // browsers show delays of 0 and 1 hundredths as 0.1 s
+        f.delay = delay_cs <= 1 ? 0.1 : (double)delay_cs / 100.0;
+        List_push(&g.frames, f);
+        // disposal before the next image: 2 clears the image's area, 3 restores the
+        // canvas from before it
+        if (disposal == 2) {
+            for (y in 0..ih) {
+                int cy = iy + y;
+                if (cy < 0 || cy >= g.height) continue;
+                for (x in 0..iw) {
+                    int cx = ix + x;
+                    if (cx < 0 || cx >= g.width) continue;
+                    *uint8 p = canvas + ((int64)cy * g.width + cx) * 4;
+                    p[0] = 0;
+                    p[1] = 0;
+                    p[2] = 0;
+                    p[3] = 0;
+                }
+            }
+        } else if (disposal == 3) {
+            memcpy(canvas, saved, canvas_bytes);
+        }
+        disposal = 0;
+        delay_cs = 0;
+        transparent = -1;
+    }
+    free(canvas);
+    free(saved);
+    if (g.frames.size == 0) {
+        Gif_free(&g);
+        return Err<Gif, string>(ok ? "gif: no images" : "gif: corrupt data");
+    }
+    return Ok<Gif, string>(g);
+}
+
+// Reads and decodes the GIF file at path.
+Result<Gif, string> gif_load(string path) {
+    *void f = fopen(path, "rb");
+    if (f == null) return Err<Gif, string>("gif: cannot open file");
+    fseek(f, 0, 2);
+    int64 n = (int64)ftell(f);
+    fseek(f, 0, 0);
+    if (n <= 0) {
+        fclose(f);
+        return Err<Gif, string>("gif: empty file");
+    }
+    *uint8 data = alloc<uint8>(n);
+    int64 got = (int64)fread(data, 1, (size_t)n, f);
+    fclose(f);
+    Result<Gif, string> g = got == n ? gif_decode(data, n) : Err<Gif, string>("gif: short read");
+    free(data);
+    return g;
+}
+
+// The total time of one pass through the frames.
+double Gif_duration(*Gif self) {
+    double t = 0.0;
+    for (i in 0..self.frames.size) t += self.frames.data[i].delay;
+    return t;
+}
+
+// Frees the frames.
+void Gif_free(*Gif self) {
+    for (i in 0..self.frames.size) free(self.frames.data[i].rgba);
+    self.frames.free();
+}
+
+// A GIF playing into a scene texture (ViroReact's ViroAnimatedImage). texture is its id
+// (sRGB, the size of the GIF's canvas); loop (true by default) starts it over at the
+// end, else it stops on its last frame; paused holds the current frame.
+struct SceneAnimatedImage {
+    int texture;
+    Gif gif;
+    bool loop;
+    bool paused;
+    int frame;
+    double _start;
+    double _paused_at;
+    bool _started;
+}
+
+// A texture for gif, showing its first frame; the image takes the Gif over.
+Result<SceneAnimatedImage, string> scene_animated_image(*Scene scene, Gif gif) {
+    SceneAnimatedImage a;
+    a.gif = gif;
+    a.loop = true;
+    GpuImageOptions o = GpuImageOptions{srgb: true};
+    GpuTexture t = scene.gpu.image_with((uint32)gif.width, (uint32)gif.height, gif.frames.data[0].rgba, &o)?;
+    a.texture = Scene_add_texture(scene, t);
+    return Ok<SceneAnimatedImage, string>(a);
+}
+
+// The frame showing at time (seconds), uploaded when it changed. Returns true once a
+// non-looping image has reached its last frame.
+Result<bool, string> SceneAnimatedImage_update(*SceneAnimatedImage self, *Scene scene, double time) {
+    if (!self._started) {
+        self._started = true;
+        self._start = time;
+    }
+    // paused, it holds the frame of the moment it was paused
+    if (self.paused) {
+        if (self._paused_at == 0.0) self._paused_at = time;
+        time = self._paused_at;
+    } else if (self._paused_at != 0.0) {
+        self._start += time - self._paused_at;
+        self._paused_at = 0.0;
+    }
+    double total = Gif_duration(&self.gif);
+    double t = time - self._start;
+    bool finished = false;
+    if (total > 0.0 && t >= total) {
+        if (self.loop) t = t - total * floor(t / total);
+        else {
+            t = total;
+            finished = true;
+        }
+    }
+    int f = self.gif.frames.size - 1;
+    double acc = 0.0;
+    for (i in 0..self.gif.frames.size) {
+        acc += self.gif.frames.data[i].delay;
+        if (t < acc) {
+            f = i;
+            break;
+        }
+    }
+    if (f != self.frame) {
+        self.frame = f;
+        *GpuTexture tex = Scene_texture(scene, self.texture);
+        if (tex != null) tex.write_level(0, 0, self.gif.frames.data[f].rgba)?;
+    }
+    return Ok<bool, string>(finished);
+}
+
+// Frees the frames (the texture stays in the scene).
+void SceneAnimatedImage_free(*SceneAnimatedImage self) {
+    Gif_free(&self.gif);
+}

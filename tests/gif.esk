@@ -1,0 +1,109 @@
+// Animated GIFs: a 4 x 4 file (tests/data/anim.gif, made by a standard LZW encoder) with a
+// full frame, a frame cleared after it (disposal 2), a frame with a transparent pixel over the
+// canvas, an interlaced frame, a zero delay and a NETSCAPE loop; then playback timing,
+// looping, holding the last frame; and a borrowed texture shown and rebound.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/gif>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool px_is(*Gif g, int f, int x, int y, int r, int gr, int b, int a) {
+    *uint8 p = g.frames.data[f].rgba + (y * g.width + x) * 4;
+    return (int)p[0] == r && (int)p[1] == gr && (int)p[2] == b && (int)p[3] == a;
+}
+
+Result<int, string> run() {
+    Gif g = gif_load("tests/data/anim.gif")?;
+    check("size and frames", g.width == 4 && g.height == 4 && g.frames.size == 4);
+    check("loops forever", g.loops == 0);
+    check("delays in seconds, a zero delay shown 0.1 s", g.frames.data[0].delay == 0.1 && g.frames.data[1].delay == 0.2 &&
+        g.frames.data[2].delay == 0.05 && g.frames.data[3].delay == 0.1);
+    check("frame 1: all red", px_is(&g, 0, 0, 0, 255, 0, 0, 255) && px_is(&g, 0, 3, 3, 255, 0, 0, 255));
+    check("frame 2: green over red at (2, 2)", px_is(&g, 1, 2, 2, 0, 255, 0, 255) && px_is(&g, 1, 1, 1, 255, 0, 0, 255));
+    check("frame 3: frame 2's area cleared, white at (0, 0), the transparent pixel keeps red", px_is(&g, 2, 3, 3, 0, 0, 0, 0) &&
+        px_is(&g, 2, 0, 0, 255, 255, 255, 255) && px_is(&g, 2, 1, 0, 255, 0, 0, 255));
+    check("frame 4: interlaced rows in order", px_is(&g, 3, 0, 0, 0, 0, 255, 255) && px_is(&g, 3, 0, 1, 255, 255, 255, 255) &&
+        px_is(&g, 3, 0, 2, 255, 255, 0, 255) && px_is(&g, 3, 0, 3, 255, 0, 255, 255));
+    check("total time", Gif_duration(&g) > 0.4499 && Gif_duration(&g) < 0.4501);
+    uint8[4] junk = {1, 2, 3, 4};
+    check("not a GIF", !gif_decode(&junk[0], 4).ok);
+
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    SceneAnimatedImage a = scene_animated_image(&scene, g)?;
+    a.update(&scene, 10.0)?;
+    check("starts on the first frame", a.frame == 0);
+    a.update(&scene, 10.15)?;
+    check("second frame after 0.1 s", a.frame == 1);
+    a.update(&scene, 10.32)?;
+    check("third frame after 0.3 s", a.frame == 2);
+    a.update(&scene, 10.5)?;
+    check("loops: 0.05 s into the next pass", a.frame == 0);
+    a.paused = true;
+    a.update(&scene, 10.6)?;
+    a.update(&scene, 20.0)?;
+    a.paused = false;
+    a.update(&scene, 20.0)?;
+    check("paused holds the frame of its moment", a.frame == 1);
+    a.loop = false;
+    bool done = a.update(&scene, 30.0)?;
+    check("without loop: the last frame, finished", a.frame == 3 && done);
+    a.free();
+
+    // a borrowed texture (a video frame's, in an app): shown by a material, rebound to a
+    // new texture under the same id, and never released by the scene
+    GpuImageOptions lo = GpuImageOptions{srgb: false};
+    uint8[4] red = {255, 0, 0, 255};
+    uint8[4] green = {0, 255, 0, 255};
+    GpuTexture t1 = gpu.image_with(1, 1, &red[0], &lo)?;
+    defer t1.release();
+    GpuTexture t2 = gpu.image_with(1, 1, &green[0], &lo)?;
+    defer t2.release();
+    int vid = scene.borrow_texture(0, &t1);
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse_texture = vid;
+    SceneGeometry q = scene_quad(2.0, 2.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    scene.add_object(0, quad, scene.add_material(m));
+    int cam = scene.add_camera(0, scene_orthographic(2.0, 0.1, 10.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 2.0};
+    scene.set_camera(cam);
+    scene.post.gamma = false;
+    GpuTexture target = gpu.target_with(8, 8, WGPUTextureFormat_RGBA8Unorm)?;
+    defer target.release();
+    uint8[256] px;
+    scene.render_to(&target)?;
+    target.read(&px[0])?;
+    check("borrowed texture drawn", px[(4 * 8 + 4) * 4] == 255 && px[(4 * 8 + 4) * 4 + 1] == 0);
+    check("rebound under the same id", scene.borrow_texture(vid, &t2) == vid);
+    scene.render_to(&target)?;
+    target.read(&px[0])?;
+    check("the new texture shows", px[(4 * 8 + 4) * 4] == 0 && px[(4 * 8 + 4) * 4 + 1] == 255);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("gif: ok\n");
+    return 0;
+}
