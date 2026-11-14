@@ -1,8 +1,8 @@
-// The scene a visionOS app draws through CompositorServices (host.m runs the frame loop):
-// a red, a green and a blue box in front of the viewer and a lit floor, turning slowly. Each
-// view of each frame arrives as the compositor's Metal color texture, the view's pose in the
-// world (the device anchor times the view's transform in the device) and the tangents of
-// its field of view; the scene draws into that texture with Scene_render_eye.
+// The scene the headset examples draw (visionos/ through CompositorServices, quest/ through
+// OpenXR): a red, a green and a blue box in front of the viewer and a lit floor, turning
+// slowly. Each view of each frame arrives as the system's color image (an id<MTLTexture> on
+// visionOS, a VkImage on Quest), the view's pose in the world and the tangents of its field
+// of view; the scene draws into that image with Scene_render_eye.
 import <io>;
 import <mem>;
 import <libc>;
@@ -47,7 +47,8 @@ Result<int, string> _xr_build() {
     return Ok<int, string>(0);
 }
 
-// Opens the GPU (the system default Metal device, the compositor's) and builds the scene.
+// Opens the GPU (on visionOS the system default Metal device, the compositor's; on Quest
+// Vulkan, whose objects xr_scene_vulkan gives the OpenXR session) and builds the scene.
 // 0 on success.
 export int xr_scene_open() {
     if (xr_open) return 0;
@@ -68,14 +69,18 @@ export void xr_scene_step(float dt) {
     }
 }
 
-// Draws one view into an id<MTLTexture> of width x height, BGRA8 sRGB (srgb true) or BGRA8.
-// pose is the view's world transform, 16 floats column by column; left, right, top and
-// bottom are the tangents of its field of view's half angles. 0 on success.
-export int xr_scene_render(*void color, uint32 width, uint32 height, bool srgb, *float pose,
+// Draws one view into the system's color image of width x height: an id<MTLTexture>
+// (visionOS) or a VkImage (Quest) in image, of wgpu format format. pose is the view's world
+// transform, 16 floats column by column; left, right, top and bottom are the tangents of
+// its field of view's half angles. 0 on success.
+export int xr_scene_render(uint64 image, uint32 width, uint32 height, int format, *float pose,
         float left, float right, float top, float bottom) {
     if (!xr_open) return 1;
-    WGPUTextureFormat format = srgb ? WGPUTextureFormat_BGRA8UnormSrgb : WGPUTextureFormat_BGRA8Unorm;
-    Result<GpuTexture, string> t = xr_gpu.texture_from_metal(color, width, height, format, 1, 0);
+#ifdef __APPLE__
+    Result<GpuTexture, string> t = xr_gpu.texture_from_metal((*void)image, width, height, (WGPUTextureFormat)format, 1, 0);
+#else
+    Result<GpuTexture, string> t = xr_gpu.texture_from_vulkan(image, width, height, (WGPUTextureFormat)format, 1, 0);
+#endif
     if (t.ok == 0) {
         println_err(t.error);
         return 1;
@@ -95,6 +100,25 @@ export int xr_scene_render(*void color, uint32 width, uint32 height, bool srgb, 
     }
     return 0;
 }
+
+#ifndef __APPLE__
+// The Vulkan instance, physical device, device and queue (family and index) the scene draws
+// with, for XrGraphicsBindingVulkanKHR. 0 on success.
+export int xr_scene_vulkan(**void instance, **void physical_device, **void device, *uint32 queue_family, *uint32 queue_index) {
+    if (!xr_open) return 1;
+    Result<WGPUVulkanHandles, string> h = xr_gpu.vulkan_handles();
+    if (h.ok == 0) {
+        println_err(h.error);
+        return 1;
+    }
+    *instance = h.value.instance;
+    *physical_device = h.value.physical_device;
+    *device = h.value.device;
+    *queue_family = h.value.queue_family_index;
+    *queue_index = h.value.queue_index;
+    return 0;
+}
+#endif
 
 // Waits until the GPU has run what was submitted, so the compositor presents finished views.
 export void xr_scene_wait() {

@@ -4,12 +4,12 @@
 # (WGPU_LIB, its eskiu/build_apple.sh) and an eskiu-gpu with Gpu_texture_from_metal (GPU_DIR,
 # until a gpu release has it).
 #
-#     examples/visionos/build.sh
+#     examples/xr/visionos/build.sh
 #     xcrun simctl boot "Apple Vision Pro"; xcrun simctl install booted build/EskiuXR.app
 #     xcrun simctl launch booted dev.eskiu.scene.xr
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "$here/../.." && pwd)
+root=$(cd "$here/../../.." && pwd)
 SDK=${SDK:-xrsimulator}
 GPU_DIR=${GPU_DIR:-$root/../eskiu-gpu}
 WGPU=${WGPU:-$root/../wgpu-native-eskiu}
@@ -25,7 +25,7 @@ rm -rf "$pkg"
 mkdir -p "$pkg" "$out/EskiuXR.app"
 # scene with gpu taken from GPU_DIR
 cp -R "$root/src" "$pkg/src"
-cp "$here/xr_scene.esk" "$pkg/xr_scene.esk"
+cp "$here/../xr_scene.esk" "$pkg/xr_scene.esk"
 sed -e "s|^gpu = .*|gpu = { path = \"$GPU_DIR\" }|" -e "s|^main = .*|main = \"xr_scene.esk\"|" \
     "$root/eskiu.toml" > "$pkg/eskiu.toml"
 (cd "$pkg" && "$ESKIUC" xr_scene.esk --target "$triple" -c -o "$out/xr_scene.o")

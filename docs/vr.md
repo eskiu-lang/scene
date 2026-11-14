@@ -78,26 +78,50 @@ then places the reticle and runs its animations. `show_reticle(false)` hides it
 (ViroController's `reticleVisibility`). The controller's 3D model (`controllerVisibility`)
 is the app's to draw at the pose.
 
-## visionOS
+## Headsets: visionOS and Quest
 
-`examples/visionos` draws a scene in a full immersive space on Apple Vision Pro. A small
-SwiftUI app opens the space; its `CompositorLayer` runs the frame loop of `host.m`, which
-takes each frame's drawables from CompositorServices and the device's pose at the frame's
-presentation time from ARKit's world tracking. For each view, `xr_scene.esk` wraps the
-drawable's color texture as a `GpuTexture` (`Gpu_texture_from_metal`) and draws with
-`Scene_render_eye`: the eye's pose is the device anchor times the view's transform, and its
-projection comes from the view's field-of-view tangents. After the views are drawn, the loop
-waits for the GPU and presents the drawable.
+`examples/xr` draws one scene (`xr_scene.esk`: three turning boxes over a lit floor) on two
+headsets, each through the system's own frame loop. The scene exports a few C functions
+(`xr_scene_open`, `xr_scene_step`, `xr_scene_render`, `xr_scene_wait`); for each view the host
+hands over the system's color image, the view's world pose and its field-of-view tangents,
+and the scene wraps the image as a `GpuTexture` and draws with `Scene_render_eye`. Both hosts
+link wgpu-native from eskiu-lang/wgpu-native's eskiu branch (`WGPU`), which adds the calls that
+wrap a system image, and an eskiu-gpu that has them (`GPU_DIR`, until a gpu release does).
+
+### visionOS
+
+`examples/xr/visionos` is a full immersive space on Apple Vision Pro. A small SwiftUI window
+opens the space at launch and closes; its `CompositorLayer` runs the frame loop of `host.m`,
+which takes each frame's drawables from CompositorServices and the device's pose at the
+frame's presentation time from ARKit's world tracking. The view's pose is the device anchor
+times the view's transform; the color texture is wrapped with `Gpu_texture_from_metal`. After
+the views are drawn, the loop waits for the GPU and presents the drawable.
 
 ```sh
-examples/visionos/build.sh          # build/EskiuXR.app for the simulator (SDK=xros: a device)
-xcrun simctl install booted examples/visionos/build/EskiuXR.app
+examples/xr/visionos/build.sh       # build/EskiuXR.app for the simulator (SDK=xros: a device)
+xcrun simctl install booted examples/xr/visionos/build/EskiuXR.app
 xcrun simctl launch booted dev.eskiu.scene.xr
 ```
 
-It links wgpu-native from eskiu-lang/wgpu-native's eskiu branch (`WGPU`, built with its
-`eskiu/build_apple.sh`), which adds `wgpuDeviceCreateTextureFromMetal`, and an eskiu-gpu with
-`Gpu_texture_from_metal` (`GPU_DIR`, until a gpu release has it). In the simulator the head
-sits at the world origin, which is the floor on a device, so the example lifts it to standing
-height there. The compositor's depth texture is not written yet, so the system cannot
-reproject the frames by depth.
+In the simulator the head sits at the world origin, which is the floor on a device, so the
+example lifts it to standing height there. The compositor's depth texture is not written
+yet, so the system cannot reproject the frames by depth.
+
+### Quest
+
+`examples/xr/quest` is a NativeActivity for Meta Quest (`host.c`). It opens the GPU on
+Vulkan, binds an OpenXR session to wgpu's Vulkan device (`XR_KHR_vulkan_enable`, with the
+objects from `Gpu_vulkan_handles`), makes a swapchain per eye in `R8G8B8A8_SRGB`, and each
+frame wraps the acquired swapchain image with `Gpu_texture_from_vulkan` and draws the eye at
+the pose and field of view `xrLocateViews` gives in the stage space (local space when there
+is no stage).
+
+```sh
+OPENXR_DIR=path/to/openxr_loader_for_android examples/xr/quest/build.sh   # build/EskiuXR.apk
+adb install -r examples/xr/quest/build/EskiuXR.apk
+```
+
+`OPENXR_DIR` is Khronos' `openxr_loader_for_android` AAR, extracted. The APK builds and its
+library links with every symbol resolved, but it has not run on a headset yet: OpenXR wants
+the Vulkan device to carry the extensions `xrGetVulkanDeviceExtensionsKHR` lists, and wgpu
+made the device, so the host logs that list (tag `eskiu-xr`) for the first run on a device.

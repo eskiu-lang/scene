@@ -1,6 +1,6 @@
 // The frame loop of the visionOS example: CompositorServices hands over each frame's
 // drawables, ARKit gives the device's pose at the frame's presentation time, and the scene in
-// xr_scene.esk draws each view into the drawable's color texture through wgpu
+// ../xr_scene.esk draws each view into the drawable's color texture through wgpu
 // (wgpuDeviceCreateTextureFromMetal, eskiu-lang/wgpu-native's eskiu branch).
 #import <CompositorServices/CompositorServices.h>
 #import <ARKit/ARKit.h>
@@ -10,7 +10,7 @@
 
 int xr_scene_open(void);
 void xr_scene_step(float dt);
-int xr_scene_render(void *color, uint32_t width, uint32_t height, bool srgb, float *pose,
+int xr_scene_render(uint64_t image, uint32_t width, uint32_t height, int format, float *pose,
                     float left, float right, float top, float bottom);
 void xr_scene_wait(void);
 
@@ -28,7 +28,8 @@ void eskiu_xr_run(cp_layer_renderer_t renderer) {
     id<MTLDevice> device = cp_layer_renderer_get_device(renderer);
     id<MTLCommandQueue> queue = [device newCommandQueue];
     cp_layer_renderer_configuration_t config = cp_layer_renderer_get_configuration(renderer);
-    bool srgb = cp_layer_renderer_configuration_get_color_format(config) == MTLPixelFormatBGRA8Unorm_sRGB;
+    // WGPUTextureFormat_BGRA8UnormSrgb or WGPUTextureFormat_BGRA8Unorm
+    int format = cp_layer_renderer_configuration_get_color_format(config) == MTLPixelFormatBGRA8Unorm_sRGB ? 0x1C : 0x1B;
     CFTimeInterval last = 0;
     unsigned long frames = 0;
     for (;;) {
@@ -75,8 +76,8 @@ void eskiu_xr_run(cp_layer_renderer_t renderer) {
                     id<MTLTexture> color = cp_drawable_get_color_texture(drawable, ti);
                     simd_float4x4 pose = simd_mul(head, cp_view_get_transform(view));
                     simd_float4 tan = cp_view_get_tangents(view);
-                    if (xr_scene_render((__bridge void *)color, (uint32_t)color.width, (uint32_t)color.height,
-                                        srgb, (float *)&pose, tan[0], tan[1], tan[2], tan[3]) != 0) {
+                    if (xr_scene_render((uint64_t)(__bridge void *)color, (uint32_t)color.width, (uint32_t)color.height,
+                                        format, (float *)&pose, tan[0], tan[1], tan[2], tan[3]) != 0) {
                         fprintf(stderr, "xr: render failed\n");
                     }
                 }
