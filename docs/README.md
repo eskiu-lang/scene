@@ -5,6 +5,7 @@ Guides and reference for scene. The [README](../README.md) has the overview.
 <!-- pages -->
 - [The scene graph](scene-graph.md): nodes, cameras, meshes, glTF models
 - [Materials](materials.md): lighting models, textures, alpha and blending
+- [Shader modifiers](modifiers.md): ViroReact's GLSL modifiers, uniforms, varyings, WGSL
 - [Lights and shadows](lights.md)
 - [Rendering, post-processing and the sky](rendering.md)
 - [Animated images and video](images.md): GIFs, video frames on surfaces and as a 360 sky
@@ -46,6 +47,7 @@ macOS; on Linux and Windows, an SDL3 build from your package manager or libsdl.o
 | `<scene>` | `Scene`, nodes, cameras, meshes, textures, glTF import, rendering; imports the others |
 | `<scene/geometry>` | `SceneGeometry` and the box, sphere, plane and quad shapes |
 | `<scene/material>` | `SceneMaterial`, lighting models, alpha and blend modes, shader variants |
+| `<scene/glsl>` | the GLSL to WGSL translator of shader modifiers |
 | `<scene/light>` | `SceneLight`, its constructors and falloff curves |
 | `<scene/post>` | `ScenePost`, tone mapping operators, CPU versions of the curves |
 | `<scene/sky>` | cube maps from six images |
@@ -79,6 +81,7 @@ Each test renders small images and reads them back:
 | `tests/gltf.esk` | a glTF model's node tree, transforms, unlit material and pose updates |
 | `tests/animation.esk` | the easing curves against ViroReact's formulas, Euler order, groups with delays, serial and parallel chains, a skipped frame, ViroReact's property strings, relative values across loops, opacity, color, pause, resume, stop |
 | `tests/physics.esk` | free fall against ViroReact's gravity and fixed steps, the 10-step cap, a ball resting on a floor with one collision event, a bounce, a stack of boxes settling flat and sleeping, forces, constant velocity, a torque impulse, a kinematic body pushing, closest and all ray hits, shape tests at a point and swept, shapes from scaled meshes and children |
+| `tests/modifiers.esk` | surface, geometry, vertex, lighting and fragment modifiers in GLSL, uniforms updated between frames, a texture uniform, a varying, swizzle assignments, splats, mod and ?:, a WGSL modifier, an unreadable body |
 | `tests/input.esk` | screen rays against the camera's field of view, hits on rotated, scaled and nested nodes, hidden and `ignore_events` nodes, bubbling to a handler, click states, fixed-distance and plane drags, pinch, rotation, hover hysteresis, fuse |
 
 ## Not yet
@@ -86,7 +89,6 @@ Each test renders small images and reads them back:
 These ViroReact renderer features are planned for later versions:
 
 - Post effects beyond ViroReact's (color grading, vignette, depth of field, SSAO).
-- Shader modifiers (user WGSL inserted into the generated shaders).
 - Cascaded shadow maps for large scenes, and shadows from point lights (ViroReact has neither).
 - Instanced drawing.
 

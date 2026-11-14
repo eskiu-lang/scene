@@ -66,6 +66,12 @@ All notable changes to this package are documented here. The format follows
   glTF material takes its base color texture's sampler.
 - `Scene_set_geometry` and `Scene_set_texture` replace a mesh's or a texture's contents in
   place.
+- Shader modifiers (ViroReact's `shaderModifiers`): `SceneShaderModifier` at the geometry,
+  vertex, surface, lighting and fragment entry points with ViroReact's names (`_geometry`,
+  `_transforms`, `_vertex`, `_surface`, `_light`, `_lightingContribution`, `_output_color`),
+  in GLSL (translated by `<scene/glsl>`) or WGSL; `Scene_add_shader`,
+  `SceneMaterial.shader`, per-material uniforms (`Scene_set_uniform_float` and the others,
+  `Scene_set_uniform_texture`) and varyings. `docs/modifiers.md`.
 - `<scene/physics>`: `ScenePhysicsWorld`, ViroReact's physics bodies: static, kinematic and
   dynamic bodies with box, sphere, automatic and compound shapes, gravity, friction,
   restitution, forces, torques, impulses, constant velocities and sleeping, stepped in fixed

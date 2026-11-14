@@ -1,0 +1,206 @@
+// Shader modifiers as ViroReact's: GLSL surface, geometry, vertex, lighting and fragment
+// modifiers with uniforms updated between frames, a texture uniform, a varying from the
+// vertex stage to the fragment stage, swizzle assignments, GLSL's splats, mod and ?:, a
+// WGSL modifier, and an error for a body that cannot be read.
+import <io>;
+import <mem>;
+import <list>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 32;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+float half_to_float(uint16 h) {
+    int e = ((int)h >> 10) & 31;
+    int m = (int)h & 1023;
+    float v = 0.0;
+    if (e == 0) v = (float)m / 1024.0 / 16384.0;
+    else v = (1.0 + (float)m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+Vec3 pixel(*uint16 px, int x, int y) {
+    *uint16 p = px + (y * N + x) * 4;
+    return Vec3{half_to_float(p[0]), half_to_float(p[1]), half_to_float(p[2])};
+}
+
+void expect(string what, Vec3 got, Vec3 want) {
+    Vec3 d = got - want;
+    if (d.length() > 0.02) {
+        printf("FAIL %s: got %.3f %.3f %.3f, want %.3f %.3f %.3f\n", what, (double)got.x, (double)got.y, (double)got.z,
+            (double)want.x, (double)want.y, (double)want.z);
+        fails++;
+    }
+}
+
+Result<int, string> shot(*Scene scene, *GpuTexture t, *uint16 px) {
+    scene.render_to(t)?;
+    t.read(px)?;
+    return Ok<int, string>(0);
+}
+
+// A program of one modifier.
+Result<int, string> program(*Scene scene, SceneShaderModifier m) {
+    List<SceneShaderModifier> l;
+    List_push(&l, m);
+    Result<int, string> r = scene.add_shader(&l);
+    l.free();
+    return r;
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    scene.background = Vec4{0.0, 0.0, 0.0, 1.0};
+    SceneGeometry q = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    int cam = scene.add_camera(0, scene_orthographic(2.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+
+    // surface: the color from a uniform, changed between frames
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.shader = program(&scene, scene_modifier(SCENE_MODIFIER_SURFACE, "uniform highp vec3 tint;",
+        "_surface.diffuse_color = vec4(tint, 1.0);"))?;
+    int mat = scene.add_material(m);
+    int obj = scene.add_object(0, quad, mat);
+    check("set a uniform", scene.set_uniform_vec3(mat, "tint", Vec3{1.0, 0.0, 0.0}));
+    check("an unknown uniform", !scene.set_uniform_float(mat, "nope", 1.0));
+    shot(&scene, &target, px)?;
+    expect("surface from a uniform", pixel(px, 16, 16), Vec3{1.0, 0.0, 0.0});
+    scene.set_uniform_vec3(mat, "tint", Vec3{0.0, 1.0, 0.0});
+    shot(&scene, &target, px)?;
+    expect("the uniform updated", pixel(px, 16, 16), Vec3{0.0, 1.0, 0.0});
+
+    // a swizzle assignment and GLSL's splats, mod and ?:
+    SceneMaterial m2 = scene_material(SCENE_CONSTANT);
+    m2.diffuse = Vec4{0.8, 0.8, 0.8, 1.0};
+    m2.shader = program(&scene, scene_modifier(SCENE_MODIFIER_SURFACE, "uniform float k;",
+        "_surface.diffuse_color.rgb *= vec3(0.5, mod(k, 1.0), k > 2.0 ? 1.0 : 0.0);\n"
+        "_surface.diffuse_color.st = clamp(_surface.diffuse_color.st, 0.0, 0.3);"))?;
+    int mat2 = scene.add_material(m2);
+    scene.node(obj).material = mat2;
+    scene.set_uniform_float(mat2, "k", 2.5);
+    shot(&scene, &target, px)?;
+    // rgb = (0.4, 0.4, 0.8), then r and g clamped to 0.3
+    expect("swizzles, splats, mod and select", pixel(px, 16, 16), Vec3{0.3, 0.3, 0.8});
+
+    // fragment: the output inverted
+    SceneMaterial m3 = scene_material(SCENE_CONSTANT);
+    m3.diffuse = Vec4{0.25, 0.5, 1.0, 1.0};
+    m3.shader = program(&scene, scene_modifier(SCENE_MODIFIER_FRAGMENT, "", "_output_color.rgb = vec3(1.0) - _output_color.rgb;"))?;
+    scene.node(obj).material = scene.add_material(m3);
+    shot(&scene, &target, px)?;
+    expect("fragment", pixel(px, 16, 16), Vec3{0.75, 0.5, 0.0});
+
+    // geometry: moved right in its own space by a uniform; vertex: moved up in clip space
+    SceneMaterial m4 = scene_material(SCENE_CONSTANT);
+    m4.shader = program(&scene, scene_modifier(SCENE_MODIFIER_GEOMETRY, "uniform float shift;", "_geometry.position.x += shift;"))?;
+    int mat4 = scene.add_material(m4);
+    scene.node(obj).material = mat4;
+    scene.set_uniform_float(mat4, "shift", 0.5);
+    shot(&scene, &target, px)?;
+    // the quad spans x 0..1 of a 2-wide view: pixels 16..32
+    expect("geometry: the left of the view empty", pixel(px, 12, 16), Vec3{0.0, 0.0, 0.0});
+    expect("geometry: the right covered", pixel(px, 28, 16), Vec3{1.0, 1.0, 1.0});
+    SceneMaterial m5 = scene_material(SCENE_CONSTANT);
+    m5.shader = program(&scene, scene_modifier(SCENE_MODIFIER_VERTEX, "", "_vertex.position.y += 0.5 * _vertex.position.w;"))?;
+    scene.node(obj).material = scene.add_material(m5);
+    shot(&scene, &target, px)?;
+    // up by a quarter of the view: the quad spans y 0.25..1.25 world, rows 0..12
+    expect("vertex: above the middle covered", pixel(px, 16, 6), Vec3{1.0, 1.0, 1.0});
+    expect("vertex: below it empty", pixel(px, 16, 22), Vec3{0.0, 0.0, 0.0});
+
+    // a varying: the vertex stage's x carried to the fragment stage
+    List<SceneShaderModifier> vm;
+    SceneShaderModifier g = scene_modifier(SCENE_MODIFIER_GEOMETRY, "", "lift = _geometry.position.x + 0.5;");
+    g.varyings = "highp float lift";
+    List_push(&vm, g);
+    SceneShaderModifier sf = scene_modifier(SCENE_MODIFIER_SURFACE, "", "_surface.diffuse_color = vec4(lift, 0.0, 0.0, 1.0);");
+    sf.varyings = "highp float lift";
+    List_push(&vm, sf);
+    SceneMaterial m6 = scene_material(SCENE_CONSTANT);
+    m6.shader = scene.add_shader(&vm)?;
+    vm.free();
+    scene.node(obj).material = scene.add_material(m6);
+    shot(&scene, &target, px)?;
+    // the quad spans pixels 8..24; x from 0 to 1 across it
+    expect("a varying, left", pixel(px, 9, 16), Vec3{1.5 / 16.0, 0.0, 0.0});
+    expect("a varying, right", pixel(px, 22, 16), Vec3{14.5 / 16.0, 0.0, 0.0});
+
+    // a texture uniform
+    SceneMaterial m7 = scene_material(SCENE_CONSTANT);
+    m7.shader = program(&scene, scene_modifier(SCENE_MODIFIER_SURFACE, "uniform sampler2D noise;",
+        "_surface.diffuse_color = texture(noise, _surface.diffuse_texcoord);"))?;
+    int mat7 = scene.add_material(m7);
+    scene.node(obj).material = mat7;
+    uint8[4] cyan = {0, 255, 255, 255};
+    GpuImageOptions lo = GpuImageOptions{srgb: false};
+    int tex = scene.add_texture(gpu.image_with(1, 1, &cyan[0], &lo)?);
+    check("bind a texture uniform", scene.set_uniform_texture(mat7, "noise", tex));
+    shot(&scene, &target, px)?;
+    expect("texture uniform", pixel(px, 16, 16), Vec3{0.0, 1.0, 1.0});
+
+    // lighting: Lambert under a light from the front, the diffuse halved per light
+    scene.node(obj).material = 0;
+    SceneMaterial lm = scene_material(SCENE_LAMBERT);
+    int plain = scene.add_material(lm);
+    lm.shader = program(&scene, scene_modifier(SCENE_MODIFIER_LIGHTING, "",
+        "if (_light.type == 1) _lightingContribution.diffuse *= 0.5;"))?;
+    int halved = scene.add_material(lm);
+    scene.add_light(scene_directional(Vec3{0.0, 0.0, -1.0}, Vec3{1.0, 1.0, 1.0}, 0.8));
+    scene.node(obj).material = plain;
+    shot(&scene, &target, px)?;
+    Vec3 full = pixel(px, 16, 16);
+    scene.node(obj).material = halved;
+    shot(&scene, &target, px)?;
+    check("lighting before", full.x > 0.5);
+    expect("lighting modifier", pixel(px, 16, 16), full * 0.5);
+
+    // WGSL
+    SceneMaterial mw = scene_material(SCENE_CONSTANT);
+    mw.shader = program(&scene, scene_modifier_wgsl(SCENE_MODIFIER_SURFACE, "tint: vec3<f32>;",
+        "_surface.diffuse_color = vec4<f32>(tint.bgr, 1.0);"))?;
+    int matw = scene.add_material(mw);
+    scene.node(obj).material = matw;
+    scene.set_uniform_vec3(matw, "tint", Vec3{0.2, 0.4, 0.6});
+    shot(&scene, &target, px)?;
+    expect("WGSL modifier", pixel(px, 16, 16), Vec3{0.6, 0.4, 0.2});
+
+    // a body that cannot be read
+    List<SceneShaderModifier> bad;
+    List_push(&bad, scene_modifier(SCENE_MODIFIER_SURFACE, "", "_surface.diffuse_color = vec4(1.0;"));
+    Result<int, string> br = scene.add_shader(&bad);
+    bad.free();
+    check("a broken body is an error", !br.ok);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("modifiers: ok\n");
+    return 0;
+}

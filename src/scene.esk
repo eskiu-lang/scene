@@ -189,6 +189,18 @@ struct _SceneMatGpu {
     GpuBindGroup group;
     int[6] bound;
     int sampler;
+    List<float> mod_values;
+    List<int> mod_textures;
+    int mod_shader;
+    bool mod_made;
+    GpuBuffer mod_buffer;
+    GpuBindGroup mod_group;
+}
+
+// A shader program's bind layout (group 3: its uniforms, a sampler, its textures).
+struct _SceneShaderGpu {
+    bool made;
+    GpuBindLayout layout;
 }
 
 struct _SceneSampler {
@@ -280,6 +292,7 @@ struct _SceneRenderer {
     List<_SceneMatGpu> mats;
     List<_SceneSampler> samplers;
     List<_ScenePortalRec> portals;
+    List<_SceneShaderGpu> shader_gpu;
     List<_SceneWorldGroup> world_groups;
     Vec3 last_eye;
     bool has_eye;
@@ -292,6 +305,8 @@ struct _SceneRenderer {
     WGPUTextureView bound_shadow;
     WGPUTextureView bound_irr;
     Mat4 view_proj;
+    Mat4 view;
+    Mat4 proj;
     Vec3 eye;
     Vec3 forward;
     bool ortho;
@@ -311,6 +326,7 @@ struct Scene {
     List<SceneCamera> cameras;
     List<SceneMesh> meshes;
     List<SceneMaterial> materials;
+    List<SceneShader> shaders;
     List<GpuTexture> textures;
     List<bool> _borrowed;
     List<SceneLight> lights;
@@ -384,7 +400,7 @@ Result<int, string> _scene_renderer_make(*Scene s) {
     r.shadow_layout = g.bind_layout();
     r.shadow_layout.uniform(0, WGPUShaderStage_Vertex);
 
-    r.frame = g.uniform(null, 144)?;
+    r.frame = g.uniform(null, 272)?;
     r.no_storage = g.buffer(64, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
     r.lights = g.buffer((uint64)SCENE_MAX_LIGHTS * 144, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
     GpuSamplerOptions so = GpuSamplerOptions{mipmaps: true, anisotropy: 8};
@@ -474,7 +490,17 @@ void Scene_release(*Scene self) {
             r.mats.data[i].group.release();
             r.mats.data[i].uniforms.release();
         }
+        if (r.mats.data[i].mod_made) {
+            r.mats.data[i].mod_group.release();
+            r.mats.data[i].mod_buffer.release();
+        }
+        r.mats.data[i].mod_values.free();
+        r.mats.data[i].mod_textures.free();
     }
+    for (i in 0..r.shader_gpu.size) {
+        if (r.shader_gpu.data[i].made) r.shader_gpu.data[i].layout.release();
+    }
+    List_free(&r.shader_gpu);
     for (i in 0..r.pipes.size) r.pipes.data[i].pipe.release();
     if (r.depth_reset_made) r.depth_reset.release();
     List_free(&r.portals);
@@ -539,6 +565,8 @@ void Scene_release(*Scene self) {
     List_free(&self.cameras);
     List_free(&self.meshes);
     List_free(&self.materials);
+    for (i in 0..self.shaders.size) scene_shader_free(&self.shaders.data[i]);
+    List_free(&self.shaders);
     List_free(&self.textures);
     List_free(&self.lights);
 }
@@ -1339,15 +1367,22 @@ Result<*GpuPipeline, string> _scene_pipeline(*Scene self, int key) {
     }
     String src;
     defer String_free(&src);
-    scene_material_shader(key, &src);
+    int sid = scene_key_shader(key);
+    *SceneShader prog = sid > 0 && sid < self.shaders.size ? &self.shaders.data[sid] : null;
+    scene_material_shader_with(key, prog, &src);
     GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)SCENE_VERTEX_FLOATS * 4};
     defer layout.release();
     _scene_vertex_layout(&layout);
-    *GpuBindLayout[3] groups = {&r.frame_layout, &r.draw_layout, &r.mat_layout};
+    *GpuBindLayout[4] groups = {&r.frame_layout, &r.draw_layout, &r.mat_layout, &r.mat_layout};
+    int group_count = 3;
+    if (prog != null && prog.modifiers.size > 0) {
+        groups[3] = _scene_shader_layout(self, sid);
+        group_count = 4;
+    }
     bool blend = scene_key_blended(key);
     WGPUBlendState bs = _scene_blend_state(scene_key_blend(key));
     GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: "fs",
-        format: WGPUTextureFormat_RGBA16Float, layout: &layout, groups: &groups[0], group_count: 3,
+        format: WGPUTextureFormat_RGBA16Float, layout: &layout, groups: &groups[0], group_count: (uint32)group_count,
         depth: true, depth_format: SCENE_DEPTH_FORMAT, depth_read_only: scene_key_skips_depth_write(key),
         cull: scene_key_double_sided(key) ? WGPUCullMode_None : WGPUCullMode_Back};
     if (scene_key_skips_depth_test(key)) d.depth_compare = WGPUCompareFunction_Always;
@@ -1465,7 +1500,153 @@ Result<int, string> _scene_material_gpu(*Scene self, int id) {
         f[6] = t.set == 1 ? 1.0 : 0.0;
     }
     g.uniforms.write(0, &u, 272);
+    if (m.shader > 0 && m.shader < self.shaders.size) _scene_material_mods(self, id)?;
     return Ok<int, string>(0);
+}
+
+// The bind layout of shader program sid, made on first use.
+*GpuBindLayout _scene_shader_layout(*Scene self, int sid) {
+    *_SceneRenderer r = &self._r;
+    while (r.shader_gpu.size <= sid) {
+        _SceneShaderGpu z;
+        List_push(&r.shader_gpu, z);
+    }
+    *_SceneShaderGpu sg = &r.shader_gpu.data[sid];
+    if (!sg.made) {
+        *SceneShader p = &self.shaders.data[sid];
+        sg.layout = self.gpu.bind_layout();
+        sg.layout.uniform(0, WGPUShaderStage_Vertex | WGPUShaderStage_Fragment);
+        sg.layout.sampler(1, WGPUShaderStage_Vertex | WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+        for (k in 0..p.textures) sg.layout.texture((uint32)(2 + k), WGPUShaderStage_Vertex | WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+        sg.made = true;
+    }
+    return &sg.layout;
+}
+
+// Material id's uniform block and textures for its shader program.
+Result<int, string> _scene_material_mods(*Scene self, int id) {
+    *_SceneMatGpu g = &self._r.mats.data[id];
+    int sid = self.materials.data[id].shader;
+    *SceneShader p = &self.shaders.data[sid];
+    if (g.mod_made && g.mod_shader != sid) {
+        g.mod_group.release();
+        g.mod_buffer.release();
+        g.mod_made = false;
+    }
+    while (g.mod_values.size < p.uniform_bytes / 4) List_push(&g.mod_values, 0.0);
+    while (g.mod_textures.size < p.uniforms.size) List_push(&g.mod_textures, 0);
+    if (!g.mod_made) {
+        g.mod_buffer = self.gpu.uniform(null, (uint64)p.uniform_bytes)?;
+        *GpuBindLayout layout = _scene_shader_layout(self, sid);
+        Result<GpuBindGroup, string> bg = layout.group();
+        if (!bg.ok) {
+            g.mod_buffer.release();
+            return Err<int, string>(bg.error);
+        }
+        g.mod_group = bg.value;
+        g.mod_group.buffer(0, &g.mod_buffer);
+        g.mod_group.sampler(1, &self._r.samp);
+        g.mod_shader = sid;
+        g.mod_made = true;
+    }
+    int t = 0;
+    for (k in 0..p.uniforms.size) {
+        if (p.offsets.data[k] >= 0) continue;
+        g.mod_group.texture((uint32)(2 + t), _scene_tex(self, g.mod_textures.data[k]));
+        t++;
+    }
+    g.mod_buffer.write(0, g.mod_values.data, (uint64)p.uniform_bytes);
+    return Ok<int, string>(0);
+}
+
+// Adds a program of shader modifiers (ViroReact's shaderModifiers) and returns its id, for
+// SceneMaterial.shader. GLSL bodies are translated to WGSL here; a body WGSL cannot take
+// fails when the first material using it is drawn, with the GPU's message.
+Result<int, string> Scene_add_shader(*Scene self, *List<SceneShaderModifier> modifiers) {
+    if (self.shaders.size == 0) {
+        SceneShader none;
+        List_push(&self.shaders, none);
+    }
+    SceneShader p = scene_shader(modifiers)?;
+    List_push(&self.shaders, p);
+    return Ok<int, string>(self.shaders.size - 1);
+}
+
+int _scene_uniform_index(*Scene self, int material, string name) {
+    if (material <= 0 || material >= self.materials.size) return -1;
+    int sid = self.materials.data[material].shader;
+    if (sid <= 0 || sid >= self.shaders.size) return -1;
+    *SceneShader p = &self.shaders.data[sid];
+    for (k in 0..p.uniforms.size) {
+        if (strcmp((string)p.uniforms.data[k].name.data, name) == 0) return k;
+    }
+    return -1;
+}
+
+// Sets count floats of material's uniform name (a float, vec2, vec3, vec4, mat3 or mat4,
+// matrices column by column), ViroReact's materialUniforms and updateShaderUniform. False
+// when the material's program has no such uniform. Shows at the next render.
+bool Scene_set_uniform(*Scene self, int material, string name, *float values, int count) {
+    int k = _scene_uniform_index(self, material, name);
+    if (k < 0) return false;
+    *SceneShader p = &self.shaders.data[self.materials.data[material].shader];
+    int off = p.offsets.data[k];
+    if (off < 0) return false;
+    *_SceneMatGpu g = &self._r.mats.data[material];
+    while (g.mod_values.size < p.uniform_bytes / 4) List_push(&g.mod_values, 0.0);
+    string t = (string)p.uniforms.data[k].type.data;
+    if (strcmp(t, "mat3") == 0) {
+        // three columns, each in 16 bytes
+        for (c in 0..3) {
+            for (rr in 0..3) {
+                if (c * 3 + rr < count) g.mod_values.data[off / 4 + c * 4 + rr] = values[c * 3 + rr];
+            }
+        }
+        return true;
+    }
+    int cap = strcmp(t, "mat4") == 0 ? 16 : 4;
+    for (i in 0..(count < cap ? count : cap)) g.mod_values.data[off / 4 + i] = values[i];
+    return true;
+}
+
+// Scene_set_uniform for a float.
+bool Scene_set_uniform_float(*Scene self, int material, string name, float value) {
+    return Scene_set_uniform(self, material, name, &value, 1);
+}
+
+// Scene_set_uniform for a vec2.
+bool Scene_set_uniform_vec2(*Scene self, int material, string name, Vec2 value) {
+    float[2] v = {value.x, value.y};
+    return Scene_set_uniform(self, material, name, &v[0], 2);
+}
+
+// Scene_set_uniform for a vec3.
+bool Scene_set_uniform_vec3(*Scene self, int material, string name, Vec3 value) {
+    float[3] v = {value.x, value.y, value.z};
+    return Scene_set_uniform(self, material, name, &v[0], 3);
+}
+
+// Scene_set_uniform for a vec4.
+bool Scene_set_uniform_vec4(*Scene self, int material, string name, Vec4 value) {
+    float[4] v = {value.x, value.y, value.z, value.w};
+    return Scene_set_uniform(self, material, name, &v[0], 4);
+}
+
+// Scene_set_uniform for a mat4.
+bool Scene_set_uniform_mat4(*Scene self, int material, string name, Mat4 value) {
+    return Scene_set_uniform(self, material, name, &value.m[0], 16);
+}
+
+// Binds texture (an id, 0 for white) to material's sampler2D uniform name.
+bool Scene_set_uniform_texture(*Scene self, int material, string name, int texture) {
+    int k = _scene_uniform_index(self, material, name);
+    if (k < 0) return false;
+    *SceneShader p = &self.shaders.data[self.materials.data[material].shader];
+    if (p.offsets.data[k] >= 0) return false;
+    *_SceneMatGpu g = &self._r.mats.data[material];
+    while (g.mod_textures.size < p.uniforms.size) List_push(&g.mod_textures, 0);
+    g.mod_textures.data[k] = texture;
+    return true;
 }
 
 Result<int, string> _scene_node_gpu(*Scene self, int id) {
@@ -1637,6 +1818,8 @@ void _scene_camera(*Scene self, uint32 width, uint32 height) {
     Scene_camera_matrices(self, width, height, &view, &proj, &world);
     r.ortho = Scene_camera_is_ortho(self);
     r.view_proj = proj * view;
+    r.view = view;
+    r.proj = proj;
     r.eye = Vec3{world.m[12], world.m[13], world.m[14]};
     r.forward = (Vec3{-world.m[8], -world.m[9], -world.m[10]}).normalize();
 }
@@ -1766,7 +1949,7 @@ Result<int, string> _scene_world_group(*Scene self, *GpuIbl ibl) {
     }
     _SceneWorldGroup w;
     w.ibl = ibl;
-    w.frame = self.gpu.uniform(null, 144)?;
+    w.frame = self.gpu.uniform(null, 272)?;
     w.group = r.frame_layout.group()?;
     w.group.buffer(0, &w.frame);
     w.group.buffer(1, &r.lights);
@@ -1852,6 +2035,7 @@ void _scene_draw(*Scene self, *GpuPass pass, *_SceneDraw d, *GpuPipeline pipe) {
     pass.set_group(0, fg);
     pass.set_group(1, &r.nodes.data[d.node].group);
     pass.set_group(2, &r.mats.data[d.material].group);
+    if (r.mats.data[d.material].mod_made && scene_key_shader(d.key) > 0) pass.set_group(3, &r.mats.data[d.material].mod_group);
     pass.draw_indexed(pipe, &mesh.vertices, &mesh.indices, mesh.index_count, 1);
 }
 
@@ -1926,7 +2110,7 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     if (r.recs.size > 0) r.lights.write(0, &lb, (uint64)r.recs.size * 144);
 
     uint32 ssize = self.shadow_size > 0 ? self.shadow_size : (uint32)2048;
-    float[36] fu;
+    float[68] fu;
     for (k in 0..16) fu[k] = r.view_proj.m[k];
     fu[16] = r.eye.x;
     fu[17] = r.eye.y;
@@ -1948,7 +2132,9 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     fu[33] = 0.0;
     fu[34] = 0.0;
     fu[35] = 0.0;
-    r.frame.write(0, &fu, 144);
+    for (k in 0..16) fu[36 + k] = r.view.m[k];
+    for (k in 0..16) fu[52 + k] = r.proj.m[k];
+    r.frame.write(0, &fu, 272);
     _scene_bind_frame(self, shadows > 0);
     // each portal's world with its own lighting environment
     for (k in 0..r.portals.size) {
@@ -1959,7 +2145,7 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
         fu[29] = ibl != null ? ibl.intensity : 0.0;
         fu[30] = ibl != null ? ibl.max_lod() : 0.0;
         *_SceneWorldGroup wg = &r.world_groups.data[gi];
-        wg.frame.write(0, &fu, 144);
+        wg.frame.write(0, &fu, 272);
         wg.group.texture(2, shadows > 0 ? &r.shadow_maps : &r.no_shadow);
     }
 

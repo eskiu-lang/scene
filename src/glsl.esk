@@ -1,0 +1,1045 @@
+// glsl.esk: ViroReact's GLSL shader modifier code in WGSL (`<scene/glsl>`).
+//
+// ViroReact's shader modifiers are GLSL ES 3.0 statements; scene's shaders are WGSL. This
+// translates the statements a modifier body holds (declarations, assignments, if, for,
+// while, discard, expressions with the GLSL built-ins) and the uniform and varying
+// declarations, keeping the names, so a modifier written for ViroReact works unchanged.
+// GLSL's implicit splats (clamp(v, 0.0, 1.0) on a vector) are made explicit from the
+// types it can infer, constructors get their WGSL types, mod is GLSL's floored modulo,
+// texture() samples through the modifier's sampler, and ?: becomes select().
+
+import <mem>;
+import <list>;
+import <string>;
+import <libc>;
+
+// A name and its type, in the translator's spelling: f32, i32, u32, bool, vec2..vec4,
+// ivec2.., uvec2.., bvec2.., mat2..mat4, sampler, or a struct's name.
+struct GlslSym {
+    String name;
+    string type;
+}
+
+struct _GTok {
+    int kind;
+    String text;
+}
+
+const int _GT_IDENT = 0;
+const int _GT_NUM = 1;
+const int _GT_OP = 2;
+const int _GT_END = 3;
+
+// The translator's state: the tokens, where it is, the names it knows and the first error.
+struct GlslTranslator {
+    List<_GTok> toks;
+    int at;
+    List<GlslSym> syms;
+    String error;
+    String sampler;
+}
+
+bool _g_ident_start(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+bool _g_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+bool _g_streq(string a, string b) {
+    return strcmp(a, b) == 0;
+}
+
+void _g_tokenize(*GlslTranslator self, string src) {
+    int64 i = 0;
+    int64 n = (int64)strlen(src);
+    while (i < n) {
+        char c = src[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && src[i + 1] == '/') {
+            while (i < n && src[i] != '\n') i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/')) i++;
+            i += 2;
+            continue;
+        }
+        _GTok t;
+        if (_g_ident_start(c)) {
+            t.kind = _GT_IDENT;
+            while (i < n && (_g_ident_start(src[i]) || _g_digit(src[i]))) {
+                t.text.push(src[i]);
+                i++;
+            }
+        } else if (_g_digit(c) || (c == '.' && i + 1 < n && _g_digit(src[i + 1]))) {
+            t.kind = _GT_NUM;
+            while (i < n && (_g_digit(src[i]) || src[i] == '.' || src[i] == 'e' || src[i] == 'E' ||
+                ((src[i] == '-' || src[i] == '+') && (src[i - 1] == 'e' || src[i - 1] == 'E')))) {
+                t.text.push(src[i]);
+                i++;
+            }
+            // GLSL suffixes: f (dropped, the literal is a float), u (kept)
+            if (i < n && (src[i] == 'f' || src[i] == 'F')) i++;
+            else if (i < n && (src[i] == 'u' || src[i] == 'U')) {
+                t.text.push('u');
+                i++;
+            }
+        } else {
+            t.kind = _GT_OP;
+            string[18] three_two = {"<<=", ">>=", "++", "--", "+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||",
+                "<<", ">>", "&="};
+            bool got = false;
+            for (k in 0..18) {
+                string op = three_two[k];
+                int64 l = (int64)strlen(op);
+                if (i + l <= n && strncmp(&src[i], op, (uint64)l) == 0) {
+                    t.text.append(op);
+                    i += l;
+                    got = true;
+                    break;
+                }
+            }
+            if (!got && i + 1 < n && (src[i] == '|' || src[i] == '^') && src[i + 1] == '=') {
+                t.text.push(src[i]);
+                t.text.push('=');
+                i += 2;
+                got = true;
+            }
+            if (!got) {
+                t.text.push(c);
+                i++;
+            }
+        }
+        List_push(&self.toks, t);
+    }
+    _GTok e;
+    e.kind = _GT_END;
+    e.text.append("");
+    List_push(&self.toks, e);
+}
+
+string _g_peek(*GlslTranslator self, int k) {
+    int i = self.at + k;
+    if (i >= self.toks.size) i = self.toks.size - 1;
+    return (string)self.toks.data[i].text.data;
+}
+
+int _g_kind(*GlslTranslator self, int k) {
+    int i = self.at + k;
+    if (i >= self.toks.size) i = self.toks.size - 1;
+    return self.toks.data[i].kind;
+}
+
+bool _g_is(*GlslTranslator self, string s) {
+    return _g_kind(self, 0) != _GT_END && _g_streq(_g_peek(self, 0), s);
+}
+
+void _g_fail(*GlslTranslator self, string what) {
+    if (self.error.len > 0) return;
+    self.error.appendf("glsl: %s near '%s'", what, _g_peek(self, 0));
+}
+
+void _g_expect(*GlslTranslator self, string s) {
+    if (_g_is(self, s)) self.at++;
+    else {
+        String m;
+        m.appendf("expected '%s'", s);
+        _g_fail(self, (string)m.data);
+        m.free();
+        // move on so the translator always ends
+        if (_g_kind(self, 0) != _GT_END) self.at++;
+    }
+}
+
+// --- types ---
+
+bool _g_is_precision(string s) {
+    return _g_streq(s, "lowp") || _g_streq(s, "mediump") || _g_streq(s, "highp");
+}
+
+// The translator's spelling of a GLSL type name, or "" when s is not one.
+string _g_type_of(string s) {
+    string[22] names = {"float", "int", "uint", "bool", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3",
+        "uvec4", "bvec2", "bvec3", "bvec4", "mat2", "mat3", "mat4", "sampler2D", "void", "samplerCube"};
+    string[22] types = {"f32", "i32", "u32", "bool", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3",
+        "uvec4", "bvec2", "bvec3", "bvec4", "mat2", "mat3", "mat4", "sampler", "void", "sampler"};
+    for (k in 0..22) {
+        if (_g_streq(s, names[k])) return types[k];
+    }
+    return "";
+}
+
+// The WGSL spelling of a translator type.
+string glsl_wgsl_type(string t) {
+    string[18] a = {"f32", "i32", "u32", "bool", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3", "uvec4",
+        "bvec2", "bvec3", "bvec4", "mat3", "mat4"};
+    string[18] w = {"f32", "i32", "u32", "bool", "vec2<f32>", "vec3<f32>", "vec4<f32>", "vec2<i32>", "vec3<i32>", "vec4<i32>",
+        "vec2<u32>", "vec3<u32>", "vec4<u32>", "vec2<bool>", "vec3<bool>", "vec4<bool>", "mat3x3<f32>", "mat4x4<f32>"};
+    for (k in 0..18) {
+        if (_g_streq(t, a[k])) return w[k];
+    }
+    if (_g_streq(t, "mat2")) return "mat2x2<f32>";
+    return t;
+}
+
+// The component count of a vector type (1 for a scalar, 0 otherwise).
+int _g_width(string t) {
+    if (t == null || t[0] == 0) return 0;
+    if (_g_streq(t, "f32") || _g_streq(t, "i32") || _g_streq(t, "u32") || _g_streq(t, "bool")) return 1;
+    int64 l = (int64)strlen(t);
+    if (l >= 4 && strncmp(&t[l - 4], "vec", 3) == 0) return (int)(t[l - 1] - '0');
+    return 0;
+}
+
+// The scalar of a vector type ("f32" for vec3, "i32" for ivec2).
+string _g_scalar(string t) {
+    if (t == null) return "";
+    if (t[0] == 'i' && t[1] == 'v') return "i32";
+    if (t[0] == 'u' && t[1] == 'v') return "u32";
+    if (t[0] == 'b' && t[1] == 'v') return "bool";
+    if (t[0] == 'v') return "f32";
+    if (_g_width(t) == 1) return t;
+    return "";
+}
+
+string _g_vec(string scalar, int n) {
+    if (n == 1) return scalar;
+    string[3] f = {"vec2", "vec3", "vec4"};
+    string[3] i = {"ivec2", "ivec3", "ivec4"};
+    string[3] u = {"uvec2", "uvec3", "uvec4"};
+    string[3] b = {"bvec2", "bvec3", "bvec4"};
+    if (n < 2 || n > 4) return "";
+    if (_g_streq(scalar, "i32")) return i[n - 2];
+    if (_g_streq(scalar, "u32")) return u[n - 2];
+    if (_g_streq(scalar, "bool")) return b[n - 2];
+    return f[n - 2];
+}
+
+// Declares name (copied) as a variable of type (a translator type, kept as given: a
+// literal or a string that outlives the translator).
+void GlslTranslator_declare(*GlslTranslator self, string name, string type) {
+    for (i in 0..self.syms.size) {
+        if (_g_streq((string)self.syms.data[i].name.data, name)) {
+            self.syms.data[i].type = type;
+            return;
+        }
+    }
+    GlslSym s;
+    s.name.append(name);
+    s.type = type;
+    List_push(&self.syms, s);
+}
+
+string _g_lookup(*GlslTranslator self, string name) {
+    for (i in 0..self.syms.size) {
+        if (_g_streq((string)self.syms.data[i].name.data, name)) return self.syms.data[i].type;
+    }
+    return "";
+}
+
+// The fields of the structures a modifier reads and writes, with their types.
+string _g_field(string st, string field) {
+    string[49] rows = {
+        "surface.diffuse_color:vec4", "surface.diffuse_texcoord:vec2", "surface.diffuse_intensity:f32",
+        "surface.shininess:f32", "surface.specular_color:vec3", "surface.specular_texcoord:vec2",
+        "surface.roughness:f32", "surface.roughness_intensity:f32", "surface.metalness:f32",
+        "surface.metalness_intensity:f32", "surface.ao:f32", "surface.alpha:f32", "surface.normal:vec3",
+        "surface.position:vec3", "surface.view:vec3",
+        "geometry.position:vec3", "geometry.normal:vec3", "geometry.texcoord:vec2", "geometry.tangent:vec4",
+        "geometry.bone_weights:vec4", "geometry.bone_indices:ivec4",
+        "transforms.model_matrix:mat4", "transforms.view_matrix:mat4", "transforms.projection_matrix:mat4",
+        "vertex.position:vec4",
+        "lighting.ambient:vec3", "lighting.diffuse:vec3", "lighting.specular:vec3", "lighting.visibility:f32",
+        "light.type:i32", "light.attenuation_start_distance:f32", "light.attenuation_end_distance:f32",
+        "light.attenuation_falloff_exp:f32", "light.position:vec4", "light.direction:vec4", "light.color:vec3",
+        "light.intensity:f32", "light.spot_inner_angle:f32", "light.spot_outer_angle:f32",
+        "", "", "", "", "", "", "", "", "", ""};
+    String key;
+    key.appendf("%s.%s:", st, field);
+    int64 kl = (int64)key.len;
+    string found = "";
+    for (k in 0..49) {
+        if (rows[k][0] != 0 && strncmp(rows[k], (string)key.data, (uint64)kl) == 0) {
+            found = &rows[k][kl];
+            break;
+        }
+    }
+    key.free();
+    return found;
+}
+
+bool _g_is_swizzle(string f) {
+    int64 l = (int64)strlen(f);
+    if (l < 1 || l > 4) return false;
+    for (k in 0..l) {
+        char c = f[k];
+        bool ok = c == 'x' || c == 'y' || c == 'z' || c == 'w' || c == 'r' || c == 'g' || c == 'b' || c == 'a' ||
+            c == 's' || c == 't' || c == 'p' || c == 'q';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// --- expressions ---
+
+struct _GExpr {
+    String text;
+    string type;
+}
+
+_GExpr _g_assign(*GlslTranslator self);
+
+int _g_prec(string op) {
+    if (_g_streq(op, "||")) return 1;
+    if (_g_streq(op, "&&")) return 2;
+    if (_g_streq(op, "|")) return 3;
+    if (_g_streq(op, "^")) return 4;
+    if (_g_streq(op, "&")) return 5;
+    if (_g_streq(op, "==") || _g_streq(op, "!=")) return 6;
+    if (_g_streq(op, "<") || _g_streq(op, ">") || _g_streq(op, "<=") || _g_streq(op, ">=")) return 7;
+    if (_g_streq(op, "<<") || _g_streq(op, ">>")) return 8;
+    if (_g_streq(op, "+") || _g_streq(op, "-")) return 9;
+    if (_g_streq(op, "*") || _g_streq(op, "/") || _g_streq(op, "%")) return 10;
+    return 0;
+}
+
+// An expression of type t widened to n components (a scalar splatted), as GLSL does in
+// built-ins that mix vectors and scalars.
+void _g_splat(*_GExpr e, int n) {
+    if (n <= 1 || _g_width(e.type) != 1) return;
+    String s;
+    string vt = _g_vec(_g_scalar(e.type)[0] == 0 ? "f32" : _g_scalar(e.type), n);
+    s.appendf("%s(%s)", glsl_wgsl_type(vt), (string)e.text.data);
+    e.text.free();
+    e.text = s;
+    e.type = vt;
+}
+
+void _g_free_args(*List<_GExpr> args) {
+    for (i in 0..args.size) args.data[i].text.free();
+    args.free();
+}
+
+// The widest vector among args (0 when none is a vector).
+int _g_widest(*List<_GExpr> args) {
+    int w = 0;
+    for (i in 0..args.size) {
+        int n = _g_width(args.data[i].type);
+        if (n > w) w = n;
+    }
+    return w;
+}
+
+_GExpr _g_call(*GlslTranslator self, string name) {
+    List<_GExpr> args;
+    self.at++;
+    if (!_g_is(self, ")")) {
+        while (true) {
+            List_push(&args, _g_assign(self));
+            if (_g_is(self, ",")) {
+                self.at++;
+                continue;
+            }
+            break;
+        }
+    }
+    _g_expect(self, ")");
+    _GExpr r;
+    string ct = _g_type_of(name);
+    if (ct[0] != 0 && !_g_streq(ct, "sampler")) {
+        // a constructor
+        r.text.appendf("%s(", glsl_wgsl_type(ct));
+        for (i in 0..args.size) {
+            if (i > 0) r.text.append(", ");
+            r.text.append((string)args.data[i].text.data);
+        }
+        r.text.append(")");
+        r.type = ct;
+        _g_free_args(&args);
+        return r;
+    }
+    int n = args.size;
+    string a0 = n > 0 ? (string)args.data[0].text.data : "";
+    if ((_g_streq(name, "texture") || _g_streq(name, "texture2D") || _g_streq(name, "textureCube")) && n >= 2) {
+        if (n >= 3) r.text.appendf("textureSampleBias(%s, %s, %s, %s)", a0, (string)self.sampler.data, (string)args.data[1].text.data,
+            (string)args.data[2].text.data);
+        else r.text.appendf("textureSample(%s, %s, %s)", a0, (string)self.sampler.data, (string)args.data[1].text.data);
+        r.type = "vec4";
+        _g_free_args(&args);
+        return r;
+    }
+    if (_g_streq(name, "textureLod") && n == 3) {
+        r.text.appendf("textureSampleLevel(%s, %s, %s, %s)", a0, (string)self.sampler.data, (string)args.data[1].text.data,
+            (string)args.data[2].text.data);
+        r.type = "vec4";
+        _g_free_args(&args);
+        return r;
+    }
+    if (_g_streq(name, "mod") && n == 2) {
+        int w = _g_widest(&args);
+        _g_splat(&args.data[0], w);
+        _g_splat(&args.data[1], w);
+        string a = (string)args.data[0].text.data;
+        string b = (string)args.data[1].text.data;
+        r.text.appendf("((%s) - (%s) * floor((%s) / (%s)))", a, b, a, b);
+        r.type = args.data[0].type;
+        _g_free_args(&args);
+        return r;
+    }
+    // GLSL built-ins whose scalar arguments WGSL wants as vectors when another is one
+    string[9] splats = {"clamp", "min", "max", "step", "smoothstep", "pow", "atan", "distance", "faceforward"};
+    for (k in 0..9) {
+        if (_g_streq(name, splats[k])) {
+            int w = _g_widest(&args);
+            for (i in 0..n) _g_splat(&args.data[i], w);
+        }
+    }
+    string wn = name;
+    if (_g_streq(name, "atan") && n == 2) wn = "atan2";
+    else if (_g_streq(name, "inversesqrt")) wn = "inverseSqrt";
+    else if (_g_streq(name, "dFdx")) wn = "dpdx";
+    else if (_g_streq(name, "dFdy")) wn = "dpdy";
+    if ((_g_streq(name, "lessThan") || _g_streq(name, "greaterThan") || _g_streq(name, "lessThanEqual") ||
+        _g_streq(name, "greaterThanEqual") || _g_streq(name, "equal") || _g_streq(name, "notEqual")) && n == 2) {
+        string op = "<";
+        if (_g_streq(name, "greaterThan")) op = ">";
+        if (_g_streq(name, "lessThanEqual")) op = "<=";
+        if (_g_streq(name, "greaterThanEqual")) op = ">=";
+        if (_g_streq(name, "equal")) op = "==";
+        if (_g_streq(name, "notEqual")) op = "!=";
+        r.text.appendf("((%s) %s (%s))", a0, op, (string)args.data[1].text.data);
+        r.type = _g_vec("bool", _g_width(args.data[0].type));
+        _g_free_args(&args);
+        return r;
+    }
+    r.text.appendf("%s(", wn);
+    for (i in 0..n) {
+        if (i > 0) r.text.append(", ");
+        r.text.append((string)args.data[i].text.data);
+    }
+    r.text.append(")");
+    // result types
+    if (_g_streq(name, "length") || _g_streq(name, "dot") || _g_streq(name, "distance") || _g_streq(name, "determinant")) r.type = "f32";
+    else if (_g_streq(name, "cross")) r.type = "vec3";
+    else if (_g_streq(name, "any") || _g_streq(name, "all")) r.type = "bool";
+    else if (n > 0) {
+        int w = _g_widest(&args);
+        r.type = w > 1 ? _g_vec(_g_scalar(args.data[0].type)[0] == 0 ? "f32" : _g_scalar(args.data[0].type), w) : args.data[0].type;
+        if (_g_streq(name, "transpose") || _g_streq(name, "inverse")) r.type = args.data[0].type;
+    } else {
+        r.type = _g_lookup(self, name);
+    }
+    _g_free_args(&args);
+    return r;
+}
+
+_GExpr _g_primary(*GlslTranslator self) {
+    _GExpr r;
+    int kind = _g_kind(self, 0);
+    string t = _g_peek(self, 0);
+    if (kind == _GT_NUM) {
+        self.at++;
+        bool is_float = false;
+        int64 l = (int64)strlen(t);
+        for (i in 0..l) {
+            if (t[i] == '.' || t[i] == 'e' || t[i] == 'E') is_float = true;
+        }
+        r.text.append(t);
+        if (l > 0 && t[l - 1] == '.') r.text.append("0");
+        if (t[0] == '.') {
+            String z;
+            z.appendf("0%s", (string)r.text.data);
+            r.text.free();
+            r.text = z;
+        }
+        r.type = is_float ? "f32" : (l > 0 && t[l - 1] == 'u' ? "u32" : "i32");
+        return r;
+    }
+    if (kind == _GT_IDENT) {
+        self.at++;
+        if (_g_is(self, "(")) return _g_call(self, t);
+        if (_g_streq(t, "true") || _g_streq(t, "false")) {
+            r.text.append(t);
+            r.type = "bool";
+            return r;
+        }
+        r.text.append(t);
+        r.type = _g_lookup(self, t);
+        return r;
+    }
+    if (_g_is(self, "(")) {
+        self.at++;
+        _GExpr e = _g_assign(self);
+        _g_expect(self, ")");
+        r.text.appendf("(%s)", (string)e.text.data);
+        r.type = e.type;
+        e.text.free();
+        return r;
+    }
+    _g_fail(self, "unexpected token");
+    if (_g_kind(self, 0) != _GT_END) self.at++;
+    r.text.append("0.0");
+    r.type = "f32";
+    return r;
+}
+
+_GExpr _g_postfix(*GlslTranslator self) {
+    _GExpr e = _g_primary(self);
+    while (true) {
+        if (_g_is(self, ".")) {
+            self.at++;
+            string f = _g_peek(self, 0);
+            self.at++;
+            string base = e.type;
+            // `type` is reserved in WGSL: the light's type is the field kind
+            if (_g_streq(base, "_light") && _g_streq(f, "type")) e.text.append(".kind");
+            else if (_g_width(base) >= 1 && _g_is_swizzle(f)) {
+                // GLSL's s t p q are x y z w
+                e.text.append(".");
+                for (k in 0..(int)strlen(f)) {
+                    char c = f[k];
+                    if (c == 's') c = 'x';
+                    else if (c == 't') c = 'y';
+                    else if (c == 'p') c = 'z';
+                    else if (c == 'q') c = 'w';
+                    e.text.push(c);
+                }
+            } else e.text.appendf(".%s", f);
+            string ft = "";
+            if (base != null && base[0] == '_') ft = _g_field(&base[1], f);
+            else if (_g_width(base) >= 1) ft = _g_vec(_g_scalar(base), (int)strlen(f));
+            e.type = ft;
+            continue;
+        }
+        if (_g_is(self, "[")) {
+            self.at++;
+            _GExpr ix = _g_assign(self);
+            _g_expect(self, "]");
+            e.text.appendf("[%s]", (string)ix.text.data);
+            ix.text.free();
+            string base = e.type;
+            if (_g_streq(base, "mat3")) e.type = "vec3";
+            else if (_g_streq(base, "mat4")) e.type = "vec4";
+            else if (_g_streq(base, "mat2")) e.type = "vec2";
+            else if (_g_width(base) > 1) e.type = _g_scalar(base);
+            else e.type = "";
+            continue;
+        }
+        if (_g_is(self, "++") || _g_is(self, "--")) {
+            e.text.append(_g_peek(self, 0));
+            self.at++;
+            continue;
+        }
+        break;
+    }
+    return e;
+}
+
+_GExpr _g_unary(*GlslTranslator self) {
+    if (_g_is(self, "-") || _g_is(self, "!") || _g_is(self, "~") || _g_is(self, "+")) {
+        string op = _g_peek(self, 0);
+        self.at++;
+        _GExpr e = _g_unary(self);
+        _GExpr r;
+        if (_g_streq(op, "+")) r.text.append((string)e.text.data);
+        else r.text.appendf("%s%s", op, (string)e.text.data);
+        r.type = _g_streq(op, "!") ? "bool" : e.type;
+        e.text.free();
+        return r;
+    }
+    if (_g_is(self, "++") || _g_is(self, "--")) {
+        // WGSL increments only as statements, written after the name
+        string op = _g_peek(self, 0);
+        self.at++;
+        _GExpr e = _g_unary(self);
+        e.text.append(op);
+        return e;
+    }
+    return _g_postfix(self);
+}
+
+string _g_binary_type(string op, string a, string b) {
+    int p = _g_prec(op);
+    if (p >= 6 && p <= 7) return "bool";
+    if (p <= 2) return "bool";
+    if (a == null || a[0] == 0) return b;
+    if (b == null || b[0] == 0) return a;
+    // matrix times vector, vector times matrix
+    if (a[0] == 'm' && _g_width(b) > 1) return b;
+    if (b[0] == 'm' && _g_width(a) > 1) return a;
+    if (_g_width(a) >= _g_width(b)) return a;
+    return b;
+}
+
+_GExpr _g_binary(*GlslTranslator self, int min_prec) {
+    _GExpr left = _g_unary(self);
+    while (true) {
+        if (_g_kind(self, 0) != _GT_OP) break;
+        string op = _g_peek(self, 0);
+        int p = _g_prec(op);
+        if (p == 0 || p < min_prec) break;
+        self.at++;
+        _GExpr right = _g_binary(self, p + 1);
+        _GExpr r;
+        // GLSL lets a vector meet a scalar in + - * /; WGSL too, except with % and the
+        // comparisons, where the scalar is splatted
+        if (_g_streq(op, "%")) {
+            int w = _g_width(left.type) > _g_width(right.type) ? _g_width(left.type) : _g_width(right.type);
+            _g_splat(&left, w);
+            _g_splat(&right, w);
+        }
+        r.text.appendf("%s %s %s", (string)left.text.data, op, (string)right.text.data);
+        r.type = _g_binary_type(op, left.type, right.type);
+        left.text.free();
+        right.text.free();
+        left = r;
+    }
+    return left;
+}
+
+_GExpr _g_ternary(*GlslTranslator self) {
+    _GExpr c = _g_binary(self, 1);
+    if (!_g_is(self, "?")) return c;
+    self.at++;
+    _GExpr a = _g_assign(self);
+    _g_expect(self, ":");
+    _GExpr b = _g_ternary(self);
+    _GExpr r;
+    int w = _g_width(a.type) > _g_width(b.type) ? _g_width(a.type) : _g_width(b.type);
+    _g_splat(&a, w);
+    _g_splat(&b, w);
+    r.text.appendf("select(%s, %s, %s)", (string)b.text.data, (string)a.text.data, (string)c.text.data);
+    r.type = a.type != null && a.type[0] != 0 ? a.type : b.type;
+    c.text.free();
+    a.text.free();
+    b.text.free();
+    return r;
+}
+
+bool _g_is_assign_op(string op) {
+    string[11] ops = {"=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="};
+    for (k in 0..11) {
+        if (_g_streq(op, ops[k])) return true;
+    }
+    return false;
+}
+
+_GExpr _g_assign(*GlslTranslator self) {
+    _GExpr left = _g_ternary(self);
+    if (_g_kind(self, 0) == _GT_OP && _g_is_assign_op(_g_peek(self, 0))) {
+        string op = _g_peek(self, 0);
+        self.at++;
+        _GExpr right = _g_assign(self);
+        _GExpr r;
+        // WGSL assigns one component of a vector at a time: v.rgb op= e becomes the
+        // components of e assigned one by one, e evaluated once
+        string lt = (string)left.text.data;
+        int64 ll = (int64)left.text.len;
+        int64 dot = ll - 1;
+        while (dot > 0 && lt[dot] != '.') dot--;
+        int64 sl = ll - dot - 1;
+        bool swz = dot > 0 && sl >= 2 && sl <= 4 && lt[ll - 1] != ']' && lt[ll - 1] != ')';
+        if (swz) {
+            for (k in dot + 1..ll) {
+                char c = lt[k];
+                if (!(c == 'x' || c == 'y' || c == 'z' || c == 'w' || c == 'r' || c == 'g' || c == 'b' || c == 'a')) swz = false;
+            }
+        }
+        if (swz) {
+            string comp = "xyzw";
+            r.text.appendf("{ let swz_v = %s;", (string)right.text.data);
+            bool scalar = _g_width(right.type) == 1;
+            for (k in 0..sl) {
+                r.text.push(' ');
+                for (j in 0..dot + 1) r.text.push(lt[j]);
+                r.text.push(lt[dot + 1 + k]);
+                r.text.appendf(" %s swz_v", op);
+                if (!scalar) {
+                    r.text.push('.');
+                    r.text.push(comp[k]);
+                }
+                r.text.push(';');
+            }
+            r.text.append(" }");
+            r.type = "block";
+            left.text.free();
+            right.text.free();
+            return r;
+        }
+        r.text.appendf("%s %s %s", (string)left.text.data, op, (string)right.text.data);
+        r.type = left.type;
+        left.text.free();
+        right.text.free();
+        return r;
+    }
+    return left;
+}
+
+// --- statements ---
+
+void _g_statement(*GlslTranslator self, *String out, int depth);
+
+void _g_indent(*String out, int depth) {
+    for (i in 0..depth) out.append("    ");
+}
+
+// A declaration: [const] [precision] type name [= value] (, name [= value])* ; consumed
+// from the type on.
+void _g_declaration(*GlslTranslator self, *String out, int depth, bool constant, bool in_for) {
+    string type = _g_type_of(_g_peek(self, 0));
+    self.at++;
+    bool first = true;
+    while (true) {
+        string name = _g_peek(self, 0);
+        self.at++;
+        string vt = type;
+        String wt;
+        wt.append(glsl_wgsl_type(type));
+        if (_g_is(self, "[")) {
+            self.at++;
+            string count = _g_peek(self, 0);
+            self.at++;
+            _g_expect(self, "]");
+            String arr;
+            arr.appendf("array<%s, %s>", (string)wt.data, count);
+            wt.free();
+            wt = arr;
+            vt = "";
+        }
+        GlslTranslator_declare(self, name, vt);
+        if (!first) {
+            out.append(in_for ? ", " : "");
+            if (!in_for) _g_indent(out, depth);
+        } else if (!in_for) {
+            _g_indent(out, depth);
+        }
+        out.appendf("%s %s: %s", constant ? "let" : "var", name, (string)wt.data);
+        wt.free();
+        if (_g_is(self, "=")) {
+            self.at++;
+            _GExpr e = _g_assign(self);
+            _g_splat(&e, _g_width(vt));
+            out.appendf(" = %s", (string)e.text.data);
+            e.text.free();
+        }
+        if (!in_for) out.append(";\n");
+        first = false;
+        if (_g_is(self, ",")) {
+            self.at++;
+            continue;
+        }
+        break;
+    }
+    if (!in_for) _g_expect(self, ";");
+}
+
+bool _g_starts_declaration(*GlslTranslator self) {
+    int k = 0;
+    if (_g_streq(_g_peek(self, k), "const")) k++;
+    while (_g_is_precision(_g_peek(self, k))) k++;
+    string t = _g_type_of(_g_peek(self, k));
+    return t[0] != 0 && _g_kind(self, k + 1) == _GT_IDENT;
+}
+
+void _g_skip_qualifiers(*GlslTranslator self, *bool constant) {
+    *constant = false;
+    if (_g_is(self, "const")) {
+        *constant = true;
+        self.at++;
+    }
+    while (_g_is_precision(_g_peek(self, 0))) self.at++;
+}
+
+// A statement as the body of if, for or while: always in braces in WGSL.
+void _g_body(*GlslTranslator self, *String out, int depth) {
+    out.append("{\n");
+    if (_g_is(self, "{")) {
+        self.at++;
+        while (!_g_is(self, "}") && _g_kind(self, 0) != _GT_END && self.error.len == 0) _g_statement(self, out, depth + 1);
+        _g_expect(self, "}");
+    } else {
+        _g_statement(self, out, depth + 1);
+    }
+    _g_indent(out, depth);
+    out.append("}");
+}
+
+void _g_statement(*GlslTranslator self, *String out, int depth) {
+    if (_g_is(self, ";")) {
+        self.at++;
+        return;
+    }
+    if (_g_is(self, "{")) {
+        _g_indent(out, depth);
+        _g_body(self, out, depth);
+        out.append("\n");
+        return;
+    }
+    if (_g_is(self, "if")) {
+        self.at++;
+        _g_expect(self, "(");
+        _GExpr c = _g_assign(self);
+        _g_expect(self, ")");
+        _g_indent(out, depth);
+        out.appendf("if (%s) ", (string)c.text.data);
+        c.text.free();
+        _g_body(self, out, depth);
+        while (_g_is(self, "else")) {
+            self.at++;
+            if (_g_is(self, "if")) {
+                self.at++;
+                _g_expect(self, "(");
+                _GExpr c2 = _g_assign(self);
+                _g_expect(self, ")");
+                out.appendf(" else if (%s) ", (string)c2.text.data);
+                c2.text.free();
+                _g_body(self, out, depth);
+            } else {
+                out.append(" else ");
+                _g_body(self, out, depth);
+                break;
+            }
+        }
+        out.append("\n");
+        return;
+    }
+    if (_g_is(self, "for")) {
+        self.at++;
+        _g_expect(self, "(");
+        _g_indent(out, depth);
+        out.append("for (");
+        if (_g_starts_declaration(self)) {
+            bool cst = false;
+            _g_skip_qualifiers(self, &cst);
+            _g_declaration(self, out, depth, false, true);
+        } else if (!_g_is(self, ";")) {
+            _GExpr i = _g_assign(self);
+            out.append((string)i.text.data);
+            i.text.free();
+        }
+        _g_expect(self, ";");
+        out.append("; ");
+        if (!_g_is(self, ";")) {
+            _GExpr c = _g_assign(self);
+            out.append((string)c.text.data);
+            c.text.free();
+        }
+        _g_expect(self, ";");
+        out.append("; ");
+        if (!_g_is(self, ")")) {
+            _GExpr s = _g_assign(self);
+            out.append((string)s.text.data);
+            s.text.free();
+        }
+        _g_expect(self, ")");
+        out.append(") ");
+        _g_body(self, out, depth);
+        out.append("\n");
+        return;
+    }
+    if (_g_is(self, "while")) {
+        self.at++;
+        _g_expect(self, "(");
+        _GExpr c = _g_assign(self);
+        _g_expect(self, ")");
+        _g_indent(out, depth);
+        out.appendf("while (%s) ", (string)c.text.data);
+        c.text.free();
+        _g_body(self, out, depth);
+        out.append("\n");
+        return;
+    }
+    if (_g_is(self, "discard") || _g_is(self, "break") || _g_is(self, "continue")) {
+        _g_indent(out, depth);
+        out.appendf("%s;\n", _g_peek(self, 0));
+        self.at++;
+        _g_expect(self, ";");
+        return;
+    }
+    if (_g_is(self, "return")) {
+        self.at++;
+        _g_indent(out, depth);
+        if (_g_is(self, ";")) out.append("return;\n");
+        else {
+            _GExpr e = _g_assign(self);
+            out.appendf("return %s;\n", (string)e.text.data);
+            e.text.free();
+        }
+        _g_expect(self, ";");
+        return;
+    }
+    if (_g_starts_declaration(self)) {
+        bool cst = false;
+        _g_skip_qualifiers(self, &cst);
+        _g_declaration(self, out, depth, cst, false);
+        return;
+    }
+    _GExpr e = _g_assign(self);
+    _g_indent(out, depth);
+    if (e.type != null && _g_streq(e.type, "block")) out.appendf("%s\n", (string)e.text.data);
+    else out.appendf("%s;\n", (string)e.text.data);
+    e.text.free();
+    _g_expect(self, ";");
+}
+
+// A translator that knows the given names (the modifier's structures, uniforms and
+// varyings) and samples textures with sampler.
+GlslTranslator glsl_translator(string sampler) {
+    GlslTranslator t;
+    t.sampler.append(sampler);
+    string[6] st = {"_surface", "_geometry", "_transforms", "_vertex", "_lightingContribution", "_light"};
+    string[6] ty = {"_surface", "_geometry", "_transforms", "_vertex", "_lighting", "_light"};
+    for (k in 0..6) GlslTranslator_declare(&t, st[k], ty[k]);
+    GlslTranslator_declare(&t, "_output_color", "vec4");
+    GlslTranslator_declare(&t, "camera_position", "vec3");
+    GlslTranslator_declare(&t, "v_texcoord", "vec2");
+    GlslTranslator_declare(&t, "v_surface_position", "vec3");
+    GlslTranslator_declare(&t, "gl_FragCoord", "vec4");
+    return t;
+}
+
+// Translates the GLSL statements of body into WGSL, appended to out at depth; false with
+// self.error set when it cannot.
+bool GlslTranslator_body(*GlslTranslator self, string body, *String out, int depth) {
+    List_clear(&self.toks);
+    self.at = 0;
+    _g_tokenize(self, body);
+    while (_g_kind(self, 0) != _GT_END && self.error.len == 0) _g_statement(self, out, depth);
+    for (i in 0..self.toks.size) self.toks.data[i].text.free();
+    List_clear(&self.toks);
+    return self.error.len == 0;
+}
+
+// A uniform or varying a modifier declares: its name and type (translator spelling).
+struct GlslDecl {
+    String name;
+    String type;
+}
+
+// Reads declarations from text: GLSL ("uniform highp float time;", "highp float d", one per
+// line or ';'-separated, "uniform" and the precision optional) or WGSL ("time: f32;",
+// "tex: texture_2d<f32>;"). Appends to out; false with error set on a line it cannot read.
+bool glsl_declarations(string text, *List<GlslDecl> out, *String error) {
+    if (text == null) return true;
+    String line;
+    int64 i = 0;
+    int64 n = (int64)strlen(text);
+    while (i <= n) {
+        char c = i < n ? text[i] : ';';
+        if (c == ';' || c == '\n' || c == ',') {
+            String t;
+            // trim
+            int64 a = 0;
+            int64 b = (int64)line.len;
+            while (a < b && (line.data[a] == ' ' || line.data[a] == '\t' || line.data[a] == '\r')) a++;
+            while (b > a && (line.data[b - 1] == ' ' || line.data[b - 1] == '\t' || line.data[b - 1] == '\r')) b--;
+            for (k in a..b) t.push(line.data[k]);
+            line.clear();
+            i++;
+            if (t.len == 0) {
+                t.free();
+                continue;
+            }
+            GlslDecl d;
+            string s = (string)t.data;
+            // WGSL: name: type
+            int64 colon = -1;
+            for (k in 0..(int64)t.len) {
+                if (s[k] == ':') {
+                    colon = k;
+                    break;
+                }
+            }
+            if (colon > 0) {
+                int64 ne = colon;
+                while (ne > 0 && s[ne - 1] == ' ') ne--;
+                int64 ns = 0;
+                if (strncmp(s, "var ", 4) == 0) ns = 4;
+                for (k in ns..ne) d.name.push(s[k]);
+                int64 ts = colon + 1;
+                while (ts < (int64)t.len && s[ts] == ' ') ts++;
+                String wt;
+                for (k in ts..(int64)t.len) wt.push(s[k]);
+                // back to the translator's spelling
+                string[17] w = {"f32", "i32", "u32", "vec2<f32>", "vec3<f32>", "vec4<f32>", "mat4x4<f32>", "mat3x3<f32>",
+                    "texture_2d<f32>", "vec2f", "vec3f", "vec4f", "mat4x4f", "mat3x3f", "vec2<i32>", "vec3<i32>", "vec4<i32>"};
+                string[17] g = {"f32", "i32", "u32", "vec2", "vec3", "vec4", "mat4", "mat3", "sampler", "vec2", "vec3", "vec4",
+                    "mat4", "mat3", "ivec2", "ivec3", "ivec4"};
+                bool known = false;
+                for (k in 0..17) {
+                    if (_g_streq((string)wt.data, w[k])) {
+                        d.type.append(g[k]);
+                        known = true;
+                        break;
+                    }
+                }
+                wt.free();
+                if (!known) {
+                    error.appendf("modifier: unknown type in '%s'", s);
+                    t.free();
+                    d.name.free();
+                    line.free();
+                    return false;
+                }
+            } else {
+                // GLSL: [uniform] [precision] type name
+                List<String> words;
+                String w;
+                for (k in 0..(int64)t.len + 1) {
+                    char ch = k < (int64)t.len ? s[k] : ' ';
+                    if (ch == ' ' || ch == '\t') {
+                        if (w.len > 0) {
+                            List_push(&words, w);
+                            String fresh;
+                            w = fresh;
+                        }
+                    } else {
+                        w.push(ch);
+                    }
+                }
+                w.free();
+                int at = 0;
+                while (at < words.size && (_g_streq((string)words.data[at].data, "uniform") || _g_streq((string)words.data[at].data, "in") ||
+                    _g_streq((string)words.data[at].data, "out") || _g_is_precision((string)words.data[at].data))) at++;
+                bool ok = at + 1 < words.size && _g_type_of((string)words.data[at].data)[0] != 0;
+                if (ok) {
+                    d.type.append(_g_type_of((string)words.data[at].data));
+                    d.name.append((string)words.data[at + 1].data);
+                }
+                for (k in 0..words.size) words.data[k].free();
+                words.free();
+                if (!ok) {
+                    error.appendf("modifier: cannot read the declaration '%s'", s);
+                    t.free();
+                    d.type.free();
+                    d.name.free();
+                    line.free();
+                    return false;
+                }
+            }
+            List_push(out, d);
+            t.free();
+            continue;
+        }
+        line.push(c);
+        i++;
+    }
+    line.free();
+    return true;
+}
+
+// Frees a translator.
+void GlslTranslator_free(*GlslTranslator self) {
+    for (i in 0..self.toks.size) self.toks.data[i].text.free();
+    self.toks.free();
+    for (i in 0..self.syms.size) self.syms.data[i].name.free();
+    self.syms.free();
+    self.error.free();
+    self.sampler.free();
+}

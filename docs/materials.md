@@ -106,4 +106,6 @@ Each material compiles to a variant: lighting model, alpha mode, blend mode (for
 materials) and sidedness, packed by `scene_material_key`. The renderer composes one WGSL
 shader per variant (`scene_material_shader`) the first time it is drawn and keeps its
 pipeline; every material with the same key shares it, and textures and factors are
-uniforms and bindings, not variants. `Scene_pipeline_count` says how many were made.
+uniforms and bindings, not variants. `Scene_pipeline_count` says how many were made. A
+material's shader modifier program (`SceneMaterial.shader`, see [shader
+modifiers](modifiers.md)) is part of its key.

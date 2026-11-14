@@ -86,6 +86,7 @@ Result<int, string> draw(*Gpu gpu, *GpuTexture target) {
 
 - [The scene graph](docs/scene-graph.md): nodes, cameras, meshes, glTF models
 - [Materials](docs/materials.md): lighting models, textures, alpha and blending
+- [Shader modifiers](docs/modifiers.md): ViroReact's GLSL modifiers, uniforms, varyings, WGSL
 - [Lights and shadows](docs/lights.md)
 - [Rendering, post-processing and the sky](docs/rendering.md)
 - [Examples, platforms, modules, tests and what is not there yet](docs/README.md)
