@@ -16,6 +16,7 @@ Guides and reference for scene. The [README](../README.md) has the overview.
 - [Physics](physics.md): rigid bodies, forces, collisions, ray and shape tests
 - [Property animations](animation.md): groups, easing, chains, loops
 - [Hit testing and events](input.md): rays, hit tests, click, drag, pinch, rotate, hover and fuse
+- [VR](vr.md): eyes, Cardboard, the reticle and controllers
 - [API reference](api.md): every public function and type
 <!-- /pages -->
 
@@ -58,6 +59,7 @@ macOS; on Linux and Windows, an SDL3 build from your package manager or libsdl.o
 | `<scene/animation>` | `SceneAnimations`: groups, easing curves, chains, playback |
 | `<scene/physics>` | `ScenePhysicsWorld`, bodies, shapes, forces, collision events, ray and shape tests |
 | `<scene/input>` | screen rays, hit tests, `SceneInput` and node events, `SceneOrbit` |
+| `<scene/vr>` | `Scene_render_eye`, `SceneCardboard`, `SceneReticle`, `SceneController` |
 
 ## Tests
 
@@ -84,6 +86,7 @@ Each test renders small images and reads them back:
 | `tests/modifiers.esk` | surface, geometry, vertex, lighting and fragment modifiers in GLSL, uniforms updated between frames, a texture uniform, a varying, swizzle assignments, splats, mod and ?:, a WGSL modifier, an unreadable body, a moved mesh casting its moved shadow, a varying in a lighting body, gl_FragCoord from the bottom, the previous frame's depth, the camera image |
 | `tests/ar.esk` | the camera picture behind an empty scene untouched by tone mapping, covered by an opaque surface, under a blended one and brightened by an additive one; a camera with its own projection drawing what the perspective camera draws, a shadow catcher over the camera softened by ambient light, a chroma key, depth occlusion through a depth image and its transform, an invisible occluder |
 | `tests/input.esk` | screen rays against the camera's field of view, hits on rotated, scaled and nested nodes, hidden and `ignore_events` nodes, bubbling to a handler, click states, fixed-distance and plane drags, pinch, rotation, hover hysteresis, fuse |
+| `tests/vr.esk` | each eye sees a box from its side and the camera is restored, field-of-view projections, a Cardboard frame with parallax in both halves, the Cardboard gaze with a head-locked reticle at the hit's depth and three pixels wide, its fuse arc and burst, a tap that clicks, a pointer controller's reticle on its hit, hiding the reticle |
 
 ## Not yet
 

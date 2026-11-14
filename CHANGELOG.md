@@ -8,6 +8,12 @@ All notable changes to this package are documented here. The format follows
 
 ### Added
 
+- `<scene/vr>`: `Scene_render_eye` (an eye's pose in the head and its projection, folded into
+  the projection so the camera node stays the head), `scene_fov_projection` from OpenXR-style
+  angles, `SceneCardboard` (both eyes side by side through Cardboard's lens polynomial),
+  `SceneReticle` (ViroReact's reticle: size, colors, fuse arc, burst and click pulse) and
+  `SceneController` (Cardboard gaze and tap, or a pointer's pose) driving `SceneInput`.
+  `docs/vr.md`, `tests/vr.esk`.
 - Triangle mesh bodies: `scene_physics_triangles` and `scene_physics_geometry` for static and
   kinematic bodies (the real world's mesh and depth in AR), with sphere and box contacts and
   ray tests.
