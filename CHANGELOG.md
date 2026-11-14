@@ -25,6 +25,11 @@ All notable changes to this package are documented here. The format follows
   camera with ViroReact's billboard rotation.
 - Frustum culling: nodes wholly outside the camera's view are not drawn (they still cast
   shadows).
+- `<scene/particles>`: `SceneParticleEmitter`, ViroParticleEmitter's model and timing:
+  rates per second and per meter, bursts, point, box and sphere spawn volumes, color,
+  alpha, scale, rotation, velocity and acceleration modifiers over time, distance or
+  speed, explosions, camera-facing quads with additive blending. `docs/particles.md`.
+- `Scene_set_geometry` writes in place when the new data fits the mesh's buffers.
 - `<scene/text>`: `Scene_add_text` and `SceneText_set` draw TrueType text (eskiu-lang/font,
   now a dependency) from a glyph atlas, laid out as ViroText: points at 0.01 world units, a
   box, word, character or no wrapping, justification, alignment, clipping, a line cap,

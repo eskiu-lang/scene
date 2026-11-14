@@ -7,6 +7,7 @@ Guides and reference for scene. The [README](../README.md) has the overview.
 - [Materials](materials.md): lighting models, textures, alpha and blending
 - [Lights and shadows](lights.md)
 - [Rendering, post-processing and the sky](rendering.md)
+- [Particles](particles.md): emitters, spawn volumes, bursts, modifiers
 - [Text](text.md): TrueType text laid out as ViroText
 - [Property animations](animation.md): groups, easing, chains, loops
 - [Hit testing and events](input.md): rays, hit tests, click, drag, pinch, rotate, hover and fuse
@@ -44,6 +45,7 @@ macOS; on Linux and Windows, an SDL3 build from your package manager or libsdl.o
 | `<scene/light>` | `SceneLight`, its constructors and falloff curves |
 | `<scene/post>` | `ScenePost`, tone mapping operators, CPU versions of the curves |
 | `<scene/sky>` | cube maps from six images |
+| `<scene/particles>` | `SceneParticleEmitter`, modifiers, bursts, spawn volumes |
 | `<scene/text>` | `SceneText`, `SceneTextStyle`, layout and glyph atlases over eskiu-lang/font |
 | `<scene/animation>` | `SceneAnimations`: groups, easing curves, chains, playback |
 | `<scene/input>` | screen rays, hit tests, `SceneInput` and node events |
@@ -57,6 +59,7 @@ Each test renders small images and reads them back:
 | `tests/graph.esk` | world matrices through parents, `look_at` under a rotated and scaled parent, reparenting, removal, the shapes' winding, normals and bounds, matrix decomposition, material keys, the CPU falloff and tone curves |
 | `tests/lighting.esk` | each lighting model on a sphere against its formula at ten pixels (linear output, within 0.006 + 1%) |
 | `tests/attenuation.esk` | point light falloff (exponent 2 and 1) and the spot cone along a profile, the influence mask, eight lights per draw |
+| `tests/particles.esk` | modifier intervals, the rate per second, the cap, bursts, a cycle without loop, motion, fixed and free particles, spawn volumes, an explosion, additive drawing |
 | `tests/text.esk` | sizes at 0.01 world units a point, word, character and no wrapping, justification, clipping and the line cap, alignment, rebuilding, the glyphs drawn inside their bounds |
 | `tests/transparency.esk` | back-to-front order of two transparent quads whatever order they were added, an opaque quad between them, each blend mode against its formula, node opacity on opaque and blended materials and down the tree, a texture with a masked quadrant |
 | `tests/post.esk` | each tone mapping operator at three exposures against `scene_tone_map`, sRGB encoding by the shader and by an sRGB target, bloom spreading and fading, its strength and threshold |
@@ -71,7 +74,6 @@ Each test renders small images and reads them back:
 These ViroReact renderer features are planned for later versions:
 
 - Portals (a window into another scene, through the stencil buffer).
-- Particle emitters.
 - Polylines and lines with a width.
 - Extruded 3D text, outlined and drop-shadow text strokes, and Knuth-Plass line breaks for justified text.
 - Post effects beyond bloom (color grading, vignette, depth of field, SSAO).
