@@ -115,6 +115,21 @@ floor.shadow_catcher = true;
 scene.add_object(placed, plane_mesh, scene.add_material(floor));
 ```
 
+## Chroma key
+
+`chroma_key` with `chroma_key_color` (ViroReact's `chromaKeyFilteringColor`) makes the
+colors near that color transparent, for a video shot on a green screen: the material's
+diffuse color (texture times color) is compared with the key in the chroma plane of YCrCb,
+and from 0.1 to 0.2 away it fades from transparent to opaque, as ViroReact's modifier does.
+The material is drawn blended.
+
+```eskiu
+SceneMaterial m = scene_material(SCENE_CONSTANT);
+m.diffuse_texture = video_texture;
+m.chroma_key = true;
+m.chroma_key_color = Vec3{0.0, 1.0, 0.0};
+```
+
 ## Shader variants
 
 Each material compiles to a variant: lighting model, alpha mode, blend mode (for blended

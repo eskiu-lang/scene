@@ -88,7 +88,9 @@ const int SCENE_TEX_OCCLUSION = 5;
 // shader modifiers from Scene_add_shader (0 for none), ViroReact's shaderModifiers.
 // shadow_catcher makes the surface invisible except for the shadows it receives, darkened
 // less as the ambient light grows (ViroReact's arShadowReceiver: a floor under an AR
-// object); it is drawn blended, writes no depth and casts nothing.
+// object); it is drawn blended, writes no depth and casts nothing. chroma_key makes the
+// colors near chroma_key_color transparent (ViroReact's chromaKeyFilteringColor, for
+// green-screen video).
 struct SceneMaterial {
     int lighting;
     Vec4 diffuse;
@@ -119,6 +121,8 @@ struct SceneMaterial {
     SceneUv[6] uv;
     int shader;
     bool shadow_catcher;
+    bool chroma_key;
+    Vec3 chroma_key_color;
 }
 
 // How the material's textures repeat past 0..1 (SceneMaterial.wrap_s, wrap_t; ViroReact's
@@ -143,7 +147,7 @@ SceneMaterial scene_material(int lighting) {
 }
 
 // The multiple of a key that holds the material's shader program (scene_key_shader).
-const int SCENE_KEY_SHADER = 32768;
+const int SCENE_KEY_SHADER = 65536;
 
 // The shader variant of a material: the lighting model, the alpha mode, the blend mode
 // (only for blended materials) and the sidedness, packed in one int. Materials with the
@@ -156,7 +160,7 @@ int scene_material_key(*SceneMaterial m) {
         blend = m.blend_mode < 0 || m.blend_mode > SCENE_BLEND_PREMULTIPLIED ? SCENE_BLEND_ALPHA : m.blend_mode;
     }
     return lighting + alpha * 8 + blend * 32 + (m.double_sided ? 256 : 0) + (m.skip_depth_test ? 1024 : 0) +
-        (m.skip_depth_write ? 2048 : 0) + (m.shadow_catcher ? 16384 : 0) + (m.shader > 0 ? m.shader * SCENE_KEY_SHADER : 0);
+        (m.skip_depth_write ? 2048 : 0) + (m.shadow_catcher ? 16384 : 0) + (m.chroma_key ? 32768 : 0) + (m.shader > 0 ? m.shader * SCENE_KEY_SHADER : 0);
 }
 
 // The shader program of a material key (0 for none).
@@ -209,8 +213,27 @@ bool scene_key_faded(int key) {
 
 // Whether a key draws blended: a BLEND material, a faded one or a shadow catcher.
 bool scene_key_blended(int key) {
-    return scene_key_alpha(key) == SCENE_ALPHA_BLEND || scene_key_faded(key) || scene_key_shadow_catcher(key);
+    return scene_key_alpha(key) == SCENE_ALPHA_BLEND || scene_key_faded(key) || scene_key_shadow_catcher(key) ||
+        scene_key_chroma(key);
 }
+
+// Whether a key filters a chroma key color (SceneMaterial.chroma_key).
+bool scene_key_chroma(int key) {
+    return (key / 32768) % 2 == 1;
+}
+
+// ViroReact's chroma key modifier: colors near the key (in YCrCb's chroma plane, 0.1 to 0.2
+// away) fade to transparent; the key is in mat.extra.yzw.
+string _scene_chroma_wgsl =
+    "    {\n"
+    "        let key = mat.extra.yzw;\n"
+    "        let my = 0.2989 * key.r + 0.5866 * key.g + 0.1145 * key.b;\n"
+    "        let mkey = vec2<f32>(0.7132 * (key.r - my), 0.5647 * (key.b - my));\n"
+    "        let c = s.base;\n"
+    "        let y = 0.2989 * c.r + 0.5866 * c.g + 0.1145 * c.b;\n"
+    "        let k = smoothstep(0.1, 0.2, distance(vec2<f32>(0.7132 * (c.r - y), 0.5647 * (c.b - y)), mkey));\n"
+    "        s.base = vec4<f32>(c.rgb * k, k);\n"
+    "    }\n";
 
 // Whether a key is a shadow catcher (SceneMaterial.shadow_catcher).
 bool scene_key_shadow_catcher(int key) {
@@ -486,13 +509,14 @@ void scene_material_shader_with(int key, *SceneShader prog, *String out) {
         String_append(out, _scene_classic_tail);
     }
     String_append(out, _scene_fs_head);
+    if (scene_key_chroma(key)) String_append(out, _scene_chroma_wgsl);
     if (alpha == SCENE_ALPHA_MASK) String_append(out, "    if (s.base.a < mat.emissive.w) { discard; }\n");
     String_append(out, "    var color = shade(s) + mat.emissive.rgb * e_s;\n");
     if (!scene_key_blended(key)) {
         String_append(out, "    return vec4<f32>(color, 1.0);\n}\n");
         return;
     }
-    if (alpha == SCENE_ALPHA_BLEND) {
+    if (alpha == SCENE_ALPHA_BLEND || scene_key_chroma(key)) {
         String_append(out, "    let alpha = clamp(s.base.a * draw.info.w, 0.0, 1.0);\n");
     } else {
         String_append(out, "    let alpha = clamp(draw.info.w, 0.0, 1.0);\n");
@@ -905,6 +929,7 @@ void _scene_modified_shader(int key, *SceneShader p, *String out) {
     }
     // the fragment stage
     out.append(_scene_fs_head);
+    if (scene_key_chroma(key)) out.append(_scene_chroma_wgsl);
     for (k in 0..p.varyings.size) {
         string n = (string)p.varyings.data[k].name.data;
         out.appendf("    var %s = v.%s;\n", n, n);
@@ -943,7 +968,7 @@ void _scene_modified_shader(int key, *SceneShader p, *String out) {
     out.append((string)lit.data);
     lit.free();
     out.append("    var color = shaded + mat.emissive.rgb * e_s;\n");
-    if (alpha == SCENE_ALPHA_BLEND) out.append("    var alpha = clamp(s.base.a * draw.info.w, 0.0, 1.0);\n");
+    if (alpha == SCENE_ALPHA_BLEND || scene_key_chroma(key)) out.append("    var alpha = clamp(s.base.a * draw.info.w, 0.0, 1.0);\n");
     else if (scene_key_blended(key)) out.append("    var alpha = clamp(draw.info.w, 0.0, 1.0);\n");
     else out.append("    var alpha = 1.0;\n");
     out.append("    var _output_color = vec4<f32>(color, alpha);\n");

@@ -1506,7 +1506,7 @@ Result<int, string> _scene_material_gpu(*Scene self, int id) {
         m.specular.x, m.specular.y, m.specular.z, m.shininess,
         m.emissive.x, m.emissive.y, m.emissive.z, m.alpha_cutoff,
         m.metalness, m.roughness, has_normal ? m.normal_scale : 0.0, has_occ ? m.occlusion_strength : 0.0,
-        m.diffuse_intensity, 0.0, 0.0, 0.0};
+        m.diffuse_intensity, m.chroma_key_color.x, m.chroma_key_color.y, m.chroma_key_color.z};
     // Each texture's coordinates: (a, b, c, d) and (tx, ty, set), u' = a u + b v + tx,
     // v' = c u + d v + ty, as KHR_texture_transform's T * R * S.
     for (k in 0..6) {

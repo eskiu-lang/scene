@@ -75,6 +75,7 @@ All notable changes to this package are documented here. The format follows
   depth), `camera_texture` and `camera_image_transform` (`Scene.camera_texture`,
   `Scene.camera_image_transform`); geometry modifiers apply to the shadow maps.
   `docs/modifiers.md`.
+- `SceneMaterial.chroma_key` and `chroma_key_color` (ViroReact's `chromaKeyFilteringColor`).
 - AR rendering: `SceneMaterial.shadow_catcher` (ViroReact's `arShadowReceiver`), a surface
   that shows only the shadows it receives; `Scene.camera_background` shows the camera picture behind the scene as it
   is (the scene over it as premultiplied color), and `scene_projection` /

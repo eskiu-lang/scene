@@ -2113,6 +2113,8 @@ struct SceneMaterial {
     SceneUv[6] uv;
     int shader;
     bool shadow_catcher;
+    bool chroma_key;
+    Vec3 chroma_key_color;
 }
 ```
 
@@ -2132,7 +2134,9 @@ metal-roughness, occlusion (SCENE_TEX_DIFFUSE and the others). shader is a progr
 shader modifiers from Scene_add_shader (0 for none), ViroReact's shaderModifiers.
 shadow_catcher makes the surface invisible except for the shadows it receives, darkened
 less as the ambient light grows (ViroReact's arShadowReceiver: a floor under an AR
-object); it is drawn blended, writes no depth and casts nothing.
+object); it is drawn blended, writes no depth and casts nothing. chroma_key makes the
+colors near chroma_key_color transparent (ViroReact's chromaKeyFilteringColor, for
+green-screen video).
 
 ### SCENE_WRAP_REPEAT, SCENE_WRAP_CLAMP, SCENE_WRAP_MIRROR
 
@@ -2169,7 +2173,7 @@ and occlusion strength 1, opaque, alpha cutoff 0.5, ALPHA blending, one-sided.
 ### SCENE_KEY_SHADER
 
 ```eskiu
-const int SCENE_KEY_SHADER = 32768;
+const int SCENE_KEY_SHADER = 65536;
 ```
 
 The multiple of a key that holds the material's shader program (scene_key_shader).
@@ -2266,6 +2270,14 @@ bool scene_key_blended(int key)
 ```
 
 Whether a key draws blended: a BLEND material, a faded one or a shadow catcher.
+
+### scene_key_chroma
+
+```eskiu
+bool scene_key_chroma(int key)
+```
+
+Whether a key filters a chroma key color (SceneMaterial.chroma_key).
 
 ### scene_key_shadow_catcher
 
