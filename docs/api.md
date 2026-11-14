@@ -2112,6 +2112,7 @@ struct SceneMaterial {
     int mip_filter;
     SceneUv[6] uv;
     int shader;
+    bool shadow_catcher;
 }
 ```
 
@@ -2129,6 +2130,9 @@ Texture ids come from the Scene that draws the material (0 is none). uv holds ho
 texture reads its coordinates, in the order diffuse, specular, normal, emissive,
 metal-roughness, occlusion (SCENE_TEX_DIFFUSE and the others). shader is a program of
 shader modifiers from Scene_add_shader (0 for none), ViroReact's shaderModifiers.
+shadow_catcher makes the surface invisible except for the shadows it receives, darkened
+less as the ambient light grows (ViroReact's arShadowReceiver: a floor under an AR
+object); it is drawn blended, writes no depth and casts nothing.
 
 ### SCENE_WRAP_REPEAT, SCENE_WRAP_CLAMP, SCENE_WRAP_MIRROR
 
@@ -2165,7 +2169,7 @@ and occlusion strength 1, opaque, alpha cutoff 0.5, ALPHA blending, one-sided.
 ### SCENE_KEY_SHADER
 
 ```eskiu
-const int SCENE_KEY_SHADER = 16384;
+const int SCENE_KEY_SHADER = 32768;
 ```
 
 The multiple of a key that holds the material's shader program (scene_key_shader).
@@ -2261,7 +2265,15 @@ Whether a key is faded (scene_key_fade).
 bool scene_key_blended(int key)
 ```
 
-Whether a key draws blended: a BLEND material, or a faded one.
+Whether a key draws blended: a BLEND material, a faded one or a shadow catcher.
+
+### scene_key_shadow_catcher
+
+```eskiu
+bool scene_key_shadow_catcher(int key)
+```
+
+Whether a key is a shadow catcher (SceneMaterial.shadow_catcher).
 
 ### scene_material_shader
 

@@ -1,7 +1,8 @@
 // AR rendering: the camera picture behind the scene (Scene.camera_background), covered by
 // opaque surfaces, mixed under blended ones and brightened by additive ones, untouched by
-// tone mapping; and a camera given its projection matrix (scene_projection) drawing what
-// the same perspective camera draws.
+// tone mapping; a camera given its projection matrix (scene_projection) drawing what the
+// same perspective camera draws; and a shadow catcher: invisible over the camera but where a
+// shadow falls on it, lighter with ambient light.
 import <io>;
 import <mem>;
 import <libc>;
@@ -111,8 +112,62 @@ Result<int, string> run() {
     return Ok<int, string>(0);
 }
 
+Result<int, string> catcher(*Gpu gpu) {
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.tone_mapping = SCENE_TONE_NONE;
+    scene.background = Vec4{0.0, 0.0, 0.0, 0.0};
+    scene.shadow_size = 512;
+    uint8[4] grey = {120, 120, 120, 255};
+    GpuImageOptions lo = GpuImageOptions{srgb: false};
+    scene.camera_background = scene.add_texture(gpu.image_with(1, 1, &grey[0], &lo)?);
+    SceneGeometry pg = scene_plane(4.0, 4.0);
+    int plane = scene.add_geometry(&pg)?;
+    pg.free();
+    SceneGeometry bg = scene_box(1.0, 0.2, 1.0);
+    int box = scene.add_geometry(&bg)?;
+    bg.free();
+    SceneMaterial cm = scene_material(SCENE_PBR);
+    cm.shadow_catcher = true;
+    scene.add_object(0, plane, scene.add_material(cm));
+    int occluder = scene.add_object(0, box, scene.add_material(scene_material(SCENE_LAMBERT)));
+    scene.node(occluder).position = Vec3{0.0, 1.0, 0.0};
+    int cam = scene.add_camera(0, scene_orthographic(4.0, 0.1, 20.0));
+    scene.node(cam).position = Vec3{0.0, 6.0, 0.0};
+    scene.look_at(cam, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 0.0, -1.0});
+    scene.set_camera(cam);
+    int sun = scene.add_light(scene_directional(Vec3{1.0, -1.0, 0.0}, Vec3{1.0, 1.0, 1.0}, 1.0));
+    scene.light(sun).casts_shadows = true;
+    GpuTexture target = gpu.target_with(64, 64, WGPUTextureFormat_RGBA8Unorm)?;
+    defer target.release();
+    *uint8 px = alloc<uint8>(64 * 64 * 4);
+    defer free(px);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    // ground point (x, z) of the top view at pixel ((x + 2) / 4 * 64, (z + 2) / 4 * 64)
+    int open = (int)px[(32 * 64 + 6) * 4];
+    int shade = (int)px[(32 * 64 + 48) * 4];
+    check("the catcher is invisible where nothing shadows it", near(open, 120, 1));
+    check("and black where the box's shadow falls", shade < 6);
+    scene.add_light(scene_ambient(Vec3{1.0, 1.0, 1.0}, 0.4));
+    scene.render_to(&target)?;
+    target.read(px)?;
+    shade = (int)px[(32 * 64 + 48) * 4];
+    // 40% ambient: the shadow 60% opaque, the camera at 40% (120 * 0.4 = 48)
+    check("ambient light softens the shadow", near(shade, 48, 4));
+    return Ok<int, string>(0);
+}
+
 int main() {
     Result<int, string> r = run();
+    if (r.ok) {
+        Result<Gpu, string> g = gpu_open();
+        if (g.ok) {
+            Gpu gpu = g.value;
+            r = catcher(&gpu);
+            gpu.release();
+        }
+    }
     if (!r.ok) {
         printf("FAIL %s\n", r.error);
         return 1;

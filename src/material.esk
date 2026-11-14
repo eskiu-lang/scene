@@ -86,6 +86,9 @@ const int SCENE_TEX_OCCLUSION = 5;
 // texture reads its coordinates, in the order diffuse, specular, normal, emissive,
 // metal-roughness, occlusion (SCENE_TEX_DIFFUSE and the others). shader is a program of
 // shader modifiers from Scene_add_shader (0 for none), ViroReact's shaderModifiers.
+// shadow_catcher makes the surface invisible except for the shadows it receives, darkened
+// less as the ambient light grows (ViroReact's arShadowReceiver: a floor under an AR
+// object); it is drawn blended, writes no depth and casts nothing.
 struct SceneMaterial {
     int lighting;
     Vec4 diffuse;
@@ -115,6 +118,7 @@ struct SceneMaterial {
     int mip_filter;
     SceneUv[6] uv;
     int shader;
+    bool shadow_catcher;
 }
 
 // How the material's textures repeat past 0..1 (SceneMaterial.wrap_s, wrap_t; ViroReact's
@@ -139,7 +143,7 @@ SceneMaterial scene_material(int lighting) {
 }
 
 // The multiple of a key that holds the material's shader program (scene_key_shader).
-const int SCENE_KEY_SHADER = 16384;
+const int SCENE_KEY_SHADER = 32768;
 
 // The shader variant of a material: the lighting model, the alpha mode, the blend mode
 // (only for blended materials) and the sidedness, packed in one int. Materials with the
@@ -152,7 +156,7 @@ int scene_material_key(*SceneMaterial m) {
         blend = m.blend_mode < 0 || m.blend_mode > SCENE_BLEND_PREMULTIPLIED ? SCENE_BLEND_ALPHA : m.blend_mode;
     }
     return lighting + alpha * 8 + blend * 32 + (m.double_sided ? 256 : 0) + (m.skip_depth_test ? 1024 : 0) +
-        (m.skip_depth_write ? 2048 : 0) + (m.shader > 0 ? m.shader * SCENE_KEY_SHADER : 0);
+        (m.skip_depth_write ? 2048 : 0) + (m.shadow_catcher ? 16384 : 0) + (m.shader > 0 ? m.shader * SCENE_KEY_SHADER : 0);
 }
 
 // The shader program of a material key (0 for none).
@@ -203,9 +207,14 @@ bool scene_key_faded(int key) {
     return (key / 512) % 2 == 1;
 }
 
-// Whether a key draws blended: a BLEND material, or a faded one.
+// Whether a key draws blended: a BLEND material, a faded one or a shadow catcher.
 bool scene_key_blended(int key) {
-    return scene_key_alpha(key) == SCENE_ALPHA_BLEND || scene_key_faded(key);
+    return scene_key_alpha(key) == SCENE_ALPHA_BLEND || scene_key_faded(key) || scene_key_shadow_catcher(key);
+}
+
+// Whether a key is a shadow catcher (SceneMaterial.shadow_catcher).
+bool scene_key_shadow_catcher(int key) {
+    return (key / 16384) % 2 == 1;
 }
 
 // Morph targets and skinning, shared by the scene and shadow vertex shaders: draw.morph is
@@ -441,6 +450,23 @@ void scene_material_shader(int key, *String out) {
 // scene_material_shader with the shader modifiers of prog (null for none) inserted where
 // ViroReact inserts them.
 void scene_material_shader_with(int key, *SceneShader prog, *String out) {
+    if (scene_key_shadow_catcher(key)) {
+        // ViroReact's VROARShadow: black, as opaque as the lights are shadowed here, less
+        // the ambient light's brightness
+        String_append(out, _scene_common_wgsl);
+        String_append(out, "@fragment fn fs(v: V, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {\n"
+            "    var n = normalize(v.normal);\n"
+            "    if (!front) { n = -n; }\n"
+            "    var total = 0.0;\n"
+            "    let count = u32(draw.info.x);\n"
+            "    for (var k = 0u; k < count; k++) {\n"
+            "        total += 1.0 - shadow_at(draw_light(k), v.world, n);\n"
+            "    }\n"
+            "    let ambient = dot(frame.ambient.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));\n"
+            "    let a = max(min(1.0, total) - ambient, 0.0) * clamp(draw.info.w, 0.0, 1.0);\n"
+            "    return vec4<f32>(0.0, 0.0, 0.0, a);\n}\n");
+        return;
+    }
     if (prog != null && prog.modifiers.size > 0) {
         _scene_modified_shader(key, prog, out);
         return;

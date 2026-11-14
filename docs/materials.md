@@ -100,6 +100,21 @@ the material's textures; a glTF material takes its base color texture's sampler.
 and `writesToDepthBuffer` set to false). With a node's `rendering_order` they put a panel
 or a label on top of the scene.
 
+## Shadow catcher
+
+`SceneMaterial.shadow_catcher` (ViroReact's `arShadowReceiver`) makes a surface show only the
+shadows it receives: elsewhere it is invisible. Put one under an AR object, on the real floor,
+and the object casts its shadow on the camera picture. As ViroReact's `VROARShadow`, it is
+black with an opacity of the lights' shadow on it (1 minus their visibility, summed and
+capped at 1) less the ambient light's brightness, so a brighter room gives softer shadows. It
+is drawn blended, writes no depth and casts no shadow; the lights must cast shadows.
+
+```eskiu
+SceneMaterial floor = scene_material(SCENE_PBR);
+floor.shadow_catcher = true;
+scene.add_object(placed, plane_mesh, scene.add_material(floor));
+```
+
 ## Shader variants
 
 Each material compiles to a variant: lighting model, alpha mode, blend mode (for blended
