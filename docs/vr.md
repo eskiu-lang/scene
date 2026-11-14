@@ -92,7 +92,9 @@ w.write(&scene, &color, &depth, true)?;   // true: reverse-Z, 1 at near, as visi
 ```
 
 The reversed value is `1 - d`, which is the same projection with reverse-Z for the same near
-and far planes.
+and far planes. Where nothing was drawn (`d = 1`) it writes the smallest depth above 0: the
+visionOS compositor takes depth 0 as empty and drops it in tiles, so a background written at
+0 would show only in blocks around the objects.
 
 ## Headsets: visionOS and Quest
 
@@ -118,10 +120,25 @@ times the view's transform; the color texture is wrapped with `Gpu_texture_from_
 the views are drawn, the loop waits for the GPU and presents the drawable.
 
 ```sh
-examples/xr/visionos/build.sh       # build/EskiuXR.app for the simulator (SDK=xros: a device)
+examples/xr/visionos/build.sh       # build/EskiuXR.app for the simulator
 xcrun simctl install booted examples/xr/visionos/build/EskiuXR.app
 xcrun simctl launch booted dev.eskiu.scene.xr
 ```
+
+On a Vision Pro the app has to be signed with a provisioning profile, which Xcode makes:
+`SDK=xros build.sh` builds the scene's object for the device, and `EskiuXR.xcodeproj` (the
+same `App.swift` and `host.m`, linking that object and wgpu-native) builds and signs the app:
+
+```sh
+SDK=xros examples/xr/visionos/build.sh
+xcodebuild -project examples/xr/visionos/EskiuXR.xcodeproj -scheme EskiuXR -destination 'id=DEVICE' \
+    -allowProvisioningUpdates DEVELOPMENT_TEAM=TEAM ESKIU_BUNDLE_ID=your.bundle.id build
+```
+
+It runs on a Vision Pro. The layer turns foveation off: the views are drawn at an even
+resolution without the drawables' rasterization rate maps, which the compositor would
+otherwise warp (a fisheye look on the device; the simulator has no foveation). The scene
+also smooths edges with `SCENE_EFFECT_FXAA`, the views having no multisampling.
 
 Each view's depth goes into the drawable's depth texture (`SceneDepthWriter`, reversed, with
 the drawable's depth range set to the scene's planes; the compositor wants a near plane of

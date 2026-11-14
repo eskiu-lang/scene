@@ -39,6 +39,8 @@ Result<int, string> _xr_build() {
     xr_gpu = gpu_open()?;
     xr_scene = xr_gpu.scene()?;
     xr_scene.background = Vec4{0.05, 0.06, 0.09, 1.0};
+    // the views are drawn without multisampling: smooth the edges in the post pass
+    xr_scene.post.effects[0] = SCENE_EFFECT_FXAA;
     SceneGeometry box = scene_box(0.3, 0.3, 0.3);
     int box_mesh = xr_scene.add_geometry(&box)?;
     box.free();

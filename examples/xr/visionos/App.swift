@@ -8,6 +8,9 @@ struct XRConfiguration: CompositorLayerConfiguration {
         configuration.colorFormat = .bgra8Unorm_srgb
         configuration.depthFormat = .depth32Float
         configuration.layout = .dedicated
+        // the views are drawn at an even resolution, without the drawable's rasterization rate
+        // maps; with foveation the compositor would read them as foveated and warp them
+        configuration.isFoveationEnabled = false
     }
 }
 

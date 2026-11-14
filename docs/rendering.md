@@ -101,6 +101,7 @@ as it is displayed (tone mapped, and sRGB-encoded when `gamma` is on), with Viro
 | `SCENE_EFFECT_INVERTED` | `inverted` | one minus the color |
 | `SCENE_EFFECT_SWIRL` | `swirldistortion` | a swirl in a circle, turning back and forth with `post.time` |
 | `SCENE_EFFECT_ZOOM` | `zoomindistortion` | a circle magnified twice |
+| `SCENE_EFFECT_FXAA` | (none) | antialiasing (FXAA) of the displayed image; put it first |
 
 ```eskiu
 scene.post.effects[0] = SCENE_EFFECT_SEPIA;

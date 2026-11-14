@@ -84,6 +84,10 @@ const int SCENE_EFFECT_INVERTED = 10;
 const int SCENE_EFFECT_SWIRL = 11;
 // The circle inside ScenePost.window magnified twice.
 const int SCENE_EFFECT_ZOOM = 12;
+// Antialiasing of the displayed image (FXAA): edges are found by luminance and blended
+// along their direction. Not one of ViroReact's; put it first, before effects that move
+// pixels. Headset views, drawn without multisampling, need it most.
+const int SCENE_EFFECT_FXAA = 13;
 
 // The effect ViroReact names name ("grayscale", "sepia", "sincity", "baralleldistortion",
 // "pincushiondistortion", "thermalvision", "crosshatch", "pixelated", "toonify",
@@ -302,6 +306,26 @@ string _scene_effect_text(int e) {
         "    let edge = clamp(5.0 * delta, 0.0, 1.0);\n"
         "    if (edge >= 0.5) { return vec3<f32>(0.0); }\n    return c;\n";
     if (e == SCENE_EFFECT_INVERTED) return "    return 1.0 - prev(uv);\n";
+    if (e == SCENE_EFFECT_FXAA) return "    let px = vec2<f32>(1.0 / post.c.x, 1.0 / post.c.y);\n"
+        "    let lw = vec3<f32>(0.299, 0.587, 0.114);\n"
+        "    let m = prev(uv);\n"
+        "    let lm = dot(m, lw);\n"
+        "    let lnw = dot(prev(uv + vec2<f32>(-1.0, -1.0) * px), lw);\n"
+        "    let lne = dot(prev(uv + vec2<f32>(1.0, -1.0) * px), lw);\n"
+        "    let lsw = dot(prev(uv + vec2<f32>(-1.0, 1.0) * px), lw);\n"
+        "    let lse = dot(prev(uv + vec2<f32>(1.0, 1.0) * px), lw);\n"
+        "    let lmin = min(lm, min(min(lnw, lne), min(lsw, lse)));\n"
+        "    let lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));\n"
+        "    if (lmax - lmin < max(0.0312, lmax * 0.125)) { return m; }\n"
+        "    var dir = vec2<f32>(-((lnw + lne) - (lsw + lse)), (lnw + lsw) - (lne + lse));\n"
+        "    let reduce = max((lnw + lne + lsw + lse) * 0.03125, 1.0 / 128.0);\n"
+        "    let rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);\n"
+        "    dir = clamp(dir * rcp, vec2<f32>(-8.0), vec2<f32>(8.0)) * px;\n"
+        "    let a = 0.5 * (prev(uv + dir * (1.0 / 3.0 - 0.5)) + prev(uv + dir * (2.0 / 3.0 - 0.5)));\n"
+        "    let b = a * 0.5 + 0.25 * (prev(uv - dir * 0.5) + prev(uv + dir * 0.5));\n"
+        "    let lb = dot(b, lw);\n"
+        "    if (lb < lmin || lb > lmax) { return a; }\n"
+        "    return b;\n";
     return "    return prev(uv);\n";
 }
 

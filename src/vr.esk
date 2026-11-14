@@ -548,13 +548,15 @@ string _scene_depth_copy_wgsl =
     "@fragment fn fs_reverse(v: V) -> F {\n"
     "    var f: F;\n"
     "    f.color = vec4<f32>(0.0);\n"
-    "    f.depth = 1.0 - textureLoad(depth_tex, vec2<i32>(v.pos.xy), 0);\n"
+    "    f.depth = max(1.0 - textureLoad(depth_tex, vec2<i32>(v.pos.xy), 0), 1e-6);\n"
     "    return f;\n"
     "}\n";
 
 // Writes scene's last depth into depth (a depth texture as large as color, color being the
 // texture that frame was drawn into). reverse writes 1 - d: the same projection with
-// reverse-Z, as visionOS wants.
+// reverse-Z, as visionOS wants; the background (d = 1) gets the smallest depth above 0
+// instead of 0, since visionOS's compositor drops what is at depth 0 as empty (in tiles,
+// so the background would show only around the objects).
 Result<int, string> SceneDepthWriter_write(*SceneDepthWriter self, *Scene scene, *GpuTexture color, *GpuTexture depth, bool reverse) {
     *_SceneRenderer r = &scene._r;
     if (r.w != color.width || r.h != color.height || depth.width != color.width || depth.height != color.height) {
