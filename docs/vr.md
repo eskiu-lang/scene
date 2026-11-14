@@ -139,15 +139,19 @@ the pose and field of view `xrLocateViews` gives in the stage space (local space
 is no stage). With `XR_KHR_composition_layer_depth` it also makes a `D32_SFLOAT` depth
 swapchain per eye, writes each eye's depth into it (`SceneDepthWriter`, forward) and chains
 it to the projection view, for the runtime's reprojection. Input is an action set with each
-hand's aim pose and trigger, bound for the Touch controllers and the simple controller; the
-hand whose trigger was pulled last points.
+hand's aim pose and trigger, bound for the Touch controllers, the simple controller and, with
+`XR_EXT_hand_interaction`, the hands' pinch; the hand whose trigger was pulled last points.
 
 ```sh
 OPENXR_DIR=path/to/openxr_loader_for_android examples/xr/quest/build.sh   # build/EskiuXR.apk
 adb install -r examples/xr/quest/build/EskiuXR.apk
 ```
 
-`OPENXR_DIR` is Khronos' `openxr_loader_for_android` AAR, extracted. The APK builds and its
-library links with every symbol resolved, but it has not run on a headset yet: OpenXR wants
-the Vulkan device to carry the extensions `xrGetVulkanDeviceExtensionsKHR` lists, and wgpu
-made the device, so the host logs that list (tag `eskiu-xr`) for the first run on a device.
+`OPENXR_DIR` is Khronos' `openxr_loader_for_android` AAR, extracted. It runs on a Quest 3
+(`quest/quest3.png`, the compositor's view of both eyes). OpenXR wants the Vulkan device to
+carry the extensions `xrGetVulkanDeviceExtensionsKHR` lists, and wgpu makes the device, so the
+host hands that list to `wgpuSetVulkanDeviceExtensions` before the scene opens the GPU (without
+them `xrCreateSession` fails with `XR_ERROR_INITIALIZATION_FAILED`). Each hand shows its
+controller: a small body and a laser along the aim pose to what it points at, with the
+scene's reticle there; hands without controllers point and pinch through
+`XR_EXT_hand_interaction` (the manifest asks for hand tracking).

@@ -28,6 +28,10 @@ int xr_scene_render(uint64_t image, uint32_t width, uint32_t height, int format,
 void xr_scene_wait(void);
 int xr_scene_vulkan(void **instance, void **physical_device, void **device, uint32_t *queue_family, uint32_t *queue_index);
 void xr_scene_pointer(float ox, float oy, float oz, float dx, float dy, float dz, bool down, bool active);
+void xr_scene_hand(int h, bool tracked, float px, float py, float pz, float qx, float qy, float qz, float qw, float length);
+float xr_scene_ray_length(float ox, float oy, float oz, float dx, float dy, float dz);
+// wgpu-native's eskiu branch: Vulkan device extensions besides wgpu's own
+void wgpuSetVulkanDeviceExtensions(char const *const *names, size_t count);
 
 #define WGPU_RGBA8_SRGB 0x17
 #define WGPU_DEPTH32FLOAT 0x30
@@ -53,6 +57,7 @@ typedef struct {
     XrSessionState state;
     bool running;
     bool depth_layer;
+    bool hand_interaction;
     XrActionSet actions;
     XrAction aim, trigger;
     XrPath hands[2];
@@ -115,6 +120,18 @@ static bool xr_actions(Xr *xr) {
     sb.interactionProfile = path(xr, "/interaction_profiles/khr/simple_controller");
     sb.suggestedBindings = simple;
     xrSuggestInteractionProfileBindings(xr->instance, &sb);
+    if (xr->hand_interaction) {
+        XrActionSuggestedBinding hands[4] = {
+            {xr->aim, path(xr, "/user/hand/left/input/aim/pose")},
+            {xr->aim, path(xr, "/user/hand/right/input/aim/pose")},
+            {xr->trigger, path(xr, "/user/hand/left/input/pinch_ext/value")},
+            {xr->trigger, path(xr, "/user/hand/right/input/pinch_ext/value")},
+        };
+        sb.interactionProfile = path(xr, "/interaction_profiles/ext/hand_interaction_ext");
+        sb.suggestedBindings = hands;
+        XrResult r = xrSuggestInteractionProfileBindings(xr->instance, &sb);
+        LOG("hand interaction bindings: %d", (int)r);
+    }
     for (int h = 0; h < 2; h++) {
         XrActionSpaceCreateInfo asi = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
         asi.action = xr->aim;
@@ -149,18 +166,30 @@ static void xr_input(Xr *xr, XrTime time) {
             if (b.changedSinceLastSync && b.currentState) xr->hand = h;
         }
     }
+    // both hands' controllers; the hand whose button was pressed last points
+    bool tracked[2] = {false, false};
+    float mats[2][16];
+    for (int k = 0; k < 2; k++) {
+        XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+        tracked[k] = XR_SUCCEEDED(xrLocateSpace(xr->aim_spaces[k], xr->space, time, &loc))
+            && (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+            && (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+        float len = 0;
+        if (tracked[k]) {
+            pose_matrix(loc.pose, mats[k]);
+            // the aim pose points along its -Z
+            len = xr_scene_ray_length(mats[k][12], mats[k][13], mats[k][14], -mats[k][8], -mats[k][9], -mats[k][10]);
+        }
+        xr_scene_hand(k, tracked[k], loc.pose.position.x, loc.pose.position.y, loc.pose.position.z,
+                      loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w, len);
+    }
+    if (!tracked[xr->hand] && tracked[1 - xr->hand]) xr->hand = 1 - xr->hand;
     int h = xr->hand;
-    XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
-    bool tracked = XR_SUCCEEDED(xrLocateSpace(xr->aim_spaces[h], xr->space, time, &loc))
-        && (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
-        && (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
-    if (!tracked) {
+    if (!tracked[h]) {
         xr_scene_pointer(0, 0, 0, 0, 0, -1, false, false);
         return;
     }
-    float m[16];
-    pose_matrix(loc.pose, m);
-    // the aim pose points along its -Z
+    float *m = mats[h];
     xr_scene_pointer(m[12], m[13], m[14], -m[8], -m[9], -m[10], pressed[h], true);
 }
 
@@ -173,7 +202,7 @@ static bool xr_start(Xr *xr, struct android_app *app) {
         li.applicationContext = app->activity->clazz;
         init_loader((XrLoaderInitInfoBaseHeaderKHR *)&li);
     }
-    const char *exts[3] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME};
+    const char *exts[4] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME};
     uint32_t ext_count = 2;
     // the depth layer lets the runtime reproject by depth, when it has the extension
     XrExtensionProperties props[128];
@@ -184,6 +213,11 @@ static bool xr_start(Xr *xr, struct android_app *app) {
         if (strcmp(props[i].extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0) {
             exts[ext_count++] = XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME;
             xr->depth_layer = true;
+        }
+        // hands: an aim pose and a pinch like a controller's
+        if (strcmp(props[i].extensionName, "XR_EXT_hand_interaction") == 0) {
+            exts[ext_count++] = "XR_EXT_hand_interaction";
+            xr->hand_interaction = true;
         }
     }
     XrInstanceCreateInfoAndroidKHR ai = {XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -205,14 +239,18 @@ static bool xr_start(Xr *xr, struct android_app *app) {
     xrGetInstanceProcAddr(xr->instance, "xrGetVulkanGraphicsRequirementsKHR", (PFN_xrVoidFunction *)&reqs_fn);
     XrGraphicsRequirementsVulkanKHR reqs = {XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
     CHECK(reqs_fn(xr->instance, xr->system, &reqs));
-    // the device extensions the runtime needs; wgpu made the device, so a missing one shows
-    // here first when the session fails
+    // the device extensions the runtime needs (a space-separated list): wgpu makes the
+    // device, so they go to it before the scene opens the GPU
     PFN_xrGetVulkanDeviceExtensionsKHR exts_fn = NULL;
     xrGetInstanceProcAddr(xr->instance, "xrGetVulkanDeviceExtensionsKHR", (PFN_xrVoidFunction *)&exts_fn);
-    char dev_exts[2048];
+    static char dev_exts[2048];
     uint32_t dev_len = 0;
     if (exts_fn && XR_SUCCEEDED(exts_fn(xr->instance, xr->system, sizeof dev_exts, &dev_len, dev_exts))) {
         LOG("the runtime asks for Vulkan device extensions: %s", dev_exts);
+        const char *names[32];
+        size_t count = 0;
+        for (char *p = strtok(dev_exts, " "); p != NULL && count < 32; p = strtok(NULL, " ")) names[count++] = p;
+        wgpuSetVulkanDeviceExtensions(names, count);
     }
 
     if (xr_scene_open() != 0) {
@@ -279,7 +317,8 @@ static bool xr_start(Xr *xr, struct android_app *app) {
         }
     }
     if (!xr_actions(xr)) LOG("no controller actions");
-    LOG("session ready: %ux%u per eye", xr->eyes[0].width, xr->eyes[0].height);
+    LOG("session ready: %ux%u per eye, %u images (first %p), depth layer %d", xr->eyes[0].width, xr->eyes[0].height,
+        xr->eyes[0].count, (void *)xr->eyes[0].images[0].image, (int)xr->depth_layer);
     return true;
 }
 
@@ -382,9 +421,11 @@ static double now_seconds(void) {
 }
 
 void android_main(struct android_app *app) {
+    LOG("android_main");
     Xr xr;
     memset(&xr, 0, sizeof xr);
     if (!xr_start(&xr, app)) {
+        LOG("the session did not start");
         ANativeActivity_finish(app->activity);
     }
     double last = now_seconds();

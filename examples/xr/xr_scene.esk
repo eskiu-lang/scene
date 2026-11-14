@@ -24,6 +24,8 @@ SceneInput xr_input;
 SceneController xr_pointer;
 bool xr_pointer_active = false;
 float[3] xr_angles;
+int[2] xr_hands;
+int[2] xr_lasers;
 bool[3] xr_paused;
 
 void _xr_clicked(*SceneEvent e) {
@@ -61,6 +63,26 @@ Result<int, string> _xr_build() {
     xr_scene.set_camera(cam);
     xr_input = scene_input();
     for (i in 0..3) xr_input.on(xr_boxes[i], SCENE_ON_CLICK, _xr_clicked);
+    // each hand's controller: a small body and a laser along its aim (-Z), hidden until tracked
+    SceneGeometry body = scene_box(0.025, 0.025, 0.1);
+    int body_mesh = xr_scene.add_geometry(&body)?;
+    body.free();
+    SceneGeometry beam = scene_box(0.003, 0.003, 1.0);
+    int beam_mesh = xr_scene.add_geometry(&beam)?;
+    beam.free();
+    SceneMaterial bm = scene_material(SCENE_BLINN);
+    bm.diffuse = Vec4{0.85, 0.85, 0.9, 1.0};
+    SceneMaterial lm = scene_material(SCENE_CONSTANT);
+    lm.diffuse = Vec4{0.3, 0.9, 1.0, 1.0};
+    int body_mat = xr_scene.add_material(bm);
+    int beam_mat = xr_scene.add_material(lm);
+    for (h in 0..2) {
+        xr_hands[h] = xr_scene.add_object(0, body_mesh, body_mat);
+        xr_lasers[h] = xr_scene.add_object(xr_hands[h], beam_mesh, beam_mat);
+        xr_scene.node(xr_hands[h]).visible = false;
+        xr_scene.node(xr_hands[h]).ignore_events = true;
+        xr_scene.node(xr_lasers[h]).ignore_events = true;
+    }
     xr_pointer = scene_controller(&xr_scene, SCENE_CONTROLLER_POINTER);
     xr_pointer.show_reticle(false);
     return Ok<int, string>(0);
@@ -92,6 +114,31 @@ export void xr_scene_step(float dt) {
         Result<int, string> r = xr_pointer.update(&xr_scene, &xr_input, (double)xr_time);
         if (r.ok == 0) println_err(r.error);
     }
+}
+
+// Places hand h's controller (0 left, 1 right) at an aim pose in world space, its laser
+// reaching length meters (to what it points at); tracked false hides it.
+export void xr_scene_hand(int h, bool tracked, float px, float py, float pz, float qx, float qy, float qz, float qw, float length) {
+    if (!xr_open || h < 0 || h > 1) return;
+    *SceneNode n = xr_scene.node(xr_hands[h]);
+    n.visible = tracked;
+    if (!tracked) return;
+    n.position = Vec3{px, py, pz};
+    n.rotation = Quat{qx, qy, qz, qw};
+    float len = length > 0.05 ? length : 3.0;
+    *SceneNode l = xr_scene.node(xr_lasers[h]);
+    l.scale = Vec3{1.0, 1.0, len};
+    l.position = Vec3{0.0, 0.0, -0.05 - len / 2.0};
+}
+
+// How far the ray from (ox, oy, oz) along (dx, dy, dz) reaches before it hits a node, 0
+// when it hits nothing (the laser then keeps its default length).
+export float xr_scene_ray_length(float ox, float oy, float oz, float dx, float dy, float dz) {
+    if (!xr_open) return 0.0;
+    SceneHit hit;
+    SceneRay ray = SceneRay{origin: Vec3{ox, oy, oz}, dir: Vec3{dx, dy, dz}.normalize()};
+    if (!xr_scene.hit_test(ray, &hit)) return 0.0;
+    return hit.distance;
 }
 
 // The rotation that turns -Z to the unit direction d.
