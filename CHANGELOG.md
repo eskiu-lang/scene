@@ -25,6 +25,10 @@ All notable changes to this package are documented here. The format follows
   camera with ViroReact's billboard rotation.
 - Frustum culling: nodes wholly outside the camera's view are not drawn (they still cast
   shadows).
+- `<scene/gif>`: a GIF decoder in Eskiu (LZW, color tables, interlacing, transparency,
+  disposal, loop count) and `SceneAnimatedImage`, ViroAnimatedImage's playback into a texture.
+  `Scene_borrow_texture` shows a texture the caller keeps, such as a video frame from
+  `<gpu/yuv>` (ViroReact's video materials). `docs/images.md`.
 - Spot light shadows, as in ViroReact: a perspective shadow map as wide as the outer
   cone, `SceneLight.shadow_near` and `shadow_far`.
 - `SceneOrbit` (ViroOrbitCamera): a camera circling a target, turned by a drag and

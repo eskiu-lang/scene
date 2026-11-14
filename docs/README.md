@@ -7,6 +7,7 @@ Guides and reference for scene. The [README](../README.md) has the overview.
 - [Materials](materials.md): lighting models, textures, alpha and blending
 - [Lights and shadows](lights.md)
 - [Rendering, post-processing and the sky](rendering.md)
+- [Animated images and video](images.md): GIFs, video frames on surfaces and as a 360 sky
 - [Portals](portals.md): worlds seen through windows, walking through them
 - [Polygons and polylines](shapes.md)
 - [Particles](particles.md): emitters, spawn volumes, bursts, modifiers
@@ -47,6 +48,7 @@ macOS; on Linux and Windows, an SDL3 build from your package manager or libsdl.o
 | `<scene/light>` | `SceneLight`, its constructors and falloff curves |
 | `<scene/post>` | `ScenePost`, tone mapping operators, CPU versions of the curves |
 | `<scene/sky>` | cube maps from six images |
+| `<scene/gif>` | `gif_decode`, `gif_load`, `SceneAnimatedImage` |
 | `<scene/shapes>` | `scene_polygon` (holes, uv bounds), `ScenePolyline` (camera-facing ribbons) |
 | `<scene/particles>` | `SceneParticleEmitter`, modifiers, bursts, spawn volumes |
 | `<scene/text>` | `SceneText`, `SceneTextStyle`, layout and glyph atlases over eskiu-lang/font |
@@ -59,6 +61,7 @@ Each test renders small images and reads them back:
 
 | Test | What it checks |
 |---|---|
+| `tests/gif.esk` | GIF frames with disposal, transparency, interlacing and loop count against a file made by a standard encoder; playback timing, looping, pausing, the last frame; a borrowed texture shown and rebound |
 | `tests/graph.esk` | world matrices through parents, `look_at` under a rotated and scaled parent, reparenting, removal, the shapes' winding, normals and bounds, matrix decomposition, material keys, the CPU falloff and tone curves |
 | `tests/lighting.esk` | each lighting model on a sphere against its formula at ten pixels (linear output, within 0.006 + 1%) |
 | `tests/attenuation.esk` | point light falloff (exponent 2 and 1) and the spot cone along a profile, the influence mask, eight lights per draw |

@@ -39,6 +39,8 @@ pipeline.
   output.
 - **Sky.** A solid color, a cube map from `<gpu/ibl>` or six images, a 360 image, and
   image-based lighting for PBR materials.
+- **Images and video.** Animated GIFs decoded in Eskiu, and video frames from
+  eskiu-lang/video on surfaces or as a 360 sky.
 - **Portals.** ViroPortalScene's worlds seen through windows, with their own skies, that the
   camera can walk into.
 - **Shapes.** ViroPolygon's polygons with holes and ViroPolyline's camera-facing lines.
