@@ -16,6 +16,7 @@ import <mem>;
 import <libc>;
 import <result>;
 import <list>;
+import <string>;
 import <gpu/raw>;
 import <gpu/core>;
 import <gpu/render>;
@@ -48,6 +49,47 @@ struct ScenePost {
     float bloom_threshold;
     float bloom_strength;
     int bloom_passes;
+    int[8] effects;
+}
+
+// Post-process effects (ScenePost.effects, applied in order, 0 for an empty slot):
+// ViroReact's postProcessEffects with its formulas, on the displayed (tone mapped and,
+// with gamma, sRGB-encoded) image.
+const int SCENE_EFFECT_NONE = 0;
+const int SCENE_EFFECT_GRAYSCALE = 1;
+const int SCENE_EFFECT_SEPIA = 2;
+const int SCENE_EFFECT_SINCITY = 3;
+const int SCENE_EFFECT_BARREL = 4;
+const int SCENE_EFFECT_PINCUSHION = 5;
+const int SCENE_EFFECT_THERMAL = 6;
+const int SCENE_EFFECT_CROSSHATCH = 7;
+const int SCENE_EFFECT_PIXELATED = 8;
+const int SCENE_EFFECT_TOONIFY = 9;
+const int SCENE_EFFECT_INVERTED = 10;
+
+// The effect ViroReact names name ("grayscale", "sepia", "sincity", "baralleldistortion",
+// "pincushiondistortion", "thermalvision", "crosshatch", "pixelated", "toonify",
+// "inverted"; any case), or SCENE_EFFECT_NONE.
+int scene_effect_named(string name) {
+    string[10] names = {"grayscale", "sepia", "sincity", "baralleldistortion", "pincushiondistortion", "thermalvision",
+        "crosshatch", "pixelated", "toonify", "inverted"};
+    if (name == null) return SCENE_EFFECT_NONE;
+    for (k in 0..10) {
+        string a = names[k];
+        int i = 0;
+        bool same = true;
+        while (a[i] != 0 || name[i] != 0) {
+            char x = name[i];
+            if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+            if (x != a[i]) {
+                same = false;
+                break;
+            }
+            i++;
+        }
+        if (same) return k + 1;
+    }
+    return SCENE_EFFECT_NONE;
 }
 
 float _scene_hable(float x) {
@@ -88,7 +130,7 @@ float scene_linear(float c) {
 }
 
 string _scene_post_wgsl =
-    "struct Post { a: vec4<f32>, b: vec4<f32> };\n"
+    "struct Post { a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32> };\n"
     "@group(0) @binding(0) var<uniform> post: Post;\n"
     "@group(0) @binding(1) var src: texture_2d<f32>;\n"
     "@group(0) @binding(2) var samp: sampler;\n"
@@ -124,21 +166,113 @@ string _scene_post_wgsl =
     "    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));\n"
     "    return select(1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055, x * 12.92, x <= vec3<f32>(0.0031308));\n"
     "}\n"
-    "@fragment fn fs_tone(v: V) -> @location(0) vec4<f32> {\n"
-    "    let hdr = textureSample(src, samp, v.uv);\n"
-    "    let c = hdr.rgb + textureSample(bloom_tex, samp, v.uv).rgb * post.a.w;\n"
+    "fn linear(c: vec3<f32>) -> vec3<f32> {\n"
+    "    return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));\n"
+    "}\n"
+    "fn tone(uv: vec2<f32>) -> vec3<f32> {\n"
+    "    let c = textureSampleLevel(src, samp, uv, 0.0).rgb + textureSampleLevel(bloom_tex, samp, uv, 0.0).rgb * post.a.w;\n"
     "    let h = c * exp2(post.a.y);\n"
     "    var m = h;\n"
     "    let op = u32(post.a.x + 0.5);\n"
     "    if (op == 1u) { m = h / (1.0 + h); }\n"
     "    if (op == 2u) { m = 1.0 - exp(-h); }\n"
     "    if (op == 3u) { m = max(hable(h), vec3<f32>(0.0)) / hable(vec3<f32>(post.a.z)); }\n"
-    "    if (post.b.x > 0.5) { m = srgb(m); }\n"
-    "    return vec4<f32>(m, 1.0);\n"
-    "}\n";
+    "    return m;\n"
+    "}\n"
+    // what the viewer sees at uv (top-left origin): encoded when gamma is on, whatever the target
+    "fn fx0(uv: vec2<f32>) -> vec3<f32> {\n"
+    "    let m = tone(uv);\n"
+    "    if (post.b.x > 0.5 || post.b.y > 0.5) { return srgb(m); }\n"
+    "    return m;\n"
+    "}\n"
+    "fn glmod(a: f32, b: f32) -> f32 { return a - b * floor(a / b); }\n";
+
+string _SCENE_DISTORT =
+    "    let t = g * 2.0 - 1.0;\n"
+    "    let d = length(t);\n"
+    "    if (d > 1.0) { return prev(uv); }\n"
+    "    let theta = atan2(t.y, t.x);\n"
+    "    let r = pow(d, p);\n"
+    "    let q = (vec2<f32>(r * cos(theta), r * sin(theta)) + 1.0) * 0.5;\n"
+    "    return prev(vec2<f32>(q.x, 1.0 - q.y));\n";
+
+// The WGSL of one effect as fx<i>(uv) over fx<i-1>, in ViroReact's (OpenGL) coordinates:
+// g is uv with its origin at the bottom left, fc the pixel center from the bottom left.
+void _scene_effect_body(int e, *String out) {
+    if (e == SCENE_EFFECT_BARREL || e == SCENE_EFFECT_PINCUSHION) {
+        out.append(e == SCENE_EFFECT_BARREL ? "    let p = 1.75;\n" : "    let p = 0.5;\n");
+        out.append("    let g = vec2<f32>(uv.x, 1.0 - uv.y);\n");
+        out.append(_SCENE_DISTORT);
+        return;
+    }
+    out.append(_scene_effect_text(e));
+}
+
+string _scene_effect_text(int e) {
+    if (e == SCENE_EFFECT_GRAYSCALE) return "    let c = prev(uv);\n    let a = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;\n    return vec3<f32>(a);\n";
+    if (e == SCENE_EFFECT_SEPIA) return "    let c = prev(uv);\n    let k = 0.9;\n"
+        "    return vec3<f32>(min(1.0, c.r * (1.0 - 0.607 * k) + c.g * 0.769 * k + c.b * 0.189 * k),\n"
+        "                     min(1.0, c.r * 0.349 * k + c.g * (1.0 - 0.314 * k) + c.b * 0.168 * k),\n"
+        "                     min(1.0, c.r * 0.272 * k + c.g * 0.534 * k + c.b * (1.0 - 0.869 * k)));\n";
+    if (e == SCENE_EFFECT_SINCITY) return "    let c = prev(uv);\n    let t = 0.1;\n"
+        "    let a = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;\n"
+        "    let s = vec3<f32>(c.r - a / 3.0, c.g - a / 3.0, c.b - a / 3.0);\n"
+        "    var k = s.r;\n    if (t >= s.r || s.b >= t || s.g >= t) { k = t; }\n"
+        "    return mix(vec3<f32>(a), s, k);\n";
+    if (e == SCENE_EFFECT_THERMAL) return "    let c = prev(uv);\n    let lum = (c.r + c.g + c.b) / 3.0;\n"
+        "    if (lum < 0.5) { return mix(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 1.0, 0.0), lum / 0.5); }\n"
+        "    return mix(vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), (lum - 0.5) / 0.5);\n";
+    if (e == SCENE_EFFECT_CROSSHATCH) return "    let lum = length(prev(uv));\n"
+        "    let fc = vec2<f32>(uv.x * post.c.x, (1.0 - uv.y) * post.c.y);\n    var t = vec3<f32>(1.0);\n"
+        "    if (lum < 1.0 && glmod(fc.x + fc.y, 10.0) == 0.0) { t = vec3<f32>(0.0); }\n"
+        "    if (lum < 0.7 && glmod(fc.x - fc.y, 10.0) == 0.0) { t = vec3<f32>(0.0); }\n"
+        "    if (lum < 0.5 && glmod(fc.x + fc.y - 5.0, 10.0) == 0.0) { t = vec3<f32>(0.0); }\n"
+        "    if (lum < 0.3 && glmod(fc.x - fc.y - 5.0, 10.0) == 0.0) { t = vec3<f32>(0.0); }\n"
+        "    return t;\n";
+    if (e == SCENE_EFFECT_PIXELATED) return "    let d = 0.02;\n    let g = vec2<f32>(uv.x, 1.0 - uv.y);\n"
+        "    let q = vec2<f32>(d * floor(g.x / d), d * floor(g.y / d));\n    return prev(vec2<f32>(q.x, 1.0 - q.y));\n";
+    if (e == SCENE_EFFECT_TOONIFY) return "    let c = prev(uv);\n    let dx = 1.0 / post.c.x;\n"
+        "    var pix: array<f32, 9>;\n    var k = 0;\n"
+        "    for (var i = -1; i < 2; i++) {\n        for (var j = -1; j < 2; j++) {\n"
+        "            let s = prev(uv + vec2<f32>(f32(i) * dx, -f32(j) * dx));\n"
+        "            pix[k] = (s.r + s.g + s.b) / 3.0;\n            k++;\n        }\n    }\n"
+        "    let delta = (abs(pix[1] - pix[7]) + abs(pix[5] - pix[3]) + abs(pix[0] - pix[8]) + abs(pix[2] - pix[6])) / 4.0;\n"
+        "    let edge = clamp(5.0 * delta, 0.0, 1.0);\n"
+        "    if (edge >= 0.5) { return vec3<f32>(0.0); }\n    return c;\n";
+    if (e == SCENE_EFFECT_INVERTED) return "    return 1.0 - prev(uv);\n";
+    return "    return prev(uv);\n";
+}
+
+// The tone mapping shader with effects: fx0 is the displayed image, each effect fx<i>
+// reads fx<i-1>, and fs_tone writes the last (back to linear for an sRGB target).
+void _scene_post_shader(*int effects, *String out) {
+    out.append(_scene_post_wgsl);
+    int n = 0;
+    for (k in 0..8) {
+        int e = effects[k];
+        if (e == SCENE_EFFECT_NONE) continue;
+        n++;
+        String body;
+        _scene_effect_body(e, &body);
+        // prev(...) is the effect before this one
+        String prev;
+        prev.appendf("fx%d(", n - 1);
+        body.replace_all("prev(", (string)prev.data);
+        out.appendf("fn fx%d(uv: vec2<f32>) -> vec3<f32> {\n", n);
+        out.append((string)body.data);
+        out.append("}\n");
+        body.free();
+        prev.free();
+    }
+    out.appendf("@fragment fn fs_tone(v: V) -> @location(0) vec4<f32> {\n    let e = fx%d(v.uv);\n", n);
+    // an sRGB target encodes what it is given: hand it back the linear value
+    out.append("    if (post.b.y > 0.5) { return vec4<f32>(linear(e), 1.0); }\n");
+    out.append("    return vec4<f32>(e, 1.0);\n}\n");
+}
 
 struct _ScenePipeFmt {
     WGPUTextureFormat format;
+    int[8] effects;
     GpuPipeline pipe;
 }
 
@@ -184,10 +318,10 @@ Result<int, string> _scene_post_make(*_ScenePostGpu self, *Gpu gpu) {
     GpuTextureDesc bd = GpuTextureDesc{width: 1, height: 1, format: WGPUTextureFormat_RGBA16Float};
     self.black = gpu.texture_with(&bd)?;
     self.black.write_level(0, 0, &zero)?;
-    self.u_bright = gpu.uniform(null, 32)?;
-    self.u_h = gpu.uniform(null, 32)?;
-    self.u_v = gpu.uniform(null, 32)?;
-    self.u_tone = gpu.uniform(null, 32)?;
+    self.u_bright = gpu.uniform(null, 64)?;
+    self.u_h = gpu.uniform(null, 64)?;
+    self.u_v = gpu.uniform(null, 64)?;
+    self.u_tone = gpu.uniform(null, 64)?;
     self.g_bright = self.layout.group()?;
     self.g_h = self.layout.group()?;
     self.g_v = self.layout.group()?;
@@ -206,15 +340,27 @@ Result<int, string> _scene_post_make(*_ScenePostGpu self, *Gpu gpu) {
     return Ok<int, string>(0);
 }
 
-Result<*GpuPipeline, string> _scene_post_tone_pipe(*_ScenePostGpu self, WGPUTextureFormat format) {
+Result<*GpuPipeline, string> _scene_post_tone_pipe(*_ScenePostGpu self, WGPUTextureFormat format, *int effects) {
     for (i in 0..self.tones.size) {
-        if (self.tones.data[i].format == format) return Ok<*GpuPipeline, string>(&self.tones.data[i].pipe);
+        if (self.tones.data[i].format != format) continue;
+        bool same = true;
+        for (k in 0..8) {
+            if (self.tones.data[i].effects[k] != effects[k]) same = false;
+        }
+        if (same) return Ok<*GpuPipeline, string>(&self.tones.data[i].pipe);
     }
+    String src;
+    defer src.free();
+    _scene_post_shader(effects, &src);
     *GpuBindLayout[1] groups = {&self.layout};
-    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_post_wgsl, vertex: "vs", fragment: "fs_tone",
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: "fs_tone",
         format: format, groups: &groups[0], group_count: 1};
     GpuPipeline p = self.gpu.pipeline(&d)?;
-    List_push(&self.tones, _ScenePipeFmt{format, p});
+    _ScenePipeFmt rec;
+    rec.format = format;
+    for (k in 0..8) rec.effects[k] = effects[k];
+    rec.pipe = p;
+    List_push(&self.tones, rec);
     return Ok<*GpuPipeline, string>(&self.tones.data[self.tones.size - 1].pipe);
 }
 
@@ -272,9 +418,11 @@ Result<int, string> _scene_post_run(*_ScenePostGpu self, *GpuEncoder enc, *GpuTe
     float strength = p.bloom ? (p.bloom_strength > 0.0 ? p.bloom_strength : 1.0) : 0.0;
     float white = p.white_point > 0.0 ? p.white_point : 11.2;
     bool encode = p.gamma && !_scene_is_srgb(format);
-    float[8] ut = {(float)p.tone_mapping, p.exposure, white, strength, encode ? 1.0 : 0.0, 0.0, 0.0, 0.0};
-    self.u_tone.write(0, &ut, 32);
-    *GpuPipeline tone = _scene_post_tone_pipe(self, format)?;
+    bool srgb_target = _scene_is_srgb(format) && p.gamma;
+    float[16] ut = {(float)p.tone_mapping, p.exposure, white, strength, encode ? 1.0 : 0.0, srgb_target ? 1.0 : 0.0, 0.0, 0.0,
+        (float)hdr.width, (float)hdr.height, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    self.u_tone.write(0, &ut, 64);
+    *GpuPipeline tone = _scene_post_tone_pipe(self, format, &p.effects[0])?;
     GpuPass tp = enc.pass(view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
     tp.set_group(0, &self.g_tone);
     tp.draw(tone, null, 3, 1);
