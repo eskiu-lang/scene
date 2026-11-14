@@ -109,7 +109,9 @@ const int SCENE_BILLBOARD_Z = 4;
 // (SCENE_BILLBOARD_*) turns the node to face the camera. portal makes the node's subtree a
 // world of its own, seen through the meshes of its descendants marked portal_entrance
 // (ViroPortalScene and ViroPortal), with portal_sky (a texture id: a cube, or a 360 image
-// with portal_sky_pano) behind it; passable lets the camera walk in. ignore_events keeps the node's mesh out of hit tests
+// with portal_sky_pano) behind it and portal_ibl (a GpuIbl, not owned) lighting its PBR
+// materials, as ViroReact's per-portal lighting environment (none: the ambient lights);
+// passable lets the camera walk in. ignore_events keeps the node's mesh out of hit tests
 // (<scene/input>): rays pass through it. alive is false once the node is removed. Change
 // parent and children through Scene_set_parent and Scene_remove, not by hand.
 struct SceneNode {
@@ -135,6 +137,7 @@ struct SceneNode {
     bool passable;
     int portal_sky;
     bool portal_sky_pano;
+    *GpuIbl portal_ibl;
     bool ignore_events;
     Mat4 world;
     List<Mat4> joints;
@@ -217,6 +220,15 @@ struct _SceneDraw {
 struct _ScenePortalRec {
     int node;
     int outer;
+    int group;
+}
+
+// The frame bind group of a portal's world: the frame's values with that world's lighting
+// environment.
+struct _SceneWorldGroup {
+    *GpuIbl ibl;
+    GpuBuffer frame;
+    GpuBindGroup group;
 }
 
 struct _SceneLightRec {
@@ -268,6 +280,7 @@ struct _SceneRenderer {
     List<_SceneMatGpu> mats;
     List<_SceneSampler> samplers;
     List<_ScenePortalRec> portals;
+    List<_SceneWorldGroup> world_groups;
     Vec3 last_eye;
     bool has_eye;
     GpuPipeline depth_reset;
@@ -465,6 +478,7 @@ void Scene_release(*Scene self) {
     for (i in 0..r.pipes.size) r.pipes.data[i].pipe.release();
     if (r.depth_reset_made) r.depth_reset.release();
     List_free(&r.portals);
+    List_free(&r.world_groups);
     for (i in 0..r.samplers.size) r.samplers.data[i].samp.release();
     List_free(&r.samplers);
     for (i in 0..r.shadow_views.size) r.shadow_views.data[i].release();
@@ -483,6 +497,10 @@ void Scene_release(*Scene self) {
         _scene_sky_release(&r.sky);
         r.shadow_pipe.release();
         r.frame_group.release();
+        for (i in 0..r.world_groups.size) {
+            r.world_groups.data[i].group.release();
+            r.world_groups.data[i].frame.release();
+        }
         r.frame.release();
         r.lights.release();
         r.samp.release();
@@ -1532,7 +1550,7 @@ void _scene_collect(*Scene self, int id, float parent_opacity, int world, int fr
     *SceneNode n = &self.nodes.data[id];
     if (!n.alive || !n.visible) return;
     if (n.portal && id != 0) {
-        List_push(&self._r.portals, _ScenePortalRec{id, world});
+        List_push(&self._r.portals, _ScenePortalRec{id, world, -1});
         // the portal's contents are its own world; its entrance stays in the outer one
         for (i in 0..n.children.size) {
             int c = n.children.data[i];
@@ -1740,6 +1758,34 @@ Result<int, string> _scene_shadow_targets(*Scene self, int layers) {
     return Ok<int, string>(0);
 }
 
+// The frame bind group for a world lit by ibl (null: the ambient lights), made on first use.
+Result<int, string> _scene_world_group(*Scene self, *GpuIbl ibl) {
+    *_SceneRenderer r = &self._r;
+    for (i in 0..r.world_groups.size) {
+        if (r.world_groups.data[i].ibl == ibl) return Ok<int, string>(i);
+    }
+    _SceneWorldGroup w;
+    w.ibl = ibl;
+    w.frame = self.gpu.uniform(null, 144)?;
+    w.group = r.frame_layout.group()?;
+    w.group.buffer(0, &w.frame);
+    w.group.buffer(1, &r.lights);
+    w.group.texture(2, &r.no_shadow);
+    w.group.sampler(3, &r.shadow_samp);
+    if (ibl != null) {
+        w.group.texture(4, &ibl.irradiance);
+        w.group.texture(5, &ibl.specular);
+        w.group.texture(6, &ibl.brdf);
+    } else {
+        w.group.texture(4, &r.black_cube);
+        w.group.texture(5, &r.black_cube);
+        w.group.texture(6, &r.white);
+    }
+    w.group.sampler(7, &r.ibl_samp);
+    List_push(&r.world_groups, w);
+    return Ok<int, string>(r.world_groups.size - 1);
+}
+
 void _scene_bind_frame(*Scene self, bool shadows) {
     *_SceneRenderer r = &self._r;
     *GpuTexture st = shadows ? &r.shadow_maps : &r.no_shadow;
@@ -1797,7 +1843,13 @@ void _scene_draw_lights(*Scene self, *_SceneDraw d, *_SceneDrawU u) {
 void _scene_draw(*Scene self, *GpuPass pass, *_SceneDraw d, *GpuPipeline pipe) {
     *_SceneRenderer r = &self._r;
     *SceneMesh mesh = &self.meshes.data[d.mesh];
-    pass.set_group(0, &r.frame_group);
+    *GpuBindGroup fg = &r.frame_group;
+    if (d.world > 0) {
+        for (k in 0..r.portals.size) {
+            if (r.portals.data[k].node == d.world && r.portals.data[k].group >= 0) fg = &r.world_groups.data[r.portals.data[k].group].group;
+        }
+    }
+    pass.set_group(0, fg);
     pass.set_group(1, &r.nodes.data[d.node].group);
     pass.set_group(2, &r.mats.data[d.material].group);
     pass.draw_indexed(pipe, &mesh.vertices, &mesh.indices, mesh.index_count, 1);
@@ -1898,6 +1950,18 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     fu[35] = 0.0;
     r.frame.write(0, &fu, 144);
     _scene_bind_frame(self, shadows > 0);
+    // each portal's world with its own lighting environment
+    for (k in 0..r.portals.size) {
+        *GpuIbl ibl = self.nodes.data[r.portals.data[k].node].portal_ibl;
+        int gi = _scene_world_group(self, ibl)?;
+        r.portals.data[k].group = gi;
+        fu[28] = ibl != null ? 1.0 : 0.0;
+        fu[29] = ibl != null ? ibl.intensity : 0.0;
+        fu[30] = ibl != null ? ibl.max_lod() : 0.0;
+        *_SceneWorldGroup wg = &r.world_groups.data[gi];
+        wg.frame.write(0, &fu, 144);
+        wg.group.texture(2, shadows > 0 ? &r.shadow_maps : &r.no_shadow);
+    }
 
     for (i in 0..r.draws.size) {
         *_SceneDraw d = &r.draws.data[i];

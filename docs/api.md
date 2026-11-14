@@ -145,6 +145,7 @@ struct SceneNode {
     bool passable;
     int portal_sky;
     bool portal_sky_pano;
+    *GpuIbl portal_ibl;
     bool ignore_events;
     Mat4 world;
     List<Mat4> joints;
@@ -165,7 +166,9 @@ ordering; with a material that skips the depth test it puts a panel on top. bill
 (SCENE_BILLBOARD_*) turns the node to face the camera. portal makes the node's subtree a
 world of its own, seen through the meshes of its descendants marked portal_entrance
 (ViroPortalScene and ViroPortal), with portal_sky (a texture id: a cube, or a 360 image
-with portal_sky_pano) behind it; passable lets the camera walk in. ignore_events keeps the node's mesh out of hit tests
+with portal_sky_pano) behind it and portal_ibl (a GpuIbl, not owned) lighting its PBR
+materials, as ViroReact's per-portal lighting environment (none: the ambient lights);
+passable lets the camera walk in. ignore_events keeps the node's mesh out of hit tests
 (`<scene/input>`): rays pass through it. alive is false once the node is removed. Change
 parent and children through Scene_set_parent and Scene_remove, not by hand.
 

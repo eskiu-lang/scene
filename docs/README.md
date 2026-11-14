@@ -68,7 +68,7 @@ Each test renders small images and reads them back:
 | `tests/lighting.esk` | each lighting model on a sphere against its formula at ten pixels (linear output, within 0.006 + 1%) |
 | `tests/attenuation.esk` | point light falloff (exponent 2 and 1) and the spot cone along a profile, the influence mask, eight lights per draw |
 | `tests/effects.esk` | each color effect against ViroReact's formula, a chain's order, crosshatch lines at their pixels, toonify's edge, barrel and pincushion moving an edge, the zoom in a window, the swirl over time |
-| `tests/portals.esk` | a portal's world only through its window, an outer object covering the window, the portal's sky, walking in and looking back out, a portal that is not passable, a portal inside a portal |
+| `tests/portals.esk` | a portal's world only through its window, an outer object covering the window, the portal's sky, walking in and looking back out, a portal that is not passable, a portal inside a portal, each world lit only by its own environment |
 | `tests/shapes.esk` | polygon area with holes and concave outlines, winding, texture coordinates, repeated points; polyline width, round ends and joins; both drawn |
 | `tests/particles.esk` | modifier intervals, the rate per second, the cap, bursts, a cycle without loop, motion, fixed and free particles, spawn volumes, an explosion, additive drawing |
 | `tests/text.esk` | sizes at 0.01 world units a point, word, character and no wrapping, justification, clipping and the line cap, alignment, rebuilding, the glyphs drawn inside their bounds, an outline around a glyph and behind it, a drop shadow's placement, extruded faces at their depths covering the glyph with its holes |

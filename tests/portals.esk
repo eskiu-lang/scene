@@ -1,12 +1,13 @@
 // Portals: a portal's world seen only through its window, the outer world around it, an
 // outer object in front of the window still covering it, the portal's own sky, walking
 // through a passable portal and looking back out, a portal that is not passable, and a
-// portal inside a portal.
+// portal inside a portal, and a portal's own lighting environment.
 import <io>;
 import <mem>;
 import <libc>;
 import <gpu>;
 import <gpu/math>;
+import <gpu/ibl>;
 import <scene>;
 
 const int N = 32;
@@ -207,6 +208,65 @@ Result<int, string> nested(*Gpu gpu) {
     return Ok<int, string>(0);
 }
 
+// Each world lit by its own environment: the portal's PBR wall by portal_ibl, the outer
+// one by the scene's, and neither by the other's.
+Result<int, string> lit(*Gpu gpu) {
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    scene.background = Vec4{0.0, 0.0, 0.0, 1.0};
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA16Float)?;
+    defer target.release();
+    *uint16 px = alloc<uint16>(N * N * 4);
+    defer free(px);
+    SceneGeometry g = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&g)?;
+    g.free();
+    HdrBitmap env;
+    env.width = 16;
+    env.height = 8;
+    env.rgba = alloc<float>(16 * 8 * 4);
+    for (i in 0..16 * 8) {
+        for (k in 0..3) env.rgba[i * 4 + k] = 0.5;
+        env.rgba[i * 4 + 3] = 1.0;
+    }
+    GpuIblOptions io = GpuIblOptions{environment_size: 16, irradiance_size: 8, specular_size: 16, specular_mips: 3,
+        brdf_size: 32, samples: 64, brdf_samples: 256};
+    GpuIbl ibl = gpu.ibl(&env, &io)?;
+    defer ibl.release();
+    env.free();
+    SceneMaterial pm = scene_material(SCENE_PBR);
+    pm.diffuse = Vec4{0.5, 0.5, 0.5, 1.0};
+    pm.roughness = 1.0;
+    int grey = scene.add_material(pm);
+    int outer = scene.add_object(0, quad, grey);
+    scene.node(outer).position = Vec3{0.0, 0.0, -10.0};
+    scene.node(outer).scale = Vec3{40.0, 40.0, 1.0};
+    int p = scene.add_node(0, "p");
+    scene.node(p).portal = true;
+    int pw = scene.add_object(p, quad, flat(&scene, Vec4{1.0, 1.0, 1.0, 0.0}));
+    scene.node(pw).portal_entrance = true;
+    scene.node(pw).scale = Vec3{2.0, 2.0, 1.0};
+    int wall = scene.add_object(p, quad, grey);
+    scene.node(wall).position = Vec3{0.0, 0.0, -3.0};
+    scene.node(wall).scale = Vec3{40.0, 40.0, 1.0};
+    int cam = scene.add_camera(0, scene_orthographic(4.0, 0.1, 100.0));
+    scene.node(cam).position = Vec3{0.0, 0.0, 5.0};
+    scene.set_camera(cam);
+    scene.node(p).portal_ibl = &ibl;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("the portal's world lit by its environment", pixel(px, 16, 16), Vec3{0.246, 0.246, 0.246});
+    expect("the outer world without one stays dark", pixel(px, 2, 16), Vec3{0.0, 0.0, 0.0});
+    scene.node(p).portal_ibl = null;
+    scene.set_ibl(&ibl);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    expect("the scene's environment lights the outer world", pixel(px, 2, 16), Vec3{0.246, 0.246, 0.246});
+    expect("not the portal's", pixel(px, 16, 16), Vec3{0.0, 0.0, 0.0});
+    return Ok<int, string>(0);
+}
+
 int main() {
     Result<int, string> r = run();
     if (r.ok) {
@@ -214,6 +274,7 @@ int main() {
         if (g.ok) {
             Gpu gpu = g.value;
             r = nested(&gpu);
+            if (r.ok) r = lit(&gpu);
             gpu.release();
         }
     }

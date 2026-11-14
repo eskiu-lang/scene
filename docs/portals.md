@@ -34,6 +34,20 @@ Each frame the scene draws:
 `portal_sky_pano`. A portal without a sky shows, where its contents leave room, what was
 drawn there before (in AR, the camera image).
 
+## Lighting environment
+
+`portal_ibl` lights the PBR materials of a portal's world with a `GpuIbl` from `<gpu/ibl>`,
+as ViroReact's lighting environment per portal; `Scene_set_ibl` is the outer world's. Each
+world uses only its own: a portal without one lights its PBR materials with the ambient
+lights, whatever the scene's environment.
+
+```eskiu
+GpuIbl room_light = gpu.ibl(&room_hdr, &opts)?;
+scene.node(room).portal_ibl = &room_light;
+```
+
+The `GpuIbl` is not owned by the scene and must outlive its use.
+
 ## Walking through
 
 When `passable` is set and the camera moves through the bounds of a window between two

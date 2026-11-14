@@ -38,9 +38,9 @@ All notable changes to this package are documented here. The format follows
   toonify, inverted, swirl and zoom distortion over `ScenePost.window` driven by
   `ScenePost.time`) with its formulas, chained in order inside the tone mapping pass;
   `scene_effect_named`.
-- Portals: `SceneNode.portal`, `portal_entrance`, `passable`, `portal_sky` and
+- Portals: `SceneNode.portal`, `portal_entrance`, `passable`, `portal_sky`, `portal_ibl` and
   `Scene.active_portal` (ViroPortalScene and ViroPortal): a portal's world drawn only
-  through its window with the stencil buffer, its own sky, walking in through a passable
+  through its window with the stencil buffer, its own sky and lighting environment, walking in through a passable
   window and seeing out, portals inside portals (`SCENE_PORTAL_DEPTH` levels, ViroReact's
   portal tree). The scene's depth buffer now has a stencil
   (`SCENE_DEPTH_FORMAT`, Depth24PlusStencil8). `docs/portals.md`.
