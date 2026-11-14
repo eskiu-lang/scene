@@ -77,3 +77,27 @@ controller.button(&scene, &input, false);
 then places the reticle and runs its animations. `show_reticle(false)` hides it
 (ViroController's `reticleVisibility`). The controller's 3D model (`controllerVisibility`)
 is the app's to draw at the pose.
+
+## visionOS
+
+`examples/visionos` draws a scene in a full immersive space on Apple Vision Pro. A small
+SwiftUI app opens the space; its `CompositorLayer` runs the frame loop of `host.m`, which
+takes each frame's drawables from CompositorServices and the device's pose at the frame's
+presentation time from ARKit's world tracking. For each view, `xr_scene.esk` wraps the
+drawable's color texture as a `GpuTexture` (`Gpu_texture_from_metal`) and draws with
+`Scene_render_eye`: the eye's pose is the device anchor times the view's transform, and its
+projection comes from the view's field-of-view tangents. After the views are drawn, the loop
+waits for the GPU and presents the drawable.
+
+```sh
+examples/visionos/build.sh          # build/EskiuXR.app for the simulator (SDK=xros: a device)
+xcrun simctl install booted examples/visionos/build/EskiuXR.app
+xcrun simctl launch booted dev.eskiu.scene.xr
+```
+
+It links wgpu-native from eskiu-lang/wgpu-native's eskiu branch (`WGPU`, built with its
+`eskiu/build_apple.sh`), which adds `wgpuDeviceCreateTextureFromMetal`, and an eskiu-gpu with
+`Gpu_texture_from_metal` (`GPU_DIR`, until a gpu release has it). In the simulator the head
+sits at the world origin, which is the floor on a device, so the example lifts it to standing
+height there. The compositor's depth texture is not written yet, so the system cannot
+reproject the frames by depth.

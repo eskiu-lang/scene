@@ -1,0 +1,102 @@
+// The scene a visionOS app draws through CompositorServices (host.m runs the frame loop):
+// a red, a green and a blue box in front of the viewer and a lit floor, turning slowly. Each
+// view of each frame arrives as the compositor's Metal color texture, the view's pose in the
+// world (the device anchor times the view's transform in the device) and the tangents of
+// its field of view; the scene draws into that texture with Scene_render_eye.
+import <io>;
+import <mem>;
+import <libc>;
+import <math>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/vr>;
+
+Gpu xr_gpu;
+Scene xr_scene;
+bool xr_open = false;
+int[3] xr_boxes;
+float xr_time = 0.0;
+
+Result<int, string> _xr_build() {
+    xr_gpu = gpu_open()?;
+    xr_scene = xr_gpu.scene()?;
+    xr_scene.background = Vec4{0.05, 0.06, 0.09, 1.0};
+    SceneGeometry box = scene_box(0.3, 0.3, 0.3);
+    int box_mesh = xr_scene.add_geometry(&box)?;
+    box.free();
+    Vec4[3] colors = {Vec4{0.9, 0.1, 0.1, 1.0}, Vec4{0.1, 0.8, 0.2, 1.0}, Vec4{0.15, 0.3, 0.95, 1.0}};
+    for (i in 0..3) {
+        SceneMaterial m = scene_material(SCENE_BLINN);
+        m.diffuse = colors[i];
+        xr_boxes[i] = xr_scene.add_object(0, box_mesh, xr_scene.add_material(m));
+        xr_scene.node(xr_boxes[i]).position = Vec3{((float)i - 1.0) * 0.6, 1.2, -1.8};
+    }
+    SceneGeometry floor = scene_box(6.0, 0.02, 6.0);
+    int floor_mesh = xr_scene.add_geometry(&floor)?;
+    floor.free();
+    SceneMaterial fm = scene_material(SCENE_LAMBERT);
+    fm.diffuse = Vec4{0.45, 0.45, 0.5, 1.0};
+    xr_scene.add_object(0, floor_mesh, xr_scene.add_material(fm));
+    SceneLight sun = scene_directional(Vec3{0.3, -1.0, -0.4}, Vec3{1.0, 1.0, 1.0}, 1.0);
+    xr_scene.add_light(sun);
+    SceneLight fill = scene_ambient(Vec3{0.25, 0.25, 0.3}, 1.0);
+    xr_scene.add_light(fill);
+    int cam = xr_scene.add_camera(0, scene_perspective(1.0, 0.05, 50.0));
+    xr_scene.set_camera(cam);
+    return Ok<int, string>(0);
+}
+
+// Opens the GPU (the system default Metal device, the compositor's) and builds the scene.
+// 0 on success.
+export int xr_scene_open() {
+    if (xr_open) return 0;
+    Result<int, string> r = _xr_build();
+    if (r.ok == 0) {
+        println_err(r.error);
+        return 1;
+    }
+    xr_open = true;
+    return 0;
+}
+
+// Advances the animation by dt seconds.
+export void xr_scene_step(float dt) {
+    xr_time += dt;
+    for (i in 0..3) {
+        xr_scene.node(xr_boxes[i]).rotation = quat_axis_angle(Vec3{0.3, 1.0, 0.1}.normalize(), xr_time * (0.6 + 0.3 * (float)i));
+    }
+}
+
+// Draws one view into an id<MTLTexture> of width x height, BGRA8 sRGB (srgb true) or BGRA8.
+// pose is the view's world transform, 16 floats column by column; left, right, top and
+// bottom are the tangents of its field of view's half angles. 0 on success.
+export int xr_scene_render(*void color, uint32 width, uint32 height, bool srgb, *float pose,
+        float left, float right, float top, float bottom) {
+    if (!xr_open) return 1;
+    WGPUTextureFormat format = srgb ? WGPUTextureFormat_BGRA8UnormSrgb : WGPUTextureFormat_BGRA8Unorm;
+    Result<GpuTexture, string> t = xr_gpu.texture_from_metal(color, width, height, format, 1, 0);
+    if (t.ok == 0) {
+        println_err(t.error);
+        return 1;
+    }
+    GpuTexture target = t.value;
+    SceneEye eye;
+    for (i in 0..16) eye.pose.m[i] = pose[i];
+    eye.near = 0.05;
+    eye.far = 50.0;
+    eye.projection = scene_fov_projection(-(float)atan((double)fabs(left)), (float)atan((double)fabs(right)),
+        -(float)atan((double)fabs(bottom)), (float)atan((double)fabs(top)), eye.near, eye.far);
+    Result<int, string> r = xr_scene.render_eye(&target, eye);
+    target.release();
+    if (r.ok == 0) {
+        println_err(r.error);
+        return 1;
+    }
+    return 0;
+}
+
+// Waits until the GPU has run what was submitted, so the compositor presents finished views.
+export void xr_scene_wait() {
+    xr_gpu.wait();
+}
