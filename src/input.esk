@@ -26,6 +26,7 @@ import <libc>;
 import <gpu/math>;
 import <gpu/touch>;
 import <scene>;
+import <scene/material>;
 
 // How far a ray that hits nothing reaches, in world units: a hit on the background is a
 // point this far along the ray (ViroReact's 8 meters).
@@ -145,15 +146,46 @@ int Scene_hit_test_all(*Scene self, SceneRay ray, *List<SceneHit> out) {
     return out.size;
 }
 
-// The nearest node ray hits, into hit. When it hits nothing, hit is the background
-// (node 0, background true, the point SCENE_BACKGROUND_DISTANCE along the ray) and the
-// result is false.
+// The node ray hits that is drawn on top, into hit: as in ViroReact, hits are taken in
+// draw order (rendering_order, then farthest first), and a hit behind a nearer node whose
+// material writes depth is hidden, unless its own material skips the depth test (drawn
+// over everything before it). Without rendering orders or depth settings this is the
+// nearest hit. When the ray hits nothing, it returns false and hit is the background
+// (node 0, background true, the point SCENE_BACKGROUND_DISTANCE along the ray).
 bool Scene_hit_test(*Scene self, SceneRay ray, *SceneHit hit) {
     List<SceneHit> all;
     Scene_hit_test_all(self, ray, &all);
-    bool found = all.size > 0;
+    int n = all.size;
+    // draw order: rendering_order ascending, then distance descending
+    for (i in 1..n) {
+        SceneHit h = all.data[i];
+        int j = i - 1;
+        while (j >= 0 && _scene_hit_draw_before(self, &h, &all.data[j])) {
+            all.data[j + 1] = all.data[j];
+            j--;
+        }
+        all.data[j + 1] = h;
+    }
+    float depth = 1e30;
+    int top = -1;
+    for (i in 0..n) {
+        *SceneNode node = &self.nodes.data[all.data[i].node];
+        int m = node.material > 0 && node.material < self.materials.size ? node.material : 0;
+        int key = scene_material_key(&self.materials.data[m]);
+        if (node.opacity < 1.0) key = scene_key_fade(key);
+        bool reads = !scene_key_skips_depth_test(key);
+        bool writes = !scene_key_skips_depth_write(key);
+        if (!reads) {
+            depth = 1e30;
+        } else if (all.data[i].distance > depth) {
+            continue;
+        }
+        if (reads && writes) depth = all.data[i].distance;
+        top = i;
+    }
+    bool found = top >= 0;
     if (found) {
-        *hit = all.data[0];
+        *hit = all.data[top];
     } else {
         hit.node = 0;
         hit.distance = SCENE_BACKGROUND_DISTANCE;
@@ -162,6 +194,13 @@ bool Scene_hit_test(*Scene self, SceneRay ray, *SceneHit hit) {
     }
     all.free();
     return found;
+}
+
+bool _scene_hit_draw_before(*Scene self, *SceneHit a, *SceneHit b) {
+    int oa = self.nodes.data[a.node].rendering_order;
+    int ob = self.nodes.data[b.node].rendering_order;
+    if (oa != ob) return oa < ob;
+    return a.distance > b.distance;
 }
 
 // Events a handler takes (SceneInput_on), bits of a mask.

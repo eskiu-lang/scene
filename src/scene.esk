@@ -78,6 +78,15 @@ SceneCamera scene_orthographic(float height, float near, float far) {
     return SceneCamera{SCENE_ORTHOGRAPHIC, 0.0, near, far, height, 0.0};
 }
 
+// How a node turns to face the camera (SceneNode.billboard), ViroReact's
+// transformBehaviors: not at all; fully (its +Z toward the camera); or only about the
+// world X, Y or Z axis.
+const int SCENE_BILLBOARD_NONE = 0;
+const int SCENE_BILLBOARD_ALL = 1;
+const int SCENE_BILLBOARD_X = 2;
+const int SCENE_BILLBOARD_Y = 3;
+const int SCENE_BILLBOARD_Z = 4;
+
 // A node. position, rotation and scale place it in its parent's space (the local matrix is
 // translation * rotation * scale); world is its world matrix after the last
 // Scene_update or render. A node that is not visible hides its whole subtree. mesh,
@@ -85,7 +94,10 @@ SceneCamera scene_orthographic(float height, float near, float far) {
 // receives_shadows choose its part in shadows, and light_mask the lights that reach it
 // (SceneLight.influence). opacity (1) fades the node and its subtree: it multiplies down
 // the tree, a node below 1 is drawn blended (after the opaque surfaces, sorted back to
-// front, casting no shadow), and one at 0 is not drawn. ignore_events keeps the node's mesh out of hit tests
+// front, casting no shadow), and one at 0 is not drawn. rendering_order (0) draws the node
+// before (lower) or after (higher) others whatever its distance, ahead of every other
+// ordering; with a material that skips the depth test it puts a panel on top. billboard
+// (SCENE_BILLBOARD_*) turns the node to face the camera. ignore_events keeps the node's mesh out of hit tests
 // (<scene/input>): rays pass through it. alive is false once the node is removed. Change
 // parent and children through Scene_set_parent and Scene_remove, not by hand.
 struct SceneNode {
@@ -104,6 +116,8 @@ struct SceneNode {
     bool receives_shadows;
     uint32 light_mask;
     float opacity;
+    int rendering_order;
+    int billboard;
     bool ignore_events;
     Mat4 world;
     List<Mat4> joints;
@@ -171,6 +185,8 @@ struct _SceneDraw {
     Vec3 center;
     float radius;
     float opacity;
+    int order;
+    bool in_view;
 }
 
 struct _SceneLightRec {
@@ -584,16 +600,80 @@ Mat4 Scene_world(*Scene self, int node) {
     return m;
 }
 
-void _scene_update_node(*Scene self, int node, Mat4 parent) {
-    *SceneNode n = &self.nodes.data[node];
-    n.world = parent * mat4_trs(n.position, n.rotation, n.scale);
-    for (i in 0..n.children.size) _scene_update_node(self, n.children.data[i], n.world);
+// The rotation turning +Z (look) toward to (normalized), about axis when the two are
+// parallel (ViroReact's computeAxisRotation).
+Quat _scene_axis_rotation(Vec3 look, Vec3 fallback, Vec3 to) {
+    float c = look.dot(to);
+    if (c > 0.99999999) return quat_identity();
+    if (c < -0.99999999) return quat_axis_angle(fallback, 3.14159265358979);
+    Vec3 axis = look.cross(to);
+    if (axis.length() < 1e-12) return quat_identity();
+    return quat_axis_angle(axis, (float)acos((double)c));
 }
 
-// Recomputes every node's world matrix (SceneNode.world) from the tree. Scene_render does
-// it first; call it to read world matrices in between.
+// The world matrix of a billboarded node: at its world position and scale, turned by
+// ViroReact's billboard rotation toward eye, then by its own rotation.
+Mat4 _scene_billboard(*SceneNode n, Vec3 eye) {
+    Mat4 w = n.world;
+    Vec3 pos = Vec3{w.m[12], w.m[13], w.m[14]};
+    Vec3 scale = Vec3{Vec3{w.m[0], w.m[1], w.m[2]}.length(), Vec3{w.m[4], w.m[5], w.m[6]}.length(),
+        Vec3{w.m[8], w.m[9], w.m[10]}.length()};
+    Vec3 look = Vec3{0.0, 0.0, 1.0};
+    Vec3 to = eye - pos;
+    Quat b = quat_identity();
+    if (n.billboard == SCENE_BILLBOARD_ALL) {
+        Vec3 flat = Vec3{to.x, 0.0, to.z};
+        if (flat.length() > 1e-9) {
+            Vec3 fl = flat.normalize();
+            Quat qy = _scene_axis_rotation(look, Vec3{0.0, 1.0, 0.0}, fl);
+            Vec3 tn = to.length() > 1e-9 ? to.normalize() : fl;
+            float c = tn.dot(fl);
+            Vec3 axis = tn.y < 0.0 ? Vec3{1.0, 0.0, 0.0} : Vec3{-1.0, 0.0, 0.0};
+            Quat qx = quat_identity();
+            if (c < -0.99999999) qx = quat_axis_angle(axis, 3.14159265358979);
+            else if (c < 0.99999999) qx = quat_axis_angle(axis, (float)acos((double)c));
+            b = qy * qx;
+        }
+    } else {
+        Vec3 fallback = Vec3{1.0, 0.0, 0.0};
+        if (n.billboard == SCENE_BILLBOARD_X) {
+            to.x = 0.0;
+        } else if (n.billboard == SCENE_BILLBOARD_Y) {
+            to.y = 0.0;
+            fallback = Vec3{0.0, 1.0, 0.0};
+        } else {
+            to.z = 0.0;
+            fallback = Vec3{0.0, 0.0, 1.0};
+        }
+        if (to.length() > 1e-9) b = _scene_axis_rotation(look, fallback, to.normalize());
+    }
+    return mat4_trs(pos, b * n.rotation, scale);
+}
+
+void _scene_update_node(*Scene self, int node, Mat4 parent, bool billboards, Vec3 eye) {
+    *SceneNode n = &self.nodes.data[node];
+    n.world = parent * mat4_trs(n.position, n.rotation, n.scale);
+    if (billboards && n.billboard != SCENE_BILLBOARD_NONE) n.world = _scene_billboard(n, eye);
+    for (i in 0..n.children.size) _scene_update_node(self, n.children.data[i], n.world, billboards, eye);
+}
+
+// Recomputes every node's world matrix (SceneNode.world) from the tree, turning
+// billboarded nodes toward the scene's camera. Scene_render does it first; call it to
+// read world matrices in between.
 void Scene_update(*Scene self) {
-    _scene_update_node(self, 0, mat4_identity());
+    Vec3 none = Vec3{0.0, 0.0, 0.0};
+    _scene_update_node(self, 0, mat4_identity(), false, none);
+    bool any = false;
+    for (i in 1..self.nodes.size) {
+        if (self.nodes.data[i].alive && self.nodes.data[i].billboard != SCENE_BILLBOARD_NONE) any = true;
+    }
+    if (!any) return;
+    Vec3 eye = none;
+    if (self.camera >= 0 && self.camera < self.nodes.size && self.nodes.data[self.camera].alive) {
+        Mat4 c = self.nodes.data[self.camera].world;
+        eye = Vec3{c.m[12], c.m[13], c.m[14]};
+    }
+    _scene_update_node(self, 0, mat4_identity(), true, eye);
 }
 
 // The rotation of a matrix's upper 3x3 part, with its scale divided out.
@@ -1063,8 +1143,9 @@ Result<*GpuPipeline, string> _scene_pipeline(*Scene self, int key) {
     WGPUBlendState bs = _scene_blend_state(scene_key_blend(key));
     GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: "fs",
         format: WGPUTextureFormat_RGBA16Float, layout: &layout, groups: &groups[0], group_count: 3,
-        depth: true, depth_format: WGPUTextureFormat_Depth32Float, depth_read_only: blend,
+        depth: true, depth_format: WGPUTextureFormat_Depth32Float, depth_read_only: scene_key_skips_depth_write(key),
         cull: scene_key_double_sided(key) ? WGPUCullMode_None : WGPUCullMode_Back};
+    if (scene_key_skips_depth_test(key)) d.depth_compare = WGPUCompareFunction_Always;
     if (blend) d.blend_state = &bs;
     GpuPipeline p = self.gpu.pipeline(&d)?;
     List_push(&r.pipes, _ScenePipe{key, p});
@@ -1193,6 +1274,25 @@ float _scene_max_scale(Mat4 m) {
     return s > sz ? s : sz;
 }
 
+// Whether a sphere is at least partly inside the view frustum of view_proj (clip space
+// with depth 0 to 1): it is outside when it lies wholly beyond one of the six planes.
+bool _scene_sphere_in_view(Mat4 m, Vec3 c, float r) {
+    // the rows of the matrix (column-major storage)
+    Vec4 r0 = Vec4{m.m[0], m.m[4], m.m[8], m.m[12]};
+    Vec4 r1 = Vec4{m.m[1], m.m[5], m.m[9], m.m[13]};
+    Vec4 r2 = Vec4{m.m[2], m.m[6], m.m[10], m.m[14]};
+    Vec4 r3 = Vec4{m.m[3], m.m[7], m.m[11], m.m[15]};
+    Vec4[6] planes = {r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2};
+    for (i in 0..6) {
+        Vec4 p = planes[i];
+        float len = Vec3{p.x, p.y, p.z}.length();
+        if (len <= 0.0) continue;
+        float dist = (p.x * c.x + p.y * c.y + p.z * c.z + p.w) / len;
+        if (dist < -r) return false;
+    }
+    return true;
+}
+
 void _scene_collect(*Scene self, int id, float parent_opacity) {
     *SceneNode n = &self.nodes.data[id];
     if (!n.alive || !n.visible) return;
@@ -1208,16 +1308,19 @@ void _scene_collect(*Scene self, int id, float parent_opacity) {
         if (opacity < 1.0) d.key = scene_key_fade(d.key);
         d.blend = scene_key_blended(d.key);
         d.opacity = opacity;
+        d.order = n.rendering_order;
         Vec3 mid = (mesh.min + mesh.max) * 0.5;
         d.center = n.world.point(mid);
         d.radius = ((mesh.max - mesh.min) * 0.5).length() * _scene_max_scale(n.world);
         d.depth = (d.center - self._r.eye).dot(self._r.forward);
+        d.in_view = _scene_sphere_in_view(self._r.view_proj, d.center, d.radius);
         List_push(&self._r.draws, d);
     }
     for (i in 0..n.children.size) _scene_collect(self, n.children.data[i], opacity);
 }
 
 int _scene_draw_order(*_SceneDraw a, *_SceneDraw b) {
+    if (a.order != b.order) return a.order < b.order ? -1 : 1;
     if (a.blend != b.blend) return a.blend ? 1 : -1;
     if (a.depth != b.depth) {
         bool closer = a.depth < b.depth;
@@ -1576,6 +1679,7 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
             if (self.skybox != null) _scene_sky_draw(&r.sky, &pass, self.skybox, r.view_proj, self.sky_intensity, self.sky_flip);
             sky_drawn = true;
         }
+        if (!d.in_view) continue;
         *GpuPipeline p = _scene_pipeline(self, d.key)?;
         _scene_draw(self, &pass, d, p);
     }

@@ -103,6 +103,8 @@ struct SceneMaterial {
     float alpha_cutoff;
     int blend_mode;
     bool double_sided;
+    bool skip_depth_test;
+    bool skip_depth_write;
     SceneUv[6] uv;
 }
 
@@ -125,7 +127,8 @@ int scene_material_key(*SceneMaterial m) {
     if (alpha == SCENE_ALPHA_BLEND) {
         blend = m.blend_mode < 0 || m.blend_mode > SCENE_BLEND_PREMULTIPLIED ? SCENE_BLEND_ALPHA : m.blend_mode;
     }
-    return lighting + alpha * 8 + blend * 32 + (m.double_sided ? 256 : 0);
+    return lighting + alpha * 8 + blend * 32 + (m.double_sided ? 256 : 0) + (m.skip_depth_test ? 1024 : 0) +
+        (m.skip_depth_write ? 2048 : 0);
 }
 
 // The lighting model of a material key.
@@ -153,6 +156,17 @@ bool scene_key_double_sided(int key) {
 // material's own alpha mode.
 int scene_key_fade(int key) {
     return scene_key_faded(key) ? key : key + 512;
+}
+
+// Whether a key draws over everything before it (SceneMaterial.skip_depth_test).
+bool scene_key_skips_depth_test(int key) {
+    return (key / 1024) % 2 == 1;
+}
+
+// Whether a key leaves the depth buffer as it is (SceneMaterial.skip_depth_write; blended
+// keys never write depth).
+bool scene_key_skips_depth_write(int key) {
+    return (key / 2048) % 2 == 1 || scene_key_blended(key);
 }
 
 // Whether a key is faded (scene_key_fade).
