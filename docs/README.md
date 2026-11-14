@@ -75,7 +75,7 @@ These ViroReact renderer features are planned for later versions:
 - Shader modifiers (user WGSL inserted into the generated shaders).
 - Shadows from spot and point lights, and cascaded shadow maps for large scenes.
 - glTF samplers (the scene's sampler is used: linear, mipmapped, repeating).
-- Render order overrides, instanced drawing, frustum culling.
+- Instanced drawing.
 
 ## Contributing
 

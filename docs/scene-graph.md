@@ -41,6 +41,8 @@ walking up its parents.
 | `position`, `rotation`, `scale` | origin, identity, 1 | the local transform |
 | `visible` | true | false hides the node and its subtree |
 | `opacity` | 1 | fades the node and its subtree; multiplied down the tree, drawn blended below 1, not drawn at 0 |
+| `rendering_order` | 0 | draws the node before (lower) or after (higher) the others, ahead of every other ordering |
+| `billboard` | `SCENE_BILLBOARD_NONE` | turns it to face the camera: `_ALL`, or about the world `_X`, `_Y` or `_Z` axis only (ViroReact's transformBehaviors); its own rotation applies after |
 | `ignore_events` | false | rays pass through it ([hit testing](input.md)) |
 | `mesh`, `material` | 0, 0 | what the node draws |
 | `camera` | -1 | the camera it holds |

@@ -39,7 +39,8 @@ pipeline.
 - **Sky.** A solid color, a cube map from `<gpu/ibl>` or six images, and image-based
   lighting for PBR materials.
 - **Animation.** Position, scale, rotation, opacity and color animated in groups and
-  chains with ViroReact's easing curves, and node opacity down the tree.
+  chains with ViroReact's easing curves, node opacity down the tree, rendering order,
+  billboards and frustum culling.
 - **Input.** Hit tests from the screen or any controller, and click, drag, pinch, rotate,
   hover and fuse events on nodes, bubbling to the nearest handler as in ViroReact.
 

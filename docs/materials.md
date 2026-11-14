@@ -88,6 +88,11 @@ shadow. Its `blend_mode`, with `s` the surface color, `a` its alpha and `d` the 
 Blending happens in the linear HDR image, before tone mapping. `double_sided` turns off
 back-face culling and lights back faces with the flipped normal.
 
+`skip_depth_test` draws the surface over whatever was drawn before it, near or far, and
+`skip_depth_write` leaves the depth buffer as it was (ViroReact's `readsFromDepthBuffer`
+and `writesToDepthBuffer` set to false). With a node's `rendering_order` they put a panel
+or a label on top of the scene.
+
 ## Shader variants
 
 Each material compiles to a variant: lighting model, alpha mode, blend mode (for blended

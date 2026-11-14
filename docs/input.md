@@ -22,8 +22,11 @@ A node is hit when the ray crosses the bounds of its mesh, carried through the n
 matrix: the test runs in the node's own space, so it is exact for a rotated, scaled or
 nested node. Nodes without a mesh, hidden nodes (and the subtrees of hidden nodes) and
 nodes with `ignore_events` set are not hit; rays pass through them.
-`Scene_hit_test` gives the nearest hit. When the ray hits nothing, it returns false and the
-hit is the background: node 0, `background` true, the point `SCENE_BACKGROUND_DISTANCE`
+`Scene_hit_test` gives the hit drawn on top, as ViroReact does: hits are taken in draw order
+(`rendering_order`, then farthest first), and one behind a nearer node whose material
+writes depth is hidden unless its own material skips the depth test. Without rendering
+orders or depth settings that is the nearest hit. When the ray hits nothing, it returns
+false and the hit is the background: node 0, `background` true, the point `SCENE_BACKGROUND_DISTANCE`
 (8) units along the ray. `Scene_hit_test_all` lists every hit, nearest first.
 
 Bounds are those of the mesh as uploaded. A skinned or morphed mesh is tested against its

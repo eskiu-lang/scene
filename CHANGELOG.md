@@ -17,6 +17,14 @@ All notable changes to this package are documented here. The format follows
 - `SceneNode.ignore_events` keeps a node out of hit tests.
 - `SceneNode.opacity` fades a node and its subtree: it multiplies down the tree, a node
   below 1 is drawn blended (whatever its material's alpha mode), one at 0 is not drawn.
+- `SceneNode.rendering_order` sorts draws ahead of everything else, and
+  `SceneMaterial.skip_depth_test` / `skip_depth_write` (ViroReact's `readsFromDepthBuffer`
+  and `writesToDepthBuffer`) put a node on top; `Scene_hit_test` returns the hit drawn on
+  top under the same rules, as ViroReact does.
+- `SceneNode.billboard` (`SCENE_BILLBOARD_ALL`, `_X`, `_Y`, `_Z`) turns a node to face the
+  camera with ViroReact's billboard rotation.
+- Frustum culling: nodes wholly outside the camera's view are not drawn (they still cast
+  shadows).
 - `<scene/animation>`: `SceneAnimations` animates position, scale, Euler rotation,
   opacity and material color in groups (duration, delay, easing) and serial or parallel
   chains, with ViroReact's easing curves, relative values and property strings, loops,

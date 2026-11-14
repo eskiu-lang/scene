@@ -19,8 +19,10 @@ surface.present(&frame);
 1. The world matrices of every node, the camera, the lights.
 2. One depth-only pass per shadow-casting light, into its layer of the shadow map array.
 3. The scene pass, into an RGBA16Float image with a Depth32Float depth buffer, cleared to
-   `Scene.background`: opaque and masked nodes sorted front to back (fewer shaded pixels),
-   the skybox, then blended nodes back to front.
+   `Scene.background`: by `SceneNode.rendering_order` first (lower first), then opaque and
+   masked nodes front to back (fewer shaded pixels), the skybox, then blended and faded
+   nodes back to front. A node whose bounds are wholly outside the camera's view is not
+   drawn in this pass (it still casts shadows).
 4. Bloom, when on: a bright pass into a half-size image and `bloom_passes` pairs of
    horizontal and vertical Gaussian blurs.
 5. The final pass into `view`: the HDR image plus the bloom, tone mapped, sRGB-encoded when

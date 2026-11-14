@@ -92,6 +92,20 @@ SceneCamera scene_orthographic(float height, float near, float far)
 An orthographic camera that sees height world units from the bottom of the image to the
 top.
 
+### SCENE_BILLBOARD_NONE, SCENE_BILLBOARD_ALL, SCENE_BILLBOARD_X, SCENE_BILLBOARD_Y, SCENE_BILLBOARD_Z
+
+```eskiu
+const int SCENE_BILLBOARD_NONE = 0;
+const int SCENE_BILLBOARD_ALL = 1;
+const int SCENE_BILLBOARD_X = 2;
+const int SCENE_BILLBOARD_Y = 3;
+const int SCENE_BILLBOARD_Z = 4;
+```
+
+How a node turns to face the camera (SceneNode.billboard), ViroReact's
+transformBehaviors: not at all; fully (its +Z toward the camera); or only about the
+world X, Y or Z axis.
+
 ### SceneNode
 
 ```eskiu
@@ -111,6 +125,8 @@ struct SceneNode {
     bool receives_shadows;
     uint32 light_mask;
     float opacity;
+    int rendering_order;
+    int billboard;
     bool ignore_events;
     Mat4 world;
     List<Mat4> joints;
@@ -125,7 +141,10 @@ material and camera are ids (0, 0 and -1 when it has none); casts_shadows and
 receives_shadows choose its part in shadows, and light_mask the lights that reach it
 (SceneLight.influence). opacity (1) fades the node and its subtree: it multiplies down
 the tree, a node below 1 is drawn blended (after the opaque surfaces, sorted back to
-front, casting no shadow), and one at 0 is not drawn. ignore_events keeps the node's mesh out of hit tests
+front, casting no shadow), and one at 0 is not drawn. rendering_order (0) draws the node
+before (lower) or after (higher) others whatever its distance, ahead of every other
+ordering; with a material that skips the depth test it puts a panel on top. billboard
+(SCENE_BILLBOARD_*) turns the node to face the camera. ignore_events keeps the node's mesh out of hit tests
 (`<scene/input>`): rays pass through it. alive is false once the node is removed. Change
 parent and children through Scene_set_parent and Scene_remove, not by hand.
 
@@ -318,8 +337,9 @@ The world matrix of node, computed now from its ancestors' current transforms.
 void Scene_update(*Scene self)
 ```
 
-Recomputes every node's world matrix (SceneNode.world) from the tree. Scene_render does
-it first; call it to read world matrices in between.
+Recomputes every node's world matrix (SceneNode.world) from the tree, turning
+billboarded nodes toward the scene's camera. Scene_render does it first; call it to
+read world matrices in between.
 
 ### scene_matrix_rotation
 
@@ -1082,9 +1102,12 @@ Nodes that are hidden, or set ignore_events, are left out. Returns the count.
 bool Scene_hit_test(*Scene self, SceneRay ray, *SceneHit hit)
 ```
 
-The nearest node ray hits, into hit. When it hits nothing, hit is the background
-(node 0, background true, the point SCENE_BACKGROUND_DISTANCE along the ray) and the
-result is false.
+The node ray hits that is drawn on top, into hit: as in ViroReact, hits are taken in
+draw order (rendering_order, then farthest first), and a hit behind a nearer node whose
+material writes depth is hidden, unless its own material skips the depth test (drawn
+over everything before it). Without rendering orders or depth settings this is the
+nearest hit. When the ray hits nothing, it returns false and hit is the background
+(node 0, background true, the point SCENE_BACKGROUND_DISTANCE along the ray).
 
 ### SCENE_ON_CLICK, SCENE_ON_DRAG, SCENE_ON_PINCH, SCENE_ON_ROTATE, SCENE_ON_HOVER, SCENE_ON_FUSE
 
@@ -1623,6 +1646,8 @@ struct SceneMaterial {
     float alpha_cutoff;
     int blend_mode;
     bool double_sided;
+    bool skip_depth_test;
+    bool skip_depth_write;
     SceneUv[6] uv;
 }
 ```
@@ -1702,6 +1727,23 @@ int scene_key_fade(int key)
 The key of a material drawn on a node faded by its opacity (SceneNode.opacity below 1):
 blended over what is behind it with its alpha times the node's opacity, whatever the
 material's own alpha mode.
+
+### scene_key_skips_depth_test
+
+```eskiu
+bool scene_key_skips_depth_test(int key)
+```
+
+Whether a key draws over everything before it (SceneMaterial.skip_depth_test).
+
+### scene_key_skips_depth_write
+
+```eskiu
+bool scene_key_skips_depth_write(int key)
+```
+
+Whether a key leaves the depth buffer as it is (SceneMaterial.skip_depth_write; blended
+keys never write depth).
 
 ### scene_key_faded
 
