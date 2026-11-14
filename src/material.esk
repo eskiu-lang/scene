@@ -577,6 +577,62 @@ SceneShaderModifier scene_modifier_wgsl(int entry, string uniforms, string body)
     return SceneShaderModifier{entry: entry, uniforms: uniforms, body: body, varyings: "", wgsl: true};
 }
 
+// How a semantic mask uses the labels it names: show the material only where they are, hide
+// it where they are, color it by label (to see the labels), or show it only where they are
+// with unlabeled pixels decided by height on the screen (upper half shown: ViroReact's sky
+// effect, as ARCore leaves the image's edges unlabeled).
+const int SCENE_SEMANTIC_SHOW_ONLY = 0;
+const int SCENE_SEMANTIC_HIDE = 1;
+const int SCENE_SEMANTIC_DEBUG = 2;
+const int SCENE_SEMANTIC_SHOW_ONLY_SKY = 3;
+
+// The bit of a label in a semantic mask's set (labels as an AR session gives them: 1 sky,
+// 2 building, 3 tree, 4 road, 5 sidewalk, 6 terrain, 7 structure, 8 object, 9 vehicle,
+// 10 person, 11 water).
+int scene_semantic_label(int label) {
+    return 1 << label;
+}
+
+// The bodies the masks made (a modifier borrows its text).
+List<String> _scene_semantic_bodies;
+
+// A fragment modifier masking a material by what the AR camera sees at each pixel, as
+// ViroReact's semantic masks: `labels` is a set of scene_semantic_label bits, `mode` a
+// SCENE_SEMANTIC_*. It reads Scene.semantic_texture through Scene.semantic_transform and
+// weighs the result by the confidence; the material needs SCENE_ALPHA_BLEND for the edges to
+// fade.
+SceneShaderModifier scene_semantic_mask(int mode, int labels) {
+    String b;
+    b.append("vec2 sem_view = vec2(gl_FragCoord.x / viewport_size.x, 1.0 - gl_FragCoord.y / viewport_size.y);\n"
+        "vec2 sem_uv = (semantic_transform * vec4(sem_view, 0.0, 1.0)).xy;\n"
+        "sem_uv = clamp(sem_uv, vec2(0.005), vec2(0.995));\n"
+        "vec2 sem_cell = (floor(sem_uv * semantic_size) + 0.5) / semantic_size;\n"
+        "float sem_label = floor(texture(semantic_texture, sem_cell).r * 255.0 + 0.5);\n"
+        "bool sem_matches = false;\n");
+    for (l in 1..12) {
+        if ((labels & (1 << l)) != 0) b.appendf("if (sem_label == %d.0) { sem_matches = true; }\n", l);
+    }
+    b.append("float sem_conf = texture(semantic_confidence_texture, sem_uv).r;\n");
+    if (mode == SCENE_SEMANTIC_DEBUG) {
+        b.append("float sem_t = sem_label / 11.0;\n"
+            "float sem_g = 0.0;\n"
+            "if (sem_label > 0.5) { sem_g = 0.8; }\n"
+            "_output_color = vec4(sem_t, sem_g, 1.0 - sem_t, 1.0);\n");
+    } else if (mode == SCENE_SEMANTIC_HIDE) {
+        b.append("if (sem_matches) { _output_color.a *= 1.0 - sem_conf; }\n");
+    } else if (mode == SCENE_SEMANTIC_SHOW_ONLY_SKY) {
+        b.append("if (sem_matches) { _output_color.a *= sem_conf; }\n"
+            "else if (sem_label < 0.5) { if (gl_FragCoord.y / viewport_size.y <= 0.5) { _output_color.a = 0.0; } }\n"
+            "else { _output_color.a = 0.0; }\n");
+    } else {
+        b.append("if (sem_matches) { _output_color.a *= sem_conf; } else { _output_color.a = 0.0; }\n");
+    }
+    List_push(&_scene_semantic_bodies, b);
+    return scene_modifier(SCENE_MODIFIER_FRAGMENT,
+        "uniform sampler2D semantic_texture; uniform sampler2D semantic_confidence_texture; uniform mat4 semantic_transform; uniform vec2 semantic_size;",
+        (string)_scene_semantic_bodies.data[_scene_semantic_bodies.size - 1].data);
+}
+
 // A shader program: modifiers with their uniforms and varyings gathered and their bodies in
 // WGSL. offsets holds each uniform's byte offset in the material's uniform block (-1 for a
 // texture), uniform_bytes its size.
@@ -945,6 +1001,7 @@ void _scene_modified_shader(int key, *SceneShader p, *String out) {
         "    let v_texcoord = v.uv;\n"
         "    let v_surface_position = v.world;\n"
         "    let gl_FragCoord = vec4<f32>(v.clip.x, frame.shadow.y - v.clip.y, v.clip.z, v.clip.w);\n"
+        "    let viewport_size = vec2<f32>(frame.shadow.z, frame.shadow.y);\n"
         "    var _surface: ModSurface;\n"
         "    _surface.diffuse_color = s.base;\n"
         "    _surface.diffuse_texcoord = v.uv;\n"

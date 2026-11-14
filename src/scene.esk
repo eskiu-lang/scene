@@ -350,7 +350,11 @@ struct _SceneRenderer {
 // in meters, in its red channel (R32Float or R16Float, 0 where unknown), as an AR session
 // measures it: virtual content farther than the real surface at a pixel is hidden there
 // (ViroReact's DepthBased occlusion). occlusion_transform maps the view's coordinates (x, y
-// from 0 to 1, from the top left) to the depth image's.
+// from 0 to 1, from the top left) to the depth image's. semantic_texture (a texture id, an
+// R8Unorm image holding a label per pixel, as an AR session's scene semantics give it) and
+// semantic_confidence_texture (its confidence, 0 to 1; white for none), with
+// semantic_transform from the view's coordinates to theirs, are what semantic masks read
+// (scene_semantic_mask).
 struct Scene {
     Gpu gpu;
     List<SceneNode> nodes;
@@ -378,6 +382,9 @@ struct Scene {
     int camera_background;
     int occlusion_depth;
     Mat4 occlusion_transform;
+    int semantic_texture;
+    int semantic_confidence_texture;
+    Mat4 semantic_transform;
     _SceneRenderer _r;
 }
 
@@ -492,6 +499,7 @@ Result<Scene, string> Gpu_scene(*Gpu self) {
     s.sky_rotation = quat_identity();
     s.camera_image_transform = mat4_identity();
     s.occlusion_transform = mat4_identity();
+    s.semantic_transform = mat4_identity();
     s.post.gamma = true;
     s.shadow_size = 2048;
     _scene_new_node(&s, -1, "root");
@@ -1639,6 +1647,12 @@ Result<int, string> _scene_material_mods(*Scene self, int id) {
             // the AR camera image's mapping, kept current from the scene
             if (strcmp(un, "camera_image_transform") == 0) {
                 for (j in 0..16) g.mod_values.data[p.offsets.data[k] / 4 + j] = self.camera_image_transform.m[j];
+            } else if (strcmp(un, "semantic_transform") == 0) {
+                for (j in 0..16) g.mod_values.data[p.offsets.data[k] / 4 + j] = self.semantic_transform.m[j];
+            } else if (strcmp(un, "semantic_size") == 0) {
+                *GpuTexture st = _scene_tex(self, self.semantic_texture);
+                g.mod_values.data[p.offsets.data[k] / 4] = (float)st.width;
+                g.mod_values.data[p.offsets.data[k] / 4 + 1] = (float)st.height;
             }
             continue;
         }
@@ -1646,6 +1660,10 @@ Result<int, string> _scene_material_mods(*Scene self, int id) {
             g.mod_group.view((uint32)(2 + t), &self._r.depth_prev_view);
         } else if (strcmp(un, "camera_texture") == 0) {
             g.mod_group.texture((uint32)(2 + t), _scene_tex(self, self.camera_texture));
+        } else if (strcmp(un, "semantic_texture") == 0) {
+            g.mod_group.texture((uint32)(2 + t), _scene_tex(self, self.semantic_texture));
+        } else if (strcmp(un, "semantic_confidence_texture") == 0) {
+            g.mod_group.texture((uint32)(2 + t), _scene_tex(self, self.semantic_confidence_texture));
         } else {
             g.mod_group.texture((uint32)(2 + t), _scene_tex(self, g.mod_textures.data[k]));
         }

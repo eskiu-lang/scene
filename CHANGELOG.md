@@ -8,6 +8,9 @@ All notable changes to this package are documented here. The format follows
 
 ### Added
 
+- Semantic masks (ViroReact's): `scene_semantic_mask`, `scene_semantic_label`, the
+  `SCENE_SEMANTIC_*` modes, and `Scene.semantic_texture`, `semantic_confidence_texture` and
+  `semantic_transform`; modifier bodies see `viewport_size`.
 - `<scene/input>`: `Scene_screen_ray`, `Scene_hit_test` and `Scene_hit_test_all` (mesh
   bounds tested in each node's own space, so rotated, scaled and nested nodes are exact),
   and `SceneInput`, which turns touches (`SceneInput_touch`) or any controller's pointer,

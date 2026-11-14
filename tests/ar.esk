@@ -273,6 +273,75 @@ Result<int, string> occluder(*Gpu gpu) {
     check("beside it: the wall", at(px, 26, 16)[0] > 250);
     return Ok<int, string>(0);
 }
+// Semantic masks: a red wall over labels that are sky on the left half and building on the
+// right: shown only on the sky, hidden on the sky, colored by label; the confidence fades it.
+Result<int, string> semantics(*Gpu gpu) {
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.tone_mapping = SCENE_TONE_NONE;
+    scene.post.gamma = false;
+    scene.background = Vec4{0.0, 0.0, 1.0, 1.0};
+    SceneGeometry q = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    List<SceneShaderModifier> show;
+    List_push(&show, scene_semantic_mask(SCENE_SEMANTIC_SHOW_ONLY, scene_semantic_label(1)));
+    List<SceneShaderModifier> hide;
+    List_push(&hide, scene_semantic_mask(SCENE_SEMANTIC_HIDE, scene_semantic_label(1)));
+    List<SceneShaderModifier> debug;
+    List_push(&debug, scene_semantic_mask(SCENE_SEMANTIC_DEBUG, 0));
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = Vec4{1.0, 0.0, 0.0, 1.0};
+    m.alpha_mode = SCENE_ALPHA_BLEND;
+    m.shader = scene.add_shader(&show)?;
+    int mat = scene.add_material(m);
+    int wall = scene.add_object(0, quad, mat);
+    scene.node(wall).position = Vec3{0.0, 0.0, -5.0};
+    scene.node(wall).scale = Vec3{40.0, 40.0, 1.0};
+    int cam = scene.add_camera(0, scene_perspective(1.0, 0.1, 50.0));
+    scene.set_camera(cam);
+    GpuTextureDesc ld = GpuTextureDesc{width: 4, height: 1, format: WGPUTextureFormat_R8Unorm,
+        usage: WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst};
+    GpuTexture labels = gpu.texture_with(&ld)?;
+    uint8[4] sky_building = {1, 1, 2, 2};
+    labels.write_level(0, 0, &sky_building[0])?;
+    scene.semantic_texture = scene.add_texture(labels);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA8Unorm)?;
+    defer target.release();
+    *uint8 px = alloc<uint8>(N * N * 4);
+    defer free(px);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("shown only on the sky", at(px, 6, 16)[0] > 250 && at(px, 26, 16)[0] < 3 && at(px, 26, 16)[2] > 250);
+    scene.material(mat).shader = scene.add_shader(&hide)?;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("hidden on the sky", at(px, 6, 16)[0] < 3 && at(px, 26, 16)[0] > 250);
+    // half confident: the sky shows half the wall
+    GpuTexture conf = gpu.texture_with(&ld)?;
+    uint8[4] half = {128, 128, 128, 128};
+    conf.write_level(0, 0, &half[0])?;
+    scene.semantic_confidence_texture = scene.add_texture(conf);
+    scene.material(mat).shader = scene.add_shader(&show)?;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("the confidence fades it", near((int)at(px, 6, 16)[0], 128, 4) && near((int)at(px, 6, 16)[2], 127, 4));
+    scene.material(mat).shader = scene.add_shader(&debug)?;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("colored by label", near((int)at(px, 6, 16)[0], 23, 3) && near((int)at(px, 26, 16)[0], 46, 3) && near((int)at(px, 26, 16)[1], 204, 3));
+    // mirrored: the building on the left
+    scene.semantic_transform = mat4_trs(Vec3{1.0, 0.0, 0.0}, quat_identity(), Vec3{-1.0, 1.0, 1.0});
+    scene.material(mat).shader = scene.add_shader(&hide)?;
+    scene.semantic_confidence_texture = 0;
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("the transform maps the view to the labels", at(px, 6, 16)[0] > 250 && at(px, 26, 16)[0] < 3);
+    show.free();
+    hide.free();
+    debug.free();
+    return Ok<int, string>(0);
+}
 
 int main() {
     Result<int, string> r = run();
@@ -284,6 +353,7 @@ int main() {
             if (r.ok) r = chroma(&gpu);
             if (r.ok) r = occlusion(&gpu);
             if (r.ok) r = occluder(&gpu);
+            if (r.ok) r = semantics(&gpu);
             gpu.release();
         }
     }

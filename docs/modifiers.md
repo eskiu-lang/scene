@@ -39,7 +39,7 @@ vertex color, the lighting model fills `_lightingContribution` for each light be
 lighting modifiers change it, and the contributions are summed as `ambient` plus `diffuse`
 and `specular` times `visibility` (the light's shadow). `_light.type` is 1 for a directional
 light, 2 for a point light and 3 for a spot. A modifier body also sees `camera_position`,
-`v_texcoord`, `v_surface_position` and `gl_FragCoord` in the fragment stage, and
+`v_texcoord`, `v_surface_position`, `gl_FragCoord` and `viewport_size` in the fragment stage, and
 `camera_position` in the vertex stage.
 
 ## Uniforms, textures and varyings
@@ -101,6 +101,29 @@ uniform mat4 camera_image_transform;
 vec2 uv = (camera_image_transform * vec4(gl_FragCoord.xy / size, 0.0, 1.0)).xy;
 _output_color.rgb = mix(_output_color.rgb, texture(camera_texture, uv).rgb, 0.5);
 ```
+
+## Semantic masks
+
+`scene_semantic_mask(mode, labels)` is a fragment modifier that masks a material by what the
+AR camera sees at each pixel, as ViroReact's semantic masks: `labels` is a set of
+`scene_semantic_label(n)` bits (1 sky, 2 building, 3 tree, 4 road, 5 sidewalk, 6 terrain,
+7 structure, 8 object, 9 vehicle, 10 person, 11 water), and the mode shows the material only
+on them (`SCENE_SEMANTIC_SHOW_ONLY`), hides it on them (`_HIDE`), colors it by label
+(`_DEBUG`), or shows it on them with unlabeled pixels decided by height on the screen
+(`_SHOW_ONLY_SKY`, ViroReact's sky effect).
+
+```eskiu
+List<SceneShaderModifier> sky;
+sky.push(scene_semantic_mask(SCENE_SEMANTIC_SHOW_ONLY_SKY, scene_semantic_label(1)));
+SceneMaterial m = scene_material(SCENE_CONSTANT);
+m.alpha_mode = SCENE_ALPHA_BLEND;     // the confidence fades the edges
+m.shader = scene.add_shader(&sky)?;
+```
+
+It reads `Scene.semantic_texture` (a label per texel, R8Unorm), `Scene.semantic_confidence_texture`
+(white when there is none) and `Scene.semantic_transform` (the view's coordinates, from the top
+left, to theirs); arscene's `ArStage` sets the three from each AR frame. A modifier body also sees
+`viewport_size`, the view's size in pixels.
 
 ## Shadows
 

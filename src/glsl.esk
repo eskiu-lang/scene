@@ -921,6 +921,7 @@ GlslTranslator glsl_translator(string sampler) {
     GlslTranslator_declare(&t, "v_texcoord", "vec2");
     GlslTranslator_declare(&t, "v_surface_position", "vec3");
     GlslTranslator_declare(&t, "gl_FragCoord", "vec4");
+    GlslTranslator_declare(&t, "viewport_size", "vec2");
     return t;
 }
 

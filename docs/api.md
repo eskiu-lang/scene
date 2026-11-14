@@ -260,6 +260,9 @@ struct Scene {
     int camera_background;
     int occlusion_depth;
     Mat4 occlusion_transform;
+    int semantic_texture;
+    int semantic_confidence_texture;
+    Mat4 semantic_transform;
 }
 ```
 
@@ -280,7 +283,11 @@ fitted to the view. occlusion_depth (a texture id, 0 for none) is the real world
 in meters, in its red channel (R32Float or R16Float, 0 where unknown), as an AR session
 measures it: virtual content farther than the real surface at a pixel is hidden there
 (ViroReact's DepthBased occlusion). occlusion_transform maps the view's coordinates (x, y
-from 0 to 1, from the top left) to the depth image's.
+from 0 to 1, from the top left) to the depth image's. semantic_texture (a texture id, an
+R8Unorm image holding a label per pixel, as an AR session's scene semantics give it) and
+semantic_confidence_texture (its confidence, 0 to 1; white for none), with
+semantic_transform from the view's coordinates to theirs, are what semantic masks read
+(scene_semantic_mask).
 
 ### Gpu_scene
 
@@ -2379,6 +2386,42 @@ SceneShaderModifier scene_modifier_wgsl(int entry, string uniforms, string body)
 ```
 
 A WGSL modifier: the same entry points and names, the body in WGSL.
+
+### SCENE_SEMANTIC_SHOW_ONLY, SCENE_SEMANTIC_HIDE, SCENE_SEMANTIC_DEBUG, SCENE_SEMANTIC_SHOW_ONLY_SKY
+
+```eskiu
+const int SCENE_SEMANTIC_SHOW_ONLY = 0;
+const int SCENE_SEMANTIC_HIDE = 1;
+const int SCENE_SEMANTIC_DEBUG = 2;
+const int SCENE_SEMANTIC_SHOW_ONLY_SKY = 3;
+```
+
+How a semantic mask uses the labels it names: show the material only where they are, hide
+it where they are, color it by label (to see the labels), or show it only where they are
+with unlabeled pixels decided by height on the screen (upper half shown: ViroReact's sky
+effect, as ARCore leaves the image's edges unlabeled).
+
+### scene_semantic_label
+
+```eskiu
+int scene_semantic_label(int label)
+```
+
+The bit of a label in a semantic mask's set (labels as an AR session gives them: 1 sky,
+2 building, 3 tree, 4 road, 5 sidewalk, 6 terrain, 7 structure, 8 object, 9 vehicle,
+10 person, 11 water).
+
+### scene_semantic_mask
+
+```eskiu
+SceneShaderModifier scene_semantic_mask(int mode, int labels)
+```
+
+A fragment modifier masking a material by what the AR camera sees at each pixel, as
+ViroReact's semantic masks: `labels` is a set of scene_semantic_label bits, `mode` a
+SCENE_SEMANTIC_*. It reads Scene.semantic_texture through Scene.semantic_transform and
+weighs the result by the confidence; the material needs SCENE_ALPHA_BLEND for the edges to
+fade.
 
 ### SceneShader
 
