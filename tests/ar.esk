@@ -238,6 +238,42 @@ Result<int, string> occlusion(*Gpu gpu) {
     return Ok<int, string>(0);
 }
 
+// An occluder (no_color_write): invisible, yet what is behind it is hidden.
+Result<int, string> occluder(*Gpu gpu) {
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.tone_mapping = SCENE_TONE_NONE;
+    scene.post.gamma = false;
+    scene.background = Vec4{0.0, 0.0, 1.0, 1.0};
+    SceneGeometry q = scene_quad(1.0, 1.0);
+    int quad = scene.add_geometry(&q)?;
+    q.free();
+    SceneMaterial red = scene_material(SCENE_CONSTANT);
+    red.diffuse = Vec4{1.0, 0.0, 0.0, 1.0};
+    int far_wall = scene.add_object(0, quad, scene.add_material(red));
+    scene.node(far_wall).position = Vec3{0.0, 0.0, -5.0};
+    scene.node(far_wall).scale = Vec3{40.0, 40.0, 1.0};
+    SceneMaterial occ = scene_material(SCENE_CONSTANT);
+    occ.diffuse = Vec4{0.0, 1.0, 0.0, 1.0};
+    occ.no_color_write = true;
+    int near_wall = scene.add_object(0, quad, scene.add_material(occ));
+    scene.node(near_wall).position = Vec3{-1.0, 0.0, -2.0};
+    scene.node(near_wall).scale = Vec3{2.0, 4.0, 1.0};
+    // the occluder is drawn before what it hides
+    scene.node(near_wall).rendering_order = -1;
+    int cam = scene.add_camera(0, scene_perspective(1.0, 0.1, 50.0));
+    scene.set_camera(cam);
+    GpuTexture target = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA8Unorm)?;
+    defer target.release();
+    *uint8 px = alloc<uint8>(N * N * 4);
+    defer free(px);
+    scene.render_to(&target)?;
+    target.read(px)?;
+    check("behind the occluder: the background", at(px, 6, 16)[0] < 3 && at(px, 6, 16)[1] < 3 && at(px, 6, 16)[2] > 250);
+    check("beside it: the wall", at(px, 26, 16)[0] > 250);
+    return Ok<int, string>(0);
+}
+
 int main() {
     Result<int, string> r = run();
     if (r.ok) {
@@ -247,6 +283,7 @@ int main() {
             r = catcher(&gpu);
             if (r.ok) r = chroma(&gpu);
             if (r.ok) r = occlusion(&gpu);
+            if (r.ok) r = occluder(&gpu);
             gpu.release();
         }
     }

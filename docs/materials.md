@@ -130,6 +130,13 @@ m.chroma_key = true;
 m.chroma_key_color = Vec3{0.0, 1.0, 0.0};
 ```
 
+## Occluders
+
+`no_color_write` (ViroReact's `colorWriteMask` of `None`) draws a surface into the depth
+buffer only: it is invisible, yet what lies behind it is hidden. Give it a lower
+`rendering_order` than what it hides so it is drawn first. In AR this is how the real world's
+mesh (LiDAR reconstruction) hides virtual content behind walls and furniture.
+
 ## Shader variants
 
 Each material compiles to a variant: lighting model, alpha mode, blend mode (for blended
