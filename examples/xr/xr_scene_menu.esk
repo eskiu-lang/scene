@@ -1,0 +1,454 @@
+// xr_scene_menu.esk: the menu and the twelve scenes (part of xr_scene.esk, which imports it in order after the ones before it)
+
+// --- the menu ---
+
+Result<int, string> _xr_menu() {
+    int menu = xr_scene.add_node(0, "menu");
+    xr_scene.node(menu).position = Vec3{0.0, 0.82, -0.95};
+    xr_scene.node(menu).rotation = quat_axis_angle(Vec3{1.0, 0.0, 0.0}, -0.5);
+    int button_mesh = _xr_mesh(scene_box(0.2, 0.07, 0.012))?;
+    xr_button_mat = _xr_material(SCENE_BLINN, Vec4{0.16, 0.18, 0.24, 1.0});
+    xr_button_on_mat = _xr_material(SCENE_BLINN, Vec4{0.1, 0.45, 0.75, 1.0});
+    for (i in 0..XR_SCENES) {
+        int row = i / 4;
+        int col = i % 4;
+        float x = ((float)col - 1.5) * 0.215;
+        float y = (1.0 - (float)row) * 0.085;
+        xr_buttons[i] = xr_scene.add_object(menu, button_mesh, i == 0 ? xr_button_on_mat : xr_button_mat);
+        xr_scene.node(xr_buttons[i]).position = Vec3{x, y, 0.0};
+        xr_input.on(xr_buttons[i], SCENE_ON_CLICK, _xr_button_clicked);
+        _xr_text(menu, xr_name(i), 5.0, Vec4{1.0, 1.0, 1.0, 1.0}, x, y, 0.008, 0.2, 0.07)?;
+    }
+    return Ok<int, string>(menu);
+}
+
+void _xr_button_clicked(*SceneEvent e) {
+    if (e.kind != SCENE_EVENT_CLICK || e.state != SCENE_CLICKED) return;
+    for (i in 0..XR_SCENES) {
+        if (xr_buttons[i] == e.node) _xr_show(i);
+    }
+}
+
+// Shows scene i and hides the others; the scenes with state start over when shown.
+void _xr_show(int i) {
+    xr_active = i;
+    for (k in 0..XR_SCENES) {
+        xr_scene.node(xr_roots[k]).visible = k == i;
+        xr_scene.node(xr_buttons[k]).material = k == i ? xr_button_on_mat : xr_button_mat;
+    }
+    xr_scene.light(xr_orbit_light).enabled = i == XR_LIGHTS;
+    xr_scene.light(xr_spot_light).enabled = i == XR_LIGHTS;
+    xr_scene.skybox = i == XR_IMAGES ? xr_sky : null;
+    xr_fountain.run = i == XR_PARTICLES;
+    xr_fire.run = i == XR_PARTICLES;
+    // the particles' draw nodes are the scene's, not under the emitters
+    xr_scene.node(xr_fountain.draw).visible = i == XR_PARTICLES;
+    xr_scene.node(xr_fire.draw).visible = i == XR_PARTICLES;
+    if (i == XR_PHYSICS) _xr_physics_reset();
+}
+
+// --- the scenes ---
+
+void _xr_box_clicked(*SceneEvent e) {
+    if (e.kind != SCENE_EVENT_CLICK || e.state != SCENE_CLICKED) return;
+    for (i in 0..3) {
+        if (xr_boxes[i] == e.node) xr_paused[i] = !xr_paused[i];
+    }
+}
+
+// Three turning boxes; a click stops or restarts one.
+Result<int, string> _xr_basics(int root) {
+    int box_mesh = _xr_mesh(scene_box(0.3, 0.3, 0.3))?;
+    Vec4[3] colors = {Vec4{0.9, 0.1, 0.1, 1.0}, Vec4{0.1, 0.8, 0.2, 1.0}, Vec4{0.15, 0.3, 0.95, 1.0}};
+    for (i in 0..3) {
+        xr_boxes[i] = xr_scene.add_object(root, box_mesh, _xr_material(SCENE_BLINN, colors[i]));
+        xr_scene.node(xr_boxes[i]).position = Vec3{((float)i - 1.0) * 0.6, 1.3, -1.8};
+        xr_input.on(xr_boxes[i], SCENE_ON_CLICK, _xr_box_clicked);
+    }
+    _xr_title(root, "Click a box to stop or restart it", 1.75, -1.8)?;
+    return Ok<int, string>(0);
+}
+
+// Each lighting model on the same color, then PBR from rough plastic to polished metal.
+Result<int, string> _xr_materials(int root) {
+    int sphere = _xr_mesh(scene_sphere(0.13, 32, 24))?;
+    int[5] models = {SCENE_CONSTANT, SCENE_LAMBERT, SCENE_PHONG, SCENE_BLINN, SCENE_PBR};
+    string[5] names = {"Constant", "Lambert", "Phong", "Blinn", "PBR"};
+    for (i in 0..5) {
+        SceneMaterial m = scene_material(models[i]);
+        m.diffuse = Vec4{0.85, 0.35, 0.15, 1.0};
+        m.shininess = 40.0;
+        m.roughness = 0.4;
+        int n = xr_scene.add_object(root, sphere, xr_scene.add_material(m));
+        float x = ((float)i - 2.0) * 0.36;
+        xr_scene.node(n).position = Vec3{x, 1.45, -1.8};
+        _xr_text(root, names[i], 7.0, Vec4{1.0, 1.0, 1.0, 1.0}, x, 1.66, -1.8, 0.34, 0.08)?;
+    }
+    for (i in 0..5) {
+        SceneMaterial m = scene_material(SCENE_PBR);
+        m.diffuse = Vec4{0.9, 0.75, 0.4, 1.0};
+        m.metalness = (float)i / 4.0;
+        m.roughness = 1.0 - (float)i / 4.0 * 0.85;
+        int n = xr_scene.add_object(root, sphere, xr_scene.add_material(m));
+        xr_scene.node(n).position = Vec3{((float)i - 2.0) * 0.36, 1.0, -1.8};
+    }
+    _xr_text(root, "metalness 0 to 1, roughness 1 to 0.15", 7.0, Vec4{0.85, 0.9, 1.0, 1.0}, 0.0, 0.78, -1.8, 1.6, 0.08)?;
+    return Ok<int, string>(0);
+}
+
+// Pillars and a sphere casting the sun's shadows, under a colored light circling them and
+// a spot light from above.
+Result<int, string> _xr_lights(int root) {
+    int pillar = _xr_mesh(scene_box(0.12, 0.8, 0.12))?;
+    int ball = _xr_mesh(scene_sphere(0.15, 32, 24))?;
+    int white = _xr_material(SCENE_BLINN, Vec4{0.9, 0.9, 0.92, 1.0});
+    for (i in 0..4) {
+        float a = (float)i * 1.5708 + 0.785;
+        int p = xr_scene.add_object(root, pillar, white);
+        xr_scene.node(p).position = Vec3{(float)cos((double)a) * 0.6, 0.4, -2.0 + (float)sin((double)a) * 0.6};
+    }
+    int s = xr_scene.add_object(root, ball, _xr_material(SCENE_PBR, Vec4{0.8, 0.8, 0.85, 1.0}));
+    xr_scene.node(s).position = Vec3{0.0, 0.5, -2.0};
+    xr_orbit_light = xr_scene.add_light(scene_point(Vec3{0.0, 1.0, -2.0}, Vec3{1.0, 0.45, 0.15}, 1.0, 0.3, 4.0));
+    xr_spot_light = xr_scene.add_light(scene_spot(Vec3{0.0, 2.2, -2.0}, Vec3{0.0, -1.0, 0.0}, Vec3{0.4, 0.6, 1.0}, 1.5, 0.2, 0.45, 0.5, 5.0));
+    _xr_title(root, "Shadows, a point light and a spot light", 1.5, -2.0)?;
+    return Ok<int, string>(0);
+}
+
+// A picture with transparency, a photo, a normal-mapped sphere and a 360 photo around the
+// viewer.
+Result<int, string> _xr_picture(int root, string name, float w, float h, Vec3 p, bool blend) {
+    String path = _xr_asset(name);
+    Result<int, string> tex = xr_scene.load_texture((string)path.data, true);
+    path.free();
+    if (tex.ok == 0) {
+        _xr_text(root, name, 7.0, Vec4{1.0, 0.5, 0.5, 1.0}, p.x, p.y, p.z, w, 0.08)?;
+        return Ok<int, string>(0);
+    }
+    int quad = _xr_mesh(scene_quad(w, h))?;
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse_texture = tex.value;
+    if (blend) m.alpha_mode = SCENE_ALPHA_BLEND;
+    int n = xr_scene.add_object(root, quad, xr_scene.add_material(m));
+    xr_scene.node(n).position = p;
+    return Ok<int, string>(n);
+}
+
+Result<int, string> _xr_images(int root) {
+    _xr_picture(root, "photo.jpg", 0.9, 0.45, Vec3{-0.55, 1.35, -1.8}, false)?;
+    _xr_picture(root, "pikachu.png", 0.5, 0.5, Vec3{0.45, 1.35, -1.8}, true)?;
+    String nm = _xr_asset("normal.jpg");
+    Result<int, string> normal = xr_scene.load_texture((string)nm.data, false);
+    nm.free();
+    int sphere = _xr_mesh(scene_sphere(0.18, 40, 30))?;
+    SceneMaterial m = scene_material(SCENE_BLINN);
+    m.diffuse = Vec4{0.7, 0.75, 0.85, 1.0};
+    m.shininess = 30.0;
+    if (normal.ok != 0) m.normal_texture = normal.value;
+    int ball = xr_scene.add_object(root, sphere, xr_scene.add_material(m));
+    xr_scene.node(ball).position = Vec3{0.0, 0.85, -1.8};
+    _xr_text(root, "normal map", 7.0, Vec4{1.0, 1.0, 1.0, 1.0}, 0.0, 0.6, -1.8, 0.5, 0.08)?;
+    String pano = _xr_asset("sky360.jpg");
+    Result<int, string> sky = xr_scene.load_sky_360((string)pano.data);
+    pano.free();
+    if (sky.ok != 0) xr_sky = xr_scene.skybox;
+    xr_scene.skybox = null;
+    _xr_title(root, "Images: transparency, a photo, a normal map, a 360 sky", 1.75, -1.8)?;
+    return Ok<int, string>(0);
+}
+
+// A screen the host's video frames go to (xr_scene_video_frame).
+Result<int, string> _xr_video_scene(int root) {
+    int quad = _xr_mesh(scene_quad(1.6, 0.9))?;
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = Vec4{0.1, 0.1, 0.12, 1.0};
+    xr_video_mat = xr_scene.add_material(m);
+    int n = xr_scene.add_object(root, quad, xr_video_mat);
+    xr_scene.node(n).position = Vec3{0.0, 1.35, -1.9};
+    _xr_title(root, "Video (video.mp4, decoded by the host)", 1.95, -1.9)?;
+    return Ok<int, string>(0);
+}
+
+// A glTF or VRX model from the assets, scaled to size meters and placed at p; animated
+// models play their first animation.
+Result<int, string> _xr_model(int root, string name, float size, Vec3 p, float turn) {
+    String path = _xr_asset(name);
+    Result<Gltf, string> g = model_load((string)path.data);
+    path.free();
+    if (g.ok == 0) {
+        _xr_text(root, name, 7.0, Vec4{1.0, 0.5, 0.5, 1.0}, p.x, p.y + 0.3, p.z, 0.6, 0.08)?;
+        return Ok<int, string>(0);
+    }
+    Gltf model = g.value;
+    Vec3 lo;
+    Vec3 hi;
+    model.bounds(&lo, &hi);
+    Vec3 ext = hi - lo;
+    float big = ext.x > ext.y ? ext.x : ext.y;
+    if (ext.z > big) big = ext.z;
+    float s = big > 0.0 ? size / big : 1.0;
+    int holder = xr_scene.add_node(root, name);
+    xr_scene.node(holder).position = p;
+    xr_scene.node(holder).rotation = quat_axis_angle(Vec3{0.0, 1.0, 0.0}, turn);
+    xr_scene.node(holder).scale = Vec3{s, s, s};
+    int inner = xr_scene.add_node(holder, null);
+    xr_scene.node(inner).position = Vec3{-(lo.x + hi.x) / 2.0, -lo.y, -(lo.z + hi.z) / 2.0};
+    SceneGltf sg = xr_scene.add_gltf(&model, inner)?;
+    List_push(&xr_models, model);
+    List_push(&xr_model_nodes, sg);
+    _xr_text(root, name, 6.0, Vec4{1.0, 1.0, 1.0, 1.0}, p.x, p.y - 0.15, p.z + 0.26, 0.5, 0.08)?;
+    return Ok<int, string>(0);
+}
+
+Result<int, string> _xr_models_scene(int root) {
+    int pedestal = _xr_mesh(scene_box(0.5, 0.5, 0.5))?;
+    int stone = _xr_material(SCENE_BLINN, Vec4{0.35, 0.37, 0.42, 1.0});
+    float[3] xs = {-0.75, 0.0, 0.75};
+    for (i in 0..3) {
+        int ped = xr_scene.add_object(root, pedestal, stone);
+        xr_scene.node(ped).position = Vec3{xs[i], 0.25, -2.1};
+    }
+    _xr_model(root, "Fox.glb", 0.45, Vec3{-0.75, 0.5, -2.1}, 0.6)?;
+    _xr_model(root, "RobotExpressive.glb", 0.7, Vec3{0.0, 0.5, -2.1}, 0.0)?;
+    _xr_model(root, "cake.vrx", 0.4, Vec3{0.75, 0.5, -2.1}, -0.4)?;
+    _xr_title(root, "glTF and VRX models, animated", 1.75, -2.1)?;
+    return Ok<int, string>(0);
+}
+
+// ViroText's styles: sizes, colors, alignment, an outline, extrusion.
+Result<int, string> _xr_texts(int root) {
+    if (!xr_has_font) return Ok<int, string>(0);
+    _xr_text(root, "Eskiu in a headset", 18.0, Vec4{1.0, 1.0, 1.0, 1.0}, 0.0, 1.7, -1.8, 2.6, 0.3)?;
+    _xr_text(root, "Text drawn by eskiu-lang/scene", 10.0, Vec4{1.0, 0.8, 0.2, 1.0}, 0.0, 1.45, -1.8, 2.6, 0.2)?;
+    SceneTextStyle st = scene_text_style();
+    st.size = 14.0;
+    st.color = Vec4{0.3, 0.9, 1.0, 1.0};
+    st.width = 0.9;
+    st.height = 0.4;
+    st.stroke = SCENE_TEXT_STROKE_OUTLINE;
+    st.stroke_color = Vec4{0.0, 0.1, 0.3, 1.0};
+    SceneText a = xr_scene.add_text(root, &xr_font, "An outlined line that wraps inside its box", st)?;
+    xr_scene.node(a.node).position = Vec3{-0.5, 1.05, -1.8};
+    st.stroke = SCENE_TEXT_STROKE_NONE;
+    st.color = Vec4{0.95, 0.4, 0.5, 1.0};
+    st.extrusion = 4.0;
+    st.align = SCENE_TEXT_RIGHT;
+    SceneText b = xr_scene.add_text(root, &xr_font, "Extruded, right aligned", st)?;
+    xr_scene.node(b.node).position = Vec3{0.5, 1.05, -1.8};
+    xr_scene.node(b.node).rotation = quat_axis_angle(Vec3{0.0, 1.0, 0.0}, -0.35);
+    return Ok<int, string>(0);
+}
+
+// A fountain and a fire.
+Result<int, string> _xr_particles(int root) {
+    int f = xr_scene.add_node(root, "fountain");
+    xr_scene.node(f).position = Vec3{-0.5, 0.6, -2.0};
+    xr_fountain = scene_particles(&xr_scene, f)?;
+    xr_fountain.max_particles = 800;
+    xr_fountain.rate_per_second = Vec2{180.0, 180.0};
+    xr_fountain.lifetime = Vec2{1.4, 1.8};
+    xr_fountain.width = 0.025;
+    xr_fountain.height = 0.025;
+    xr_fountain.fixed_to_emitter = false;
+    xr_fountain.velocity = scene_particle_constant(Vec3{-0.35, 2.4, -0.35});
+    xr_fountain.velocity.max = Vec3{0.35, 2.8, 0.35};
+    xr_fountain.acceleration = scene_particle_constant(Vec3{0.0, -3.5, 0.0});
+    xr_fountain.color = scene_particle_constant(Vec3{0.5, 0.8, 1.0});
+    xr_fountain.alpha = scene_particle_constant(Vec3{0.9, 0.0, 0.0});
+    String spark = _xr_asset("spark.png");
+    Result<int, string> st = xr_scene.load_texture((string)spark.data, true);
+    spark.free();
+    if (st.ok != 0) xr_fountain.image(&xr_scene, st.value, 0.03, 0.03);
+    xr_fountain.run = false;
+    int fire = xr_scene.add_node(root, "fire");
+    xr_scene.node(fire).position = Vec3{0.5, 0.6, -2.0};
+    xr_fire = scene_particles(&xr_scene, fire)?;
+    xr_fire.max_particles = 600;
+    xr_fire.rate_per_second = Vec2{120.0, 120.0};
+    xr_fire.lifetime = Vec2{0.6, 1.0};
+    xr_fire.width = 0.06;
+    xr_fire.height = 0.06;
+    xr_fire.fixed_to_emitter = false;
+    xr_fire.volume_size = Vec3{0.2, 0.02, 0.2};
+    xr_fire.velocity = scene_particle_constant(Vec3{-0.05, 0.5, -0.05});
+    xr_fire.velocity.max = Vec3{0.05, 0.9, 0.05};
+    xr_fire.color = scene_particle_constant(Vec3{1.0, 0.55, 0.1});
+    xr_fire.alpha = scene_particle_constant(Vec3{0.8, 0.0, 0.0});
+    String flame = _xr_asset("fire.png");
+    Result<int, string> ft = xr_scene.load_texture((string)flame.data, true);
+    flame.free();
+    if (ft.ok != 0) xr_fire.image(&xr_scene, ft.value, 0.12, 0.12);
+    xr_fire.run = false;
+    _xr_title(root, "A fountain and a fire", 1.7, -2.0)?;
+    return Ok<int, string>(0);
+}
+
+void _xr_crate_clicked(*SceneEvent e) {
+    if (e.kind != SCENE_EVENT_CLICK || e.state != SCENE_CLICKED) return;
+    for (i in 0..xr_crates.size) {
+        if (xr_crates.data[i] == e.node) {
+            Vec3 dir = xr_pointer.ray(&xr_scene).dir;
+            xr_world.apply_impulse(xr_crate_bodies.data[i], dir * 2.5, xr_scene.node(e.node).position);
+        }
+    }
+}
+
+// A pyramid of crates on a table; balls fall on it every two seconds and a click pushes a
+// crate along the pointer.
+Result<int, string> _xr_physics(int root) {
+    xr_world = scene_physics();
+    int table_mesh = _xr_mesh(scene_box(1.2, 0.06, 0.6))?;
+    int table = xr_scene.add_object(root, table_mesh, _xr_material(SCENE_BLINN, Vec4{0.45, 0.3, 0.2, 1.0}));
+    xr_scene.node(table).position = Vec3{0.0, 0.8, -1.6};
+    xr_world.add(&xr_scene, table, SCENE_BODY_STATIC, 0.0, scene_physics_box(Vec3{1.2, 0.06, 0.6}));
+    int ground = xr_scene.add_node(root, "ground");
+    xr_scene.node(ground).position = Vec3{0.0, -0.05, -1.0};
+    xr_world.add(&xr_scene, ground, SCENE_BODY_STATIC, 0.0, scene_physics_box(Vec3{8.0, 0.1, 8.0}));
+    int crate_mesh = _xr_mesh(scene_box(0.12, 0.12, 0.12))?;
+    int crate_mat = _xr_material(SCENE_BLINN, Vec4{0.85, 0.65, 0.3, 1.0});
+    for (row in 0..4) {
+        for (k in 0..(4 - row)) {
+            float x = ((float)k - (float)(3 - row) / 2.0) * 0.13;
+            Vec3 home = Vec3{x, 0.83 + 0.0605 + (float)row * 0.121, -1.6};
+            int c = xr_scene.add_object(root, crate_mesh, crate_mat);
+            xr_scene.node(c).position = home;
+            int b = xr_world.add(&xr_scene, c, SCENE_BODY_DYNAMIC, 1.0, scene_physics_box(Vec3{0.12, 0.12, 0.12}));
+            xr_input.on(c, SCENE_ON_CLICK, _xr_crate_clicked);
+            List_push(&xr_crates, c);
+            List_push(&xr_crate_bodies, b);
+            List_push(&xr_crate_homes, home);
+        }
+    }
+    xr_ball_mesh = _xr_mesh(scene_sphere(0.05, 20, 14))?;
+    xr_ball_mat = _xr_material(SCENE_PBR, Vec4{0.7, 0.75, 0.8, 1.0});
+    _xr_title(root, "Click a crate to push it", 1.6, -1.6)?;
+    return Ok<int, string>(0);
+}
+
+// Puts every crate back on the pyramid, at rest.
+void _xr_physics_reset() {
+    for (i in 0..xr_crates.size) {
+        *SceneNode n = xr_scene.node(xr_crates.data[i]);
+        n.position = xr_crate_homes.data[i];
+        n.rotation = quat_identity();
+        xr_world.set_velocity(xr_crate_bodies.data[i], Vec3{0.0, 0.0, 0.0}, false);
+    }
+    xr_next_ball = (double)xr_time + 1.0;
+}
+
+void _xr_drop_ball() {
+    int b = xr_scene.add_object(xr_roots[XR_PHYSICS], xr_ball_mesh, xr_ball_mat);
+    float x = (float)sin((double)xr_time * 1.7) * 0.25;
+    xr_scene.node(b).position = Vec3{x, 1.8, -1.6};
+    int body = xr_world.add(&xr_scene, b, SCENE_BODY_DYNAMIC, 0.5, scene_physics_sphere(0.05));
+    xr_world.body(body).restitution = 0.5;
+}
+
+void _xr_dragged(*SceneEvent e) {}
+
+// Objects to drag: on a plane (the floor's), at a fixed distance from the pointer, and a
+// sphere that keeps its distance from where the drag started.
+Result<int, string> _xr_drag(int root) {
+    int box = _xr_mesh(scene_box(0.2, 0.2, 0.2))?;
+    int ball = _xr_mesh(scene_sphere(0.12, 28, 20))?;
+    int a = xr_scene.add_object(root, box, _xr_material(SCENE_BLINN, Vec4{0.95, 0.6, 0.15, 1.0}));
+    xr_scene.node(a).position = Vec3{-0.5, 0.1, -1.6};
+    xr_input.on(a, SCENE_ON_DRAG, _xr_dragged);
+    xr_input.set_drag(a, SCENE_DRAG_FIXED_TO_PLANE, Vec3{0.0, 0.1, 0.0}, Vec3{0.0, 1.0, 0.0}, 5.0);
+    _xr_text(root, "on the floor", 7.0, Vec4{1.0, 1.0, 1.0, 1.0}, -0.5, 0.35, -1.6, 0.5, 0.08)?;
+    int b = xr_scene.add_object(root, box, _xr_material(SCENE_BLINN, Vec4{0.2, 0.7, 0.95, 1.0}));
+    xr_scene.node(b).position = Vec3{0.0, 1.2, -1.6};
+    xr_input.on(b, SCENE_ON_DRAG, _xr_dragged);
+    xr_input.set_drag(b, SCENE_DRAG_FIXED_DISTANCE, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0}, 5.0);
+    _xr_text(root, "fixed distance", 7.0, Vec4{1.0, 1.0, 1.0, 1.0}, 0.0, 1.45, -1.6, 0.5, 0.08)?;
+    int c = xr_scene.add_object(root, ball, _xr_material(SCENE_PBR, Vec4{0.9, 0.3, 0.5, 1.0}));
+    xr_scene.node(c).position = Vec3{0.55, 1.2, -1.6};
+    xr_input.on(c, SCENE_ON_DRAG, _xr_dragged);
+    xr_input.set_drag(c, SCENE_DRAG_FIXED_DISTANCE_ORIGIN, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0}, 5.0);
+    _xr_text(root, "from the origin", 7.0, Vec4{1.0, 1.0, 1.0, 1.0}, 0.55, 1.45, -1.6, 0.5, 0.08)?;
+    _xr_title(root, "Hold and move to drag", 1.75, -1.6)?;
+    return Ok<int, string>(0);
+}
+
+// Boxes hopping, each with one of the easing curves.
+Result<int, string> _xr_animation(int root) {
+    xr_anims = scene_animations();
+    int box = _xr_mesh(scene_box(0.16, 0.16, 0.16))?;
+    int[5] easings = {SCENE_EASE_LINEAR, SCENE_EASE_IN, SCENE_EASE_OUT, SCENE_EASE_IN_OUT, SCENE_EASE_BOUNCE};
+    string[5] names = {"Linear", "Ease in", "Ease out", "In out", "Bounce"};
+    for (i in 0..5) {
+        float x = ((float)i - 2.0) * 0.36;
+        int n = xr_scene.add_object(root, box, _xr_material(SCENE_BLINN, Vec4{0.3 + 0.15 * (float)i, 0.5, 0.95 - 0.15 * (float)i, 1.0}));
+        xr_scene.node(n).position = Vec3{x, 0.9, -1.8};
+        int up = xr_anims.group(1.6, easings[i]);
+        xr_anims.set(up, SCENE_ANIM_POSITION_Y, SCENE_ANIM_ADD, 0.5);
+        xr_anims.set(up, SCENE_ANIM_ROTATE_Y, SCENE_ANIM_ADD, 45.0);
+        int down = xr_anims.group(1.6, easings[i]);
+        xr_anims.set(down, SCENE_ANIM_POSITION_Y, SCENE_ANIM_ADD, -0.5);
+        xr_anims.set(down, SCENE_ANIM_ROTATE_Y, SCENE_ANIM_ADD, 45.0);
+        int[2] steps = {up, down};
+        int hop = xr_anims.chain(&steps[0], 2, false);
+        xr_anims.play(&xr_scene, n, hop, true, 0.0);
+        _xr_text(root, names[i], 7.0, Vec4{1.0, 1.0, 1.0, 1.0}, x, 0.7, -1.8, 0.34, 0.08)?;
+    }
+    return Ok<int, string>(0);
+}
+
+// Viro's archway (portal_archway.vrx) as the doorway into a room with glowing spheres, seen
+// only through the arch; a frame of boxes when the model is missing.
+Result<int, string> _xr_portal(int root) {
+    float z = -2.0;
+    int room = xr_scene.add_node(root, "room");
+    xr_scene.node(room).portal = true;
+    // the window: room's child marked portal_entrance, with every mesh under it
+    int door = xr_scene.add_node(room, "door");
+    xr_scene.node(door).portal_entrance = true;
+    // the archway's bottom is 1.307 m below its origin
+    xr_scene.node(door).position = Vec3{0.0, 1.307 * 0.75, z};
+    xr_scene.node(door).scale = Vec3{0.75, 0.75, 0.75};
+    String arch = _xr_asset("portal_archway.vrx");
+    Result<Gltf, string> g = model_load((string)arch.data);
+    arch.free();
+    if (g.ok != 0) {
+        // the arch stands outside the portal's world; its "entry" mesh moves into that world
+        // as the window, at the same place, clear (alpha 0, blended)
+        SceneMaterial clear = scene_material(SCENE_CONSTANT);
+        clear.diffuse = Vec4{1.0, 1.0, 1.0, 0.0};
+        clear.alpha_mode = SCENE_ALPHA_BLEND;
+        int window_mat = xr_scene.add_material(clear);
+        int holder = xr_scene.add_node(root, "archway");
+        xr_scene.node(holder).position = xr_scene.node(door).position;
+        xr_scene.node(holder).scale = xr_scene.node(door).scale;
+        Gltf model = g.value;
+        SceneGltf sg = xr_scene.add_gltf(&model, holder)?;
+        for (i in 0..sg.prim_nodes.size) {
+            *GltfNode gn = &model.nodes.data[sg.prim_src.data[i]];
+            if (strcmp((string)gn.name.data, "entry") != 0) continue;
+            int w = sg.prim_nodes.data[i];
+            xr_scene.set_parent(w, door);
+            xr_scene.node(w).material = window_mat;
+        }
+        List_push(&xr_models, model);
+        List_push(&xr_model_nodes, sg);
+    } else {
+        int window_mesh = _xr_mesh(scene_quad(1.0, 1.6))?;
+        SceneMaterial clear = scene_material(SCENE_CONSTANT);
+        clear.diffuse = Vec4{1.0, 1.0, 1.0, 0.0};
+        clear.alpha_mode = SCENE_ALPHA_BLEND;
+        int w = xr_scene.add_object(door, window_mesh, xr_scene.add_material(clear));
+        xr_scene.node(w).position = Vec3{0.0, 0.8 / 0.75, 0.0};
+    }
+    int wall_mesh = _xr_mesh(scene_box(6.0, 4.0, 6.0))?;
+    SceneMaterial wm = scene_material(SCENE_LAMBERT);
+    wm.diffuse = Vec4{0.55, 0.25, 0.15, 1.0};
+    wm.double_sided = true;
+    int walls = xr_scene.add_object(room, wall_mesh, xr_scene.add_material(wm));
+    xr_scene.node(walls).position = Vec3{0.0, 2.0, z - 3.05};
+    int orb = _xr_mesh(scene_sphere(0.18, 28, 20))?;
+    for (i in 0..5) {
+        int n = xr_scene.add_object(room, orb, _xr_material(SCENE_CONSTANT, Vec4{1.0, 0.85 - 0.12 * (float)i, 0.3 + 0.1 * (float)i, 1.0}));
+        xr_scene.node(n).position = Vec3{((float)i - 2.0) * 0.45, 1.1 + 0.35 * (float)(i % 2), z - 1.8 - (float)(i % 3) * 0.6};
+    }
+    _xr_title(root, "A portal into another world", 2.4, z)?;
+    return Ok<int, string>(0);
+}

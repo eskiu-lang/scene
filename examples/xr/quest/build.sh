@@ -25,7 +25,7 @@ pkg=$out/pkg
 rm -rf "$pkg" "$out/apk"
 mkdir -p "$pkg" "$out/apk/lib/arm64-v8a"
 cp -R "$root/src" "$pkg/src"
-cp "$here/../xr_scene.esk" "$pkg/xr_scene.esk"
+cp "$here"/../xr_scene*.esk "$pkg/"
 sed -e "s|^gpu = .*|gpu = { path = \"$GPU_DIR\" }|" -e "s|^main = .*|main = \"xr_scene.esk\"|" \
     "$root/eskiu.toml" > "$pkg/eskiu.toml"
 (cd "$pkg" && "$ESKIUC" xr_scene.esk --target aarch64-linux-android29 -c -o "$out/xr_scene.o")

@@ -25,7 +25,7 @@ rm -rf "$pkg"
 mkdir -p "$pkg" "$out/EskiuXR.app"
 # scene with gpu taken from GPU_DIR
 cp -R "$root/src" "$pkg/src"
-cp "$here/../xr_scene.esk" "$pkg/xr_scene.esk"
+cp "$here"/../xr_scene*.esk "$pkg/"
 sed -e "s|^gpu = .*|gpu = { path = \"$GPU_DIR\" }|" -e "s|^main = .*|main = \"xr_scene.esk\"|" \
     "$root/eskiu.toml" > "$pkg/eskiu.toml"
 (cd "$pkg" && "$ESKIUC" xr_scene.esk --target "$triple" -c -o "$out/xr_scene.o")

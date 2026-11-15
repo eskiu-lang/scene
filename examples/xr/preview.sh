@@ -20,7 +20,7 @@ rm -rf "$work/pkg"
 mkdir -p "$work/pkg"
 "$here/assets.sh" "$work/assets" >/dev/null
 cp -R "$root/src" "$work/pkg/src"
-cp "$here/xr_scene.esk" "$work/pkg/xr_scene.esk"
+cp "$here"/xr_scene*.esk "$work/pkg/"
 sed -e "s|^gpu = .*|gpu = { path = \"$GPU_DIR\" }|" -e "s|^main = .*|main = \"xr_scene.esk\"|" \
     "$root/eskiu.toml" > "$work/pkg/eskiu.toml"
 (cd "$work/pkg" && "$ESKIUC" xr_scene.esk -c -o "$work/xr_scene.o")
