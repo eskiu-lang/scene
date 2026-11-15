@@ -132,6 +132,11 @@ struct SceneNode {
     Vec3 position;
     Quat rotation;
     Vec3 scale;
+    // the points rotation and scale turn and grow about, in the node's own space
+    // (ViroReact's rotationPivot and scalePivot); has_pivot when either is set
+    Vec3 rotation_pivot;
+    Vec3 scale_pivot;
+    bool has_pivot;
     bool visible;
     bool alive;
     int mesh;

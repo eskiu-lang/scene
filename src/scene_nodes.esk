@@ -348,10 +348,28 @@ void Scene_remove(*Scene self, int node) {
     if (self.camera == node) self.camera = -1;
 }
 
+// A node's local matrix: translation * rotation * scale, the rotation about rotation_pivot
+// and the scale about scale_pivot when it has pivots (as ViroReact's VRONode).
+Mat4 _scene_node_local(*SceneNode n) {
+    if (!n.has_pivot) return mat4_trs(n.position, n.rotation, n.scale);
+    Vec3 zero = Vec3{0.0, 0.0, 0.0};
+    Vec3 one = Vec3{1.0, 1.0, 1.0};
+    Mat4 s = mat4_translate(n.scale_pivot) * mat4_trs(zero, quat_identity(), n.scale) * mat4_translate(zero - n.scale_pivot);
+    Mat4 r = mat4_translate(n.rotation_pivot) * mat4_trs(zero, n.rotation, one) * mat4_translate(zero - n.rotation_pivot);
+    return mat4_translate(n.position) * r * s;
+}
+
 // The local matrix of node: translation * rotation * scale.
 Mat4 Scene_local(*Scene self, int node) {
+    return _scene_node_local(Scene_node(self, node));
+}
+
+// Sets the points node's rotation and scale are about, in its own space.
+void Scene_set_pivots(*Scene self, int node, Vec3 rotation_pivot, Vec3 scale_pivot) {
     *SceneNode n = Scene_node(self, node);
-    return mat4_trs(n.position, n.rotation, n.scale);
+    n.rotation_pivot = rotation_pivot;
+    n.scale_pivot = scale_pivot;
+    n.has_pivot = rotation_pivot.length() > 0.0 || scale_pivot.length() > 0.0;
 }
 
 // The world matrix of node, computed now from its ancestors' current transforms.
@@ -418,7 +436,7 @@ Mat4 _scene_billboard(*SceneNode n, Vec3 eye) {
 
 void _scene_update_node(*Scene self, int node, Mat4 parent, bool billboards, Vec3 eye) {
     *SceneNode n = &self.nodes.data[node];
-    n.world = parent * mat4_trs(n.position, n.rotation, n.scale);
+    n.world = parent * _scene_node_local(n);
     if (billboards && n.billboard != SCENE_BILLBOARD_NONE) n.world = _scene_billboard(n, eye);
     for (i in 0..n.children.size) _scene_update_node(self, n.children.data[i], n.world, billboards, eye);
 }
