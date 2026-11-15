@@ -102,8 +102,38 @@ float _scene_ray_box(Vec3 o, Vec3 d, Vec3 lo, Vec3 hi) {
     return tmin > 0.0 ? tmin : 0.0;
 }
 
-void _scene_hit_node(*Scene self, int node, SceneRay ray, *List<SceneHit> out) {
+// The nearest crossing of the ray (o + d * t, in the mesh's space) with the mesh's triangles
+// (its CPU copy; Moller-Trumbore, both faces), or -1.
+float _scene_ray_triangles(Vec3 o, Vec3 d, *SceneMesh m) {
+    float best = -1.0;
+    *float p = m.cpu_positions.data;
+    for (i in 0..m.cpu_indices.size / 3) {
+        int ia = (int)m.cpu_indices.data[i * 3];
+        int ib = (int)m.cpu_indices.data[i * 3 + 1];
+        int ic = (int)m.cpu_indices.data[i * 3 + 2];
+        Vec3 a = Vec3{p[ia * 3], p[ia * 3 + 1], p[ia * 3 + 2]};
+        Vec3 e1 = Vec3{p[ib * 3], p[ib * 3 + 1], p[ib * 3 + 2]} - a;
+        Vec3 e2 = Vec3{p[ic * 3], p[ic * 3 + 1], p[ic * 3 + 2]} - a;
+        Vec3 h = d.cross(e2);
+        float det = e1.dot(h);
+        if (det > -1e-12 && det < 1e-12) continue;
+        float inv = 1.0 / det;
+        Vec3 s = o - a;
+        float u = s.dot(h) * inv;
+        if (u < 0.0 || u > 1.0) continue;
+        Vec3 q = s.cross(e1);
+        float v = d.dot(q) * inv;
+        if (v < 0.0 || u + v > 1.0) continue;
+        float t = e2.dot(q) * inv;
+        if (t >= 0.0 && (best < 0.0 || t < best)) best = t;
+    }
+    return best;
+}
+
+void _scene_hit_node(*Scene self, int node, SceneRay ray, *List<SceneHit> out, bool precise) {
     *SceneNode n = &self.nodes.data[node];
+    // a node's precise_hits covers its descendants (a model's meshes)
+    precise = precise || n.precise_hits;
     if (!n.alive || !n.visible) return;
     if (n.mesh > 0 && n.mesh < self.meshes.size && !n.ignore_events) {
         *SceneMesh m = &self.meshes.data[n.mesh];
@@ -111,6 +141,8 @@ void _scene_hit_node(*Scene self, int node, SceneRay ray, *List<SceneHit> out) {
         Vec3 lo = inv.point(ray.origin);
         Vec3 ld = inv.point(ray.origin + ray.dir) - lo;
         float t = _scene_ray_box(lo, ld, m.min, m.max);
+        // precise_hits: the nearest triangle the ray crosses, when the bounds are hit
+        if (t >= 0.0 && precise && m.cpu_indices.size >= 3) t = _scene_ray_triangles(lo, ld, m);
         if (t >= 0.0) {
             SceneHit h;
             h.node = node;
@@ -119,7 +151,7 @@ void _scene_hit_node(*Scene self, int node, SceneRay ray, *List<SceneHit> out) {
             List_push(out, h);
         }
     }
-    for (i in 0..n.children.size) _scene_hit_node(self, n.children.data[i], ray, out);
+    for (i in 0..n.children.size) _scene_hit_node(self, n.children.data[i], ray, out, precise);
 }
 
 int _scene_hit_order(*SceneHit a, *SceneHit b) {
@@ -133,7 +165,7 @@ int _scene_hit_order(*SceneHit a, *SceneHit b) {
 int Scene_hit_test_all(*Scene self, SceneRay ray, *List<SceneHit> out) {
     Scene_update(self);
     List_clear(out);
-    _scene_hit_node(self, 0, ray, out);
+    _scene_hit_node(self, 0, ray, out, false);
     for (i in 1..out.size) {
         SceneHit h = out.data[i];
         int j = i - 1;

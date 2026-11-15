@@ -155,6 +155,9 @@ struct SceneNode {
     bool portal_sky_pano;
     *GpuIbl portal_ibl;
     bool ignore_events;
+    // hit tests against its and its descendants' triangles instead of bounds (needs Scene.keep_mesh_copies
+    // when the mesh is made; ViroReact's highAccuracyEvents)
+    bool precise_hits;
     Mat4 world;
     List<Mat4> joints;
     List<float> weights;
@@ -172,6 +175,10 @@ struct SceneMesh {
     uint32 vertex_count;
     int targets;
     GpuBuffer morph;
+    // the positions (3 floats a vertex) and indices kept on the CPU when Scene.keep_mesh_copies
+    // is set, for hit tests against the triangles (SceneNode.precise_hits)
+    List<float> cpu_positions;
+    List<uint32> cpu_indices;
 }
 
 // A glTF model added with Scene_add_gltf: root is the node holding it; nodes maps each glTF
@@ -392,6 +399,8 @@ struct Scene {
     int semantic_texture;
     int semantic_confidence_texture;
     Mat4 semantic_transform;
+    // keep each mesh's positions and indices on the CPU too (for SceneNode.precise_hits)
+    bool keep_mesh_copies;
     _SceneRenderer _r;
 }
 

@@ -538,6 +538,19 @@ void Scene_look_at(*Scene self, int node, Vec3 target, Vec3 up) {
     self.nodes.data[node].rotation = local.normalize();
 }
 
+// The CPU copy of geometry's positions and indices (Scene.keep_mesh_copies).
+void _scene_mesh_copy(*SceneMesh m, *SceneGeometry g) {
+    List_clear(&m.cpu_positions);
+    List_clear(&m.cpu_indices);
+    for (i in 0..(int)g.vertex_count) {
+        *float v = g.vertices + (int64)i * SCENE_VERTEX_FLOATS;
+        List_push(&m.cpu_positions, v[0]);
+        List_push(&m.cpu_positions, v[1]);
+        List_push(&m.cpu_positions, v[2]);
+    }
+    for (i in 0..(int)g.index_count) List_push(&m.cpu_indices, g.indices[i]);
+}
+
 // Uploads geometry as a mesh and returns its id. The geometry can be freed afterwards.
 Result<int, string> Scene_add_geometry(*Scene self, *SceneGeometry geometry) {
     if (geometry.vertex_count == 0 || geometry.index_count < 3) return Err<int, string>("scene: empty geometry");
@@ -553,6 +566,7 @@ Result<int, string> Scene_add_geometry(*Scene self, *SceneGeometry geometry) {
     m.vertex_count = geometry.vertex_count;
     m.min = geometry.min;
     m.max = geometry.max;
+    if (self.keep_mesh_copies) _scene_mesh_copy(&m, geometry);
     List_push(&self.meshes, m);
     return Ok<int, string>(self.meshes.size - 1);
 }
@@ -575,6 +589,7 @@ bool Scene_set_geometry(*Scene self, int mesh, *SceneGeometry geometry) {
         old.vertex_count = geometry.vertex_count;
         old.min = geometry.min;
         old.max = geometry.max;
+        if (self.keep_mesh_copies) _scene_mesh_copy(old, geometry);
         return true;
     }
     Result<GpuBuffer, string> vb = self.gpu.vertices(geometry.vertices, (uint64)geometry.vertex_count * SCENE_VERTEX_FLOATS * 4);
@@ -595,6 +610,7 @@ bool Scene_set_geometry(*Scene self, int mesh, *SceneGeometry geometry) {
     m.vertex_count = geometry.vertex_count;
     m.min = geometry.min;
     m.max = geometry.max;
+    if (self.keep_mesh_copies) _scene_mesh_copy(m, geometry);
     for (i in 0..self._r.nodes.size) {
         if (self._r.nodes.data[i].bound_mesh == mesh) self._r.nodes.data[i].bound_mesh = -1;
     }
