@@ -131,6 +131,10 @@ struct SceneMaterial {
     bool chroma_key;
     Vec3 chroma_key_color;
     bool no_color_write;
+    // with post.bloom, glows (ViroReact's bloomThreshold): once any material in view is
+    // marked, only marked ones bloom, hidden where other surfaces cover them; with none
+    // marked, every bright part of the image does
+    bool bloom;
 }
 
 // How the material's textures repeat past 0..1 (SceneMaterial.wrap_s, wrap_t; ViroReact's

@@ -332,6 +332,15 @@ struct _SceneRenderer {
     GpuBuffer occ_uniforms;
     GpuBindGroup occ_group;
     bool occ_made;
+    // selective bloom: the marked materials alone over the depth of the rest
+    GpuTexture bloom_src;
+    GpuTexture bloom_depth;
+    uint32 bloom_w;
+    uint32 bloom_h;
+    GpuPipeline bloom_pre;
+    GpuBuffer bloom_buf;
+    GpuBindGroup bloom_group;
+    bool bloom_made;
     List<_SceneDraw> draws;
     List<_SceneLightRec> recs;
     _ScenePostGpu post;

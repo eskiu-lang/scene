@@ -183,6 +183,18 @@ void Scene_release(*Scene self) {
     List_free(&r.shadow_bufs);
     List_free(&r.draws);
     List_free(&r.recs);
+    if (r.bloom_made) {
+        r.bloom_pre.release();
+        r.bloom_buf.release();
+        r.bloom_group.release();
+        r.bloom_made = false;
+    }
+    if (r.bloom_w > 0) {
+        r.bloom_src.release();
+        r.bloom_depth.release();
+        r.bloom_w = 0;
+        r.bloom_h = 0;
+    }
     if (r.made) {
         _scene_post_release(&r.post);
         _scene_sky_release(&r.sky);

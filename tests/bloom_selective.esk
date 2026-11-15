@@ -1,0 +1,82 @@
+// Selective bloom: with post.bloom and a material marked bloom, only that material glows
+// (the unmarked one, as bright, does not), and a surface in front of it hides its glow
+// source; with none marked, every bright part blooms as before.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+
+const int N = 96;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+int lum(*uint8 px, int x, int y) {
+    *uint8 p = px + (y * N + x) * 4;
+    return (int)p[0] + (int)p[1] + (int)p[2];
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.bloom = true;
+    scene.post.bloom_threshold = 0.5;
+    scene.post.bloom_strength = 2.0;
+    SceneGeometry g = scene_box(0.3, 0.3, 0.3);
+    int box_mesh = scene.add_geometry(&g)?;
+    g.free();
+    SceneMaterial white = scene_material(SCENE_CONSTANT);
+    white.diffuse = Vec4{4.0, 4.0, 4.0, 1.0};
+    int plain = scene.add_material(white);
+    white.bloom = true;
+    int glow = scene.add_material(white);
+    int left = scene.add_object(0, box_mesh, glow);
+    scene.node(left).position = Vec3{-0.6, 0.0, -3.0};
+    int right = scene.add_object(0, box_mesh, plain);
+    scene.node(right).position = Vec3{0.6, 0.0, -3.0};
+    int cam = scene.add_camera(0, scene_perspective(1.0, 0.05, 50.0));
+    scene.set_camera(cam);
+    (void)right;
+    GpuTexture t = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA8Unorm)?;
+    defer t.release();
+    *uint8 px = alloc<uint8>(N * N * 4);
+    defer free((*void)px);
+    scene.render_to(&t)?;
+    t.read(px)?;
+    // just outside each box (its half width projects to about 7 pixels at 3 m)
+    float f = 1.0 / (float)tan(0.5);
+    int lx = (int)((-0.6 * f / 3.0 * 0.5 + 0.5) * (float)N);
+    int rx = (int)((0.6 * f / 3.0 * 0.5 + 0.5) * (float)N);
+    int y = N / 2 - 12;
+    int gl = lum(px, lx, y);
+    int gr = lum(px, rx, y);
+    printf("glow left %d right %d corner %d\n", gl, gr, lum(px, 0, 0));
+    check("the marked box glows", gl > 30);
+    check("the unmarked box does not", gr < 10);
+    // none marked: the old whole-image bloom, both glow
+    scene.material(glow).bloom = false;
+    scene.render_to(&t)?;
+    t.read(px)?;
+    check("none marked: both bright boxes bloom", lum(px, lx, y) > 30 && lum(px, rx, y) > 30);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    println("selective bloom ok");
+    return 0;
+}

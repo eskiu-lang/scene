@@ -410,7 +410,94 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     pass.end()?;
     *GpuTexture bg = self.camera_background > 0 && self.camera_background < self.textures.size &&
         self.textures.data[self.camera_background].handle != null ? &self.textures.data[self.camera_background] : null;
-    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post, bg);
+    *GpuTexture bloom_from = null;
+    if (self.post.bloom && _scene_bloom_marked(self, active)) {
+        _scene_bloom_source(self, enc, active)?;
+        bloom_from = &r.bloom_src;
+    }
+    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post, bg, bloom_from);
+}
+
+// Whether a draw in view of world uses a material marked to bloom.
+bool _scene_bloom_marked(*Scene self, int world) {
+    *_SceneRenderer r = &self._r;
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        if (d.in_view && d.world == world && d.material >= 0 && d.material < self.materials.size && self.materials.data[d.material].bloom) return true;
+    }
+    return false;
+}
+
+string _scene_bloom_pre_wgsl =
+    "struct Pass { vp: mat4x4<f32>, eye: vec4<f32> };\n"
+    "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32>, morph: vec4<f32> };\n"
+    "@group(0) @binding(0) var<uniform> sp: Pass;\n"
+    "@group(1) @binding(0) var<uniform> draw: Draw;\n"
+    "@group(1) @binding(1) var<storage, read> joints: array<mat4x4<f32>>;\n"
+    "@group(1) @binding(2) var<storage, read> morph: array<vec4<f32>>;\n"
+    "@group(1) @binding(3) var<storage, read> weights: array<f32>;\n"
+    SCENE_DEFORM_WGSL
+    "@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32, @location(0) pos: vec3<f32>, @location(6) joint: vec4<f32>,\n"
+    "              @location(7) weight: vec4<f32>) -> @builtin(position) vec4<f32> {\n"
+    "    var p = pos;\n"
+    "    var nrm = vec3<f32>(0.0, 0.0, 1.0);\n"
+    "    morph_apply(vi, &p, &nrm);\n"
+    "    return sp.vp * (inst_model(ii) * (skin_matrix(joint, weight) * vec4<f32>(p, 1.0)));\n"
+    "}\n"
+    "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }\n";
+
+// The bloom's source when materials are marked: the depth of the unmarked opaque surfaces of
+// world, then the marked ones drawn as in the frame, into bloom_src (cleared to black).
+Result<int, string> _scene_bloom_source(*Scene self, *GpuEncoder enc, int world) {
+    *_SceneRenderer r = &self._r;
+    if (r.bloom_w != r.w || r.bloom_h != r.h) {
+        if (r.bloom_w > 0) {
+            r.bloom_src.release();
+            r.bloom_depth.release();
+        }
+        r.bloom_src = self.gpu.target_with(r.w, r.h, WGPUTextureFormat_RGBA16Float)?;
+        r.bloom_depth = self.gpu.texture(r.w, r.h, SCENE_DEPTH_FORMAT, WGPUTextureUsage_RenderAttachment)?;
+        r.bloom_w = r.w;
+        r.bloom_h = r.h;
+    }
+    if (!r.bloom_made) {
+        GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)SCENE_VERTEX_FLOATS * 4};
+        defer layout.release();
+        _scene_vertex_layout(&layout);
+        *GpuBindLayout[2] groups = {&r.shadow_layout, &r.draw_layout};
+        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_bloom_pre_wgsl, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA16Float,
+            layout: &layout, groups: &groups[0], group_count: 2, depth: true, depth_format: SCENE_DEPTH_FORMAT, no_color_write: true};
+        r.bloom_pre = self.gpu.pipeline(&d)?;
+        r.bloom_buf = self.gpu.uniform(null, 80)?;
+        r.bloom_group = r.shadow_layout.group()?;
+        r.bloom_group.buffer(0, &r.bloom_buf);
+        r.bloom_made = true;
+    }
+    float[20] pu;
+    for (k in 0..16) pu[k] = r.view_proj.m[k];
+    pu[16] = r.eye.x;
+    pu[17] = r.eye.y;
+    pu[18] = r.eye.z;
+    pu[19] = 1.0;
+    r.bloom_buf.write(0, &pu[0], 80);
+    GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 0.0}, depth: &r.bloom_depth};
+    GpuPass pass = enc.pass_with(r.bloom_src.view, &o);
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        if (!d.in_view || d.world != world || d.blend || self.materials.data[d.material].bloom) continue;
+        *SceneMesh mesh = &self.meshes.data[d.mesh];
+        pass.set_group(0, &r.bloom_group);
+        pass.set_group(1, &r.nodes.data[d.node].group);
+        pass.draw_indexed(&r.bloom_pre, &mesh.vertices, &mesh.indices, mesh.index_count, _scene_instance_count(self, d.node));
+    }
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        if (!d.in_view || d.world != world || !self.materials.data[d.material].bloom) continue;
+        *GpuPipeline p = _scene_pipeline(self, d.key)?;
+        _scene_draw(self, &pass, d, p);
+    }
+    pass.end()?;
+    return Ok<int, string>(0);
 }
 
 // How many portals deep the scene draws from the world the camera is in.

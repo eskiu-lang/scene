@@ -470,7 +470,7 @@ bool _scene_is_srgb(WGPUTextureFormat f) {
 
 // Records the bloom passes (when on) and the tone mapping pass from hdr into view.
 Result<int, string> _scene_post_run(*_ScenePostGpu self, *GpuEncoder enc, *GpuTexture hdr, WGPUTextureView view,
-                                    WGPUTextureFormat format, *ScenePost p, *GpuTexture background) {
+                                    WGPUTextureFormat format, *ScenePost p, *GpuTexture background, *GpuTexture bloom_from) {
     *GpuTexture bloom_src = &self.black;
     if (p.bloom) {
         uint32 w = hdr.width / 2;
@@ -487,7 +487,8 @@ Result<int, string> _scene_post_run(*_ScenePostGpu self, *GpuEncoder enc, *GpuTe
             self.g_h.texture(1, &self.a);
             self.g_v.texture(1, &self.b);
         }
-        self.g_bright.texture(1, hdr);
+        // the marked materials' image when some are (selective bloom), else the whole frame
+        self.g_bright.texture(1, bloom_from != null ? bloom_from : hdr);
         float thr = p.bloom_threshold > 0.0 ? p.bloom_threshold : 1.0;
         float[8] ub = {thr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
         self.u_bright.write(0, &ub, 32);
