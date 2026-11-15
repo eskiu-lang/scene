@@ -596,3 +596,135 @@ void SceneDepthWriter_release(*SceneDepthWriter self) {
     self.layout.release();
     self.made = false;
 }
+
+// --- Tracking areas: visionOS's system hover. A Metal immersive app gets the system's own
+// gaze highlight by writing, for each object that reacts to the pointer, a value per pixel
+// into a texture the compositor reads (the gaze itself never reaches the app). After
+// Scene_render_eye, SceneIdWriter_write draws the nodes given (with their descendants' meshes)
+// into such a texture as their values, hidden where the scene hides them.
+
+struct SceneIdWriter {
+    bool made;
+    WGPUTextureFormat format;
+    GpuBindLayout value_layout;
+    GpuPipeline pipe;
+    GpuBuffer pass_buf;
+    GpuBindGroup pass_group;
+    List<GpuBuffer> value_bufs;
+    List<GpuBindGroup> value_groups;
+}
+
+SceneIdWriter scene_id_writer() {
+    SceneIdWriter w;
+    return w;
+}
+
+string _scene_id_wgsl =
+    "struct Pass { vp: mat4x4<f32>, eye: vec4<f32> };\n"
+    "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32>, morph: vec4<f32> };\n"
+    "@group(0) @binding(0) var<uniform> sp: Pass;\n"
+    "@group(1) @binding(0) var<uniform> draw: Draw;\n"
+    "@group(1) @binding(1) var<storage, read> joints: array<mat4x4<f32>>;\n"
+    "@group(1) @binding(2) var<storage, read> morph: array<vec4<f32>>;\n"
+    "@group(1) @binding(3) var<storage, read> weights: array<f32>;\n"
+    "@group(2) @binding(0) var<uniform> id_value: vec4<u32>;\n"
+    SCENE_DEFORM_WGSL
+    "@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32, @location(0) pos: vec3<f32>, @location(6) joint: vec4<f32>,\n"
+    "              @location(7) weight: vec4<f32>) -> @builtin(position) vec4<f32> {\n"
+    "    var p = pos;\n"
+    "    var nrm = vec3<f32>(0.0, 0.0, 1.0);\n"
+    "    morph_apply(vi, &p, &nrm);\n"
+    "    var c = sp.vp * (inst_model(ii) * (skin_matrix(joint, weight) * vec4<f32>(p, 1.0)));\n"
+    // a hair toward the eye, so the surface passes against the depth the frame drew
+    "    c.z = c.z - 0.00002 * c.w;\n"
+    "    return c;\n"
+    "}\n"
+    "@fragment fn fs() -> @location(0) vec4<u32> { return vec4<u32>(id_value.x, 0u, 0u, 0u); }\n";
+
+// Draws nodes[i] (and the meshes under it, a nearer registered node winning) as values[i]
+// into target (an unsigned integer texture the size of the eye last drawn, cleared to 0
+// first), tested against that eye's depth. Fails when target is not that size.
+Result<int, string> SceneIdWriter_write(*SceneIdWriter self, *Scene scene, *GpuTexture target, *int nodes, *uint32 values, int count) {
+    *_SceneRenderer r = &scene._r;
+    if (target.width != r.w || target.height != r.h) return Err<int, string>("scene: the tracking areas are not the size of the last eye");
+    if (self.made && self.format != target.format) SceneIdWriter_release(self);
+    if (!self.made) {
+        self.value_layout = scene.gpu.bind_layout();
+        self.value_layout.uniform(0, WGPUShaderStage_Fragment);
+        GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)SCENE_VERTEX_FLOATS * 4};
+        defer layout.release();
+        _scene_vertex_layout(&layout);
+        *GpuBindLayout[3] groups = {&r.shadow_layout, &r.draw_layout, &self.value_layout};
+        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_id_wgsl, vertex: "vs", fragment: "fs", format: target.format, layout: &layout,
+            groups: &groups[0], group_count: 3, depth: true, depth_read_only: true, depth_format: SCENE_DEPTH_FORMAT,
+            depth_compare: WGPUCompareFunction_LessEqual};
+        self.pipe = scene.gpu.pipeline(&d)?;
+        self.pass_buf = scene.gpu.uniform(null, 80)?;
+        self.pass_group = r.shadow_layout.group()?;
+        self.pass_group.buffer(0, &self.pass_buf);
+        self.format = target.format;
+        self.made = true;
+    }
+    float[20] pu;
+    for (k in 0..16) pu[k] = r.view_proj.m[k];
+    pu[16] = r.eye.x;
+    pu[17] = r.eye.y;
+    pu[18] = r.eye.z;
+    pu[19] = 1.0;
+    self.pass_buf.write(0, &pu[0], 80);
+    while (self.value_bufs.size < count) {
+        GpuBuffer b = scene.gpu.uniform(null, 16)?;
+        List_push(&self.value_bufs, b);
+        GpuBindGroup g = self.value_layout.group()?;
+        List_push(&self.value_groups, g);
+        self.value_groups.data[self.value_groups.size - 1].buffer(0, &self.value_bufs.data[self.value_bufs.size - 1]);
+    }
+    for (i in 0..count) {
+        uint32[4] v = {values[i], 0, 0, 0};
+        self.value_bufs.data[i].write(0, &v[0], 16);
+    }
+    // each scene node's entry in nodes (-1 none)
+    int n_nodes = scene.nodes.size;
+    *int entry = alloc<int>((int64)(n_nodes > 0 ? n_nodes : 1));
+    defer free((*void)entry);
+    for (i in 0..n_nodes) entry[i] = -1;
+    for (i in 0..count) {
+        if (nodes[i] >= 0 && nodes[i] < n_nodes) entry[nodes[i]] = i;
+    }
+    GpuEncoder enc = scene.gpu.encoder();
+    GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 0.0}, depth: &r.depth, depth_load: true, stencil_load: true};
+    GpuPass pass = enc.pass_with(target.view, &o);
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        int at = -1;
+        int n = d.node;
+        while (n >= 0 && n < n_nodes) {
+            if (entry[n] >= 0) {
+                at = entry[n];
+                break;
+            }
+            n = scene.nodes.data[n].parent;
+        }
+        if (at < 0) continue;
+        *SceneMesh mesh = &scene.meshes.data[d.mesh];
+        pass.set_group(0, &self.pass_group);
+        pass.set_group(1, &r.nodes.data[d.node].group);
+        pass.set_group(2, &self.value_groups.data[at]);
+        pass.draw_indexed(&self.pipe, &mesh.vertices, &mesh.indices, mesh.index_count, _scene_instance_count(scene, d.node));
+    }
+    pass.end()?;
+    return enc.submit();
+}
+
+void SceneIdWriter_release(*SceneIdWriter self) {
+    if (!self.made) return;
+    self.pipe.release();
+    self.pass_buf.release();
+    self.pass_group.release();
+    for (i in 0..self.value_bufs.size) self.value_bufs.data[i].release();
+    for (i in 0..self.value_groups.size) self.value_groups.data[i].release();
+    List_free(&self.value_bufs);
+    List_free(&self.value_groups);
+    self.value_layout.release();
+    self.made = false;
+}

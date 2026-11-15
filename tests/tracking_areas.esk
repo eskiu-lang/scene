@@ -1,0 +1,98 @@
+// Tracking areas (visionOS's system hover): after an eye is drawn, the registered nodes'
+// values where their meshes show, a child's mesh under its registered parent, and nothing
+// where an unregistered object in front hides them.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/vr>;
+
+const int N = 64;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+int flat(*Scene scene, Vec4 color) {
+    SceneMaterial m = scene_material(SCENE_CONSTANT);
+    m.diffuse = color;
+    return scene.add_material(m);
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    SceneGeometry g = scene_box(0.5, 0.5, 0.5);
+    int box_mesh = scene.add_geometry(&g)?;
+    g.free();
+    int mat = flat(&scene, Vec4{1.0, 0.0, 0.0, 1.0});
+    // a registered box on the left, a registered group on the right with a box under it, and
+    // an unregistered box in front of the left one's lower half
+    int left = scene.add_object(0, box_mesh, mat);
+    scene.node(left).position = Vec3{-0.6, 0.0, -3.0};
+    int group = scene.add_node(0, "group");
+    scene.node(group).position = Vec3{0.6, 0.0, -3.0};
+    int child = scene.add_object(group, box_mesh, mat);
+    int front = scene.add_object(0, box_mesh, mat);
+    scene.node(front).position = Vec3{-0.6, -0.35, -2.0};
+    int cam = scene.add_camera(0, scene_perspective(1.0, 0.05, 50.0));
+    scene.set_camera(cam);
+    (void)child;
+
+    GpuTexture eye_t = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA8Unorm)?;
+    defer eye_t.release();
+    Scene_render_eye(&scene, &eye_t, scene_eye(0.0, 1.0, 1.0, 0.05, 50.0))?;
+    GpuTexture ids = gpu.texture((uint32)N, (uint32)N, WGPUTextureFormat_R16Uint,
+        WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc)?;
+    defer ids.release();
+    SceneIdWriter w = scene_id_writer();
+    defer w.release();
+    int[2] nodes = {left, group};
+    uint32[2] values = {7, 9};
+    w.write(&scene, &ids, &nodes[0], &values[0], 2)?;
+    *uint16 px = alloc<uint16>(N * N);
+    defer free((*void)px);
+    ids.read(px)?;
+    // the projections of the boxes' centers: x = f * X / -Z at f = 1 / tan(0.5)
+    float f = 1.0 / (float)tan(0.5);
+    int lx = (int)((-0.6 * f / 3.0 * 0.5 + 0.5) * (float)N);
+    int rx = (int)((0.6 * f / 3.0 * 0.5 + 0.5) * (float)N);
+    int top = N / 2 - 4;
+    int bottom = N / 2 + 6;
+    printf("left %d right %d center %d\n", (int)px[top * N + lx], (int)px[top * N + rx], (int)px[(N / 2) * N + N / 2]);
+    check("the left box's upper half is its value", px[top * N + lx] == 7);
+    check("the box under the group is the group's value", px[top * N + rx] == 9);
+    check("nothing between them", px[(N / 2) * N + N / 2] == 0);
+    check("the box in front hides the left box", px[bottom * N + lx] == 0);
+    check("a corner is empty", px[0] == 0);
+    // only one registered: the other is gone
+    int[1] one = {group};
+    uint32[1] v1 = {3};
+    w.write(&scene, &ids, &one[0], &v1[0], 1)?;
+    ids.read(px)?;
+    check("cleared each time", px[top * N + lx] == 0 && px[top * N + rx] == 3);
+    // a target of another size is refused
+    GpuTexture small = gpu.texture(8, 8, WGPUTextureFormat_R16Uint, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc)?;
+    defer small.release();
+    check("another size is refused", !w.write(&scene, &small, &one[0], &v1[0], 1).ok);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    println("tracking areas ok");
+    return 0;
+}
