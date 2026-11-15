@@ -1,0 +1,121 @@
+// scene_targets.esk: rendering to a view or a texture, and the multisampled targets (part of scene_render.esk, which imports it in order after the ones before it)
+
+// Scene_render_in with an encoder of its own, submitted at the end.
+Result<int, string> Scene_render(*Scene self, WGPUTextureView view, uint32 width, uint32 height, WGPUTextureFormat format) {
+    GpuEncoder enc = self.gpu.encoder();
+    Scene_render_in(self, &enc, view, width, height, format)?;
+    return enc.submit();
+}
+
+// Renders into a texture (Gpu_target, Gpu_target_with), to read back or sample.
+Result<int, string> Scene_render_to(*Scene self, *GpuTexture target) {
+    return Scene_render(self, target.view, target.width, target.height, target.format);
+}
+
+// Scene.msaa applied: the pipelines of the scene's pass made again when the sample count
+// changes, and the multisampled targets sized to the frame.
+Result<int, string> _scene_msaa_targets(*Scene self, uint32 width, uint32 height) {
+    *_SceneRenderer r = &self._r;
+    uint32 want = self.msaa > 1 ? (uint32)4 : (uint32)1;
+    uint32 have = r.samples > 1 ? r.samples : (uint32)1;
+    if (want != have) {
+        for (i in 0..r.pipes.size) r.pipes.data[i].pipe.release();
+        List_clear(&r.pipes);
+        if (r.depth_reset_made) r.depth_reset.release();
+        r.depth_reset_made = false;
+        if (r.occ_made) {
+            r.occ_group.release();
+            r.occ_uniforms.release();
+            r.occ_pipe.release();
+            r.occ_layout.release();
+            r.occ_made = false;
+        }
+        if (r.bloom_made) {
+            r.bloom_pre.release();
+            r.bloom_buf.release();
+            r.bloom_group.release();
+            r.bloom_sub.release();
+            r.bloom_sub_layout.release();
+            r.bloom_made = false;
+        }
+        // their bind groups belong to the layout made again with the pipelines
+        for (i in 0..r.bloom_sub_groups.size) r.bloom_sub_groups.data[i].release();
+        for (i in 0..r.bloom_sub_bufs.size) r.bloom_sub_bufs.data[i].release();
+        List_clear(&r.bloom_sub_groups);
+        List_clear(&r.bloom_sub_bufs);
+        r.samples = want;
+        _scene_sky_samples(&r.sky, &self.gpu, want)?;
+    }
+    if (want > 1 && (r.ms_w != width || r.ms_h != height || r.ms_n != want)) {
+        _scene_msaa_release(r);
+        GpuTextureDesc cd = GpuTextureDesc{width: width, height: height, format: WGPUTextureFormat_RGBA16Float,
+            usage: WGPUTextureUsage_RenderAttachment, samples: want};
+        r.ms_color = self.gpu.texture_with(&cd)?;
+        r.ms_bloom = self.gpu.texture_with(&cd)?;
+        GpuTextureDesc dd = GpuTextureDesc{width: width, height: height, format: SCENE_DEPTH_FORMAT,
+            usage: WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding, samples: want};
+        r.ms_depth = self.gpu.texture_with(&dd)?;
+        dd.usage = WGPUTextureUsage_RenderAttachment;
+        r.ms_bloom_depth = self.gpu.texture_with(&dd)?;
+        GpuViewDesc dv = GpuViewDesc{format: WGPUTextureFormat_Depth24Plus, aspect: WGPUTextureAspect_DepthOnly, dimension: WGPUTextureViewDimension_2D};
+        r.ms_depth_view = r.ms_depth.view_with(&dv)?;
+        r.ms_w = width;
+        r.ms_h = height;
+        r.ms_n = want;
+    }
+    return Ok<int, string>(0);
+}
+
+void _scene_msaa_release(*_SceneRenderer r) {
+    if (r.ms_w == 0) return;
+    r.ms_depth_view.release();
+    r.ms_color.release();
+    r.ms_depth.release();
+    r.ms_bloom.release();
+    r.ms_bloom_depth.release();
+    r.ms_w = 0;
+    r.ms_h = 0;
+    r.ms_n = 0;
+}
+
+string _scene_msaa_depth_wgsl =
+    "@group(0) @binding(0) var ms_depth: texture_depth_multisampled_2d;\n"
+    "struct V { @builtin(position) pos: vec4<f32> };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    var v: V;\n"
+    "    v.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    return v;\n"
+    "}\n"
+    "struct F { @builtin(frag_depth) depth: f32, @location(0) color: vec4<f32> };\n"
+    "@fragment fn fs(v: V) -> F {\n"
+    "    var f: F;\n"
+    "    f.color = vec4<f32>(0.0);\n"
+    "    f.depth = textureLoad(ms_depth, vec2<i32>(v.pos.xy), 0);\n"
+    "    return f;\n"
+    "}\n";
+
+// The multisampled depth's first sample written into the single-sample depth.
+Result<int, string> _scene_msaa_resolve_depth(*Scene self, *GpuEncoder enc) {
+    *_SceneRenderer r = &self._r;
+    if (!r.ms_resolve_made) {
+        r.ms_resolve_layout = self.gpu.bind_layout();
+        List_push(&r.ms_resolve_layout.entries, WGPUBindGroupLayoutEntry{binding: 0, visibility: _gpu_visibility(WGPUShaderStage_Fragment),
+            texture: WGPUTextureBindingLayout{sampleType: WGPUTextureSampleType_Depth, viewDimension: WGPUTextureViewDimension_2D, multisampled: 1}});
+        *GpuBindLayout[1] groups = {&r.ms_resolve_layout};
+        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_msaa_depth_wgsl, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA16Float,
+            groups: &groups[0], group_count: 1, depth: true, depth_format: SCENE_DEPTH_FORMAT, depth_compare: WGPUCompareFunction_Always,
+            no_color_write: true};
+        r.ms_resolve = self.gpu.pipeline(&d)?;
+        r.ms_resolve_made = true;
+    }
+    GpuBindGroup g = r.ms_resolve_layout.group()?;
+    defer g.release();
+    g.view(0, &r.ms_depth_view);
+    GpuPassOptions o = GpuPassOptions{load: true, depth: &r.depth};
+    GpuPass pass = enc.pass_with(r.hdr.view, &o);
+    pass.set_group(0, &g);
+    pass.draw(&r.ms_resolve, null, 3, 1);
+    pass.end()?;
+    return Ok<int, string>(0);
+}
