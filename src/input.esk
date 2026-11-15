@@ -210,6 +210,7 @@ const int SCENE_ON_PINCH = 4;
 const int SCENE_ON_ROTATE = 8;
 const int SCENE_ON_HOVER = 16;
 const int SCENE_ON_FUSE = 32;
+const int SCENE_ON_SCROLL = 64;
 
 // SceneEvent.kind.
 const int SCENE_EVENT_CLICK = 1;
@@ -218,6 +219,7 @@ const int SCENE_EVENT_PINCH = 3;
 const int SCENE_EVENT_ROTATE = 4;
 const int SCENE_EVENT_HOVER = 5;
 const int SCENE_EVENT_FUSE = 6;
+const int SCENE_EVENT_SCROLL = 7;
 
 // SceneEvent.state of a click: the press, the release (to the node that took the press),
 // then clicked when the release is still on that node.
@@ -245,7 +247,8 @@ const int SCENE_DRAG_FIXED_TO_PLANE = 2;
 // position is the dragged node's new world position; scale the pinch's distance over the
 // starting one; rotation the two fingers' turn since the start, in radians; fuse the
 // share of the fuse time left (1 down to 0, at which the node is fused; -1 when the gaze
-// left it).
+// left it). scroll is a thumbstick's position (x right, y up, -1 to 1) and source the
+// controller part it came from (the caller's number).
 struct SceneEvent {
     int kind;
     int node;
@@ -257,6 +260,8 @@ struct SceneEvent {
     float scale;
     float rotation;
     float fuse;
+    Vec2 scroll;
+    int source;
 }
 
 struct _SceneHandler {
@@ -612,6 +617,18 @@ void SceneInput_rotate(*SceneInput self, *Scene scene, float radians, int state)
     e.rotation = radians;
     int node = self.rotated;
     if (state == SCENE_GESTURE_END) self.rotated = -1;
+    _scene_send(self, node, &e);
+}
+
+// A thumbstick's position (x, y from -1 to 1) on source: a scroll event to the node under the
+// pointer that takes them (ViroReact's onScroll from a Quest controller).
+void SceneInput_scroll(*SceneInput self, *Scene scene, float x, float y, int source) {
+    if (!self.has_hit) return;
+    int node = _scene_handler_for(self, scene, SCENE_ON_SCROLL, self.hit.node);
+    if (node < 0) return;
+    SceneEvent e = _scene_event(SCENE_EVENT_SCROLL, 0, &self.hit);
+    e.scroll = Vec2{x, y};
+    e.source = source;
     _scene_send(self, node, &e);
 }
 
