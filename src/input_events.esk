@@ -1,0 +1,190 @@
+// input_events.esk: event kinds, handlers and the SceneInput state (part of input.esk, which imports it in order after the ones before it)
+
+// Events a handler takes (SceneInput_on), bits of a mask.
+const int SCENE_ON_CLICK = 1;
+const int SCENE_ON_DRAG = 2;
+const int SCENE_ON_PINCH = 4;
+const int SCENE_ON_ROTATE = 8;
+const int SCENE_ON_HOVER = 16;
+const int SCENE_ON_FUSE = 32;
+const int SCENE_ON_SCROLL = 64;
+
+// SceneEvent.kind.
+const int SCENE_EVENT_CLICK = 1;
+const int SCENE_EVENT_DRAG = 2;
+const int SCENE_EVENT_PINCH = 3;
+const int SCENE_EVENT_ROTATE = 4;
+const int SCENE_EVENT_HOVER = 5;
+const int SCENE_EVENT_FUSE = 6;
+const int SCENE_EVENT_SCROLL = 7;
+
+// SceneEvent.state of a click: the press, the release (to the node that took the press),
+// then clicked when the release is still on that node.
+const int SCENE_CLICK_DOWN = 1;
+const int SCENE_CLICK_UP = 2;
+const int SCENE_CLICKED = 3;
+
+// SceneEvent.state of a drag, a pinch and a rotation.
+const int SCENE_GESTURE_START = 1;
+const int SCENE_GESTURE_MOVE = 2;
+const int SCENE_GESTURE_END = 3;
+
+// How a dragged node follows the pointer (SceneInput_set_drag). FIXED_DISTANCE keeps the
+// distance from the pointer to the point that was grabbed; FIXED_DISTANCE_ORIGIN the
+// distance to the node's origin; FIXED_TO_PLANE moves the node on a plane, no farther
+// than a maximum distance from the pointer.
+const int SCENE_DRAG_FIXED_DISTANCE = 0;
+const int SCENE_DRAG_FIXED_DISTANCE_ORIGIN = 1;
+const int SCENE_DRAG_FIXED_TO_PLANE = 2;
+
+// An event on a node. node is the node whose handler runs, target the node the ray hit
+// (node or one of its descendants). state is a SCENE_CLICK_* or SCENE_GESTURE_* value,
+// for hover 1 on entering and 0 on leaving. point is the world point under the pointer
+// (has_point false when the pointer is off the node, as for a release that left it).
+// position is the dragged node's new world position; scale the pinch's distance over the
+// starting one; rotation the two fingers' turn since the start, in radians; fuse the
+// share of the fuse time left (1 down to 0, at which the node is fused; -1 when the gaze
+// left it). scroll is a thumbstick's position (x right, y up, -1 to 1) and source the
+// controller part it came from (the caller's number).
+struct SceneEvent {
+    int kind;
+    int node;
+    int target;
+    int state;
+    Vec3 point;
+    bool has_point;
+    Vec3 position;
+    float scale;
+    float rotation;
+    float fuse;
+    Vec2 scroll;
+    int source;
+}
+
+struct _SceneHandler {
+    bool set;
+    int events;
+    fn(*SceneEvent)->void call;
+    int drag_type;
+    Vec3 plane_point;
+    Vec3 plane_normal;
+    float drag_max;
+    double fuse_time;
+}
+
+// Thresholds below which a move is not reported (ViroReact's): world units for a drag,
+// scale for a pinch, radians for a rotation.
+const float SCENE_DRAG_THRESHOLD = 0.01;
+const float SCENE_PINCH_THRESHOLD = 0.02;
+const float SCENE_ROTATE_THRESHOLD = 0.01;
+
+// Seconds a hover change must hold before it is reported, so a ray that flickers on a
+// node's edge does not send enter and leave every frame.
+const double SCENE_HOVER_HYSTERESIS = 0.075;
+
+const int _SCENE_NO_CANDIDATE = -2;
+
+// The events of one scene's pointer and gestures. Feed it with SceneInput_touch, or with
+// SceneInput_pointer, _press, _release, _pinch, _rotate and _gaze for another controller.
+struct SceneInput {
+    List<_SceneHandler> handlers;
+    SceneRay ray;
+    SceneHit hit;
+    bool has_hit;
+    int pressed;
+    bool pressing;
+    int dragged;
+    Vec3 drag_hit;
+    Vec3 drag_start;
+    float drag_dist;
+    Vec3 drag_last;
+    int pinched;
+    float pinch_last;
+    int rotated;
+    float rotate_last;
+    int hovered;
+    int hover_candidate;
+    double hover_since;
+    int fused;
+    double fuse_at;
+    bool fuse_done;
+    int[2] finger;
+    float[2] fx;
+    float[2] fy;
+    int fingers;
+    float gesture_dist;
+    float gesture_angle;
+}
+
+// An empty SceneInput.
+SceneInput scene_input() {
+    SceneInput s;
+    s.dragged = -1;
+    s.pinched = -1;
+    s.rotated = -1;
+    s.hovered = -1;
+    s.hover_candidate = _SCENE_NO_CANDIDATE;
+    s.fused = -1;
+    s.pressed = -1;
+    s.finger[0] = -1;
+    s.finger[1] = -1;
+    return s;
+}
+
+*_SceneHandler _scene_handler(*SceneInput self, int node) {
+    if (node < 0) return null;
+    while (self.handlers.size <= node) {
+        _SceneHandler h;
+        h.fuse_time = 2.0;
+        h.drag_max = 5.0;
+        List_push(&self.handlers, h);
+    }
+    return &self.handlers.data[node];
+}
+
+// Sets node's handler: it takes the events in the mask events (SCENE_ON_* bits) for node
+// and the descendants that have no handler of their own for them. A new handler replaces
+// the node's last one.
+void SceneInput_on(*SceneInput self, int node, int events, escaping fn(*SceneEvent)->void handler) {
+    *_SceneHandler h = _scene_handler(self, node);
+    if (h == null) return;
+    if (h.set) free_closure(h.call);
+    h.set = true;
+    h.events = events;
+    h.call = handler;
+}
+
+// Removes node's handler.
+void SceneInput_off(*SceneInput self, int node) {
+    if (node < 0 || node >= self.handlers.size) return;
+    *_SceneHandler h = &self.handlers.data[node];
+    if (h.set) free_closure(h.call);
+    h.set = false;
+    h.events = 0;
+}
+
+// How node moves when dragged: type is a SCENE_DRAG_* value; for SCENE_DRAG_FIXED_TO_PLANE
+// the plane goes through plane_point with normal plane_normal (world space), and the node
+// stays within max_distance of the pointer.
+void SceneInput_set_drag(*SceneInput self, int node, int type, Vec3 plane_point, Vec3 plane_normal, float max_distance) {
+    *_SceneHandler h = _scene_handler(self, node);
+    if (h == null) return;
+    h.drag_type = type;
+    h.plane_point = plane_point;
+    h.plane_normal = plane_normal;
+    h.drag_max = max_distance;
+}
+
+// The seconds a gaze must stay on node before it is fused (2 by default).
+void SceneInput_set_fuse_time(*SceneInput self, int node, double seconds) {
+    *_SceneHandler h = _scene_handler(self, node);
+    if (h != null) h.fuse_time = seconds;
+}
+
+// Frees the handlers.
+void SceneInput_free(*SceneInput self) {
+    for (i in 0..self.handlers.size) {
+        if (self.handlers.data[i].set) free_closure(self.handlers.data[i].call);
+    }
+    self.handlers.free();
+}

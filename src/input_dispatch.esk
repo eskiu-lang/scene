@@ -1,0 +1,341 @@
+// input_dispatch.esk: pointer, gaze, gesture and touch dispatch to the handlers (part of input.esk, which imports it in order after the ones before it)
+
+int _scene_handler_for(*SceneInput self, *Scene scene, int event, int node) {
+    while (node >= 0 && node < scene.nodes.size) {
+        if (node < self.handlers.size && self.handlers.data[node].set && (self.handlers.data[node].events & event) != 0 && scene.nodes.data[node].alive) return node;
+        node = scene.nodes.data[node].parent;
+    }
+    return -1;
+}
+
+void _scene_send(*SceneInput self, int node, *SceneEvent e) {
+    if (node < 0 || node >= self.handlers.size || !self.handlers.data[node].set) return;
+    e.node = node;
+    fn(*SceneEvent)->void call = self.handlers.data[node].call;
+    call(e);
+}
+
+SceneEvent _scene_event(int kind, int state, *SceneHit hit) {
+    SceneEvent e;
+    e.kind = kind;
+    e.state = state;
+    e.target = hit.node;
+    e.point = hit.point;
+    e.has_point = !hit.background;
+    e.scale = 1.0;
+    return e;
+}
+
+void _scene_set_world_position(*Scene scene, int node, Vec3 p) {
+    *SceneNode n = &scene.nodes.data[node];
+    Mat4 parent = n.parent >= 0 ? scene.nodes.data[n.parent].world : mat4_identity();
+    n.position = parent.inverse().point(p);
+    Scene_update(scene);
+}
+
+Vec3 _scene_node_world_position(*Scene scene, int node) {
+    Mat4 w = scene.nodes.data[node].world;
+    return Vec3{w.m[12], w.m[13], w.m[14]};
+}
+
+bool _scene_plane_point(*_SceneHandler h, SceneRay ray, *Vec3 out) {
+    Vec3 n = h.plane_normal;
+    if (n.length() < 1e-9) return false;
+    float denom = n.dot(ray.dir);
+    if (denom > -1e-9 && denom < 1e-9) return false;
+    float t = n.dot(h.plane_point - ray.origin) / denom;
+    if (t < 0.0 || t > h.drag_max) return false;
+    *out = ray.origin + ray.dir * t;
+    return true;
+}
+
+void _scene_drag_update(*SceneInput self, *Scene scene) {
+    int node = self.dragged;
+    if (node < 0 || !scene.nodes.data[node].alive) {
+        self.dragged = -1;
+        return;
+    }
+    *_SceneHandler h = &self.handlers.data[node];
+    Vec3 to;
+    if (h.drag_type == SCENE_DRAG_FIXED_TO_PLANE) {
+        Vec3 p;
+        if (!_scene_plane_point(h, self.ray, &p)) return;
+        to = self.drag_start + (p - self.drag_hit);
+    } else {
+        to = self.drag_start + (self.ray.origin + self.ray.dir * self.drag_dist - self.drag_hit);
+    }
+    _scene_set_world_position(scene, node, to);
+    if ((to - self.drag_last).length() < SCENE_DRAG_THRESHOLD) return;
+    SceneEvent e = _scene_event(SCENE_EVENT_DRAG, SCENE_GESTURE_MOVE, &self.hit);
+    e.position = to;
+    self.drag_last = to;
+    _scene_send(self, node, &e);
+}
+
+void _scene_drag_end(*SceneInput self, *Scene scene) {
+    if (self.dragged < 0) return;
+    int node = self.dragged;
+    self.dragged = -1;
+    if (!scene.nodes.data[node].alive) return;
+    SceneEvent e = _scene_event(SCENE_EVENT_DRAG, SCENE_GESTURE_END, &self.hit);
+    e.position = _scene_node_world_position(scene, node);
+    _scene_send(self, node, &e);
+}
+
+void _scene_hover(*SceneInput self, *Scene scene, double time) {
+    int node = _scene_handler_for(self, scene, SCENE_ON_HOVER, self.hit.node);
+    if (node == self.hovered) {
+        self.hover_candidate = _SCENE_NO_CANDIDATE;
+        return;
+    }
+    if (self.hovered >= 0) {
+        if (node != self.hover_candidate) {
+            self.hover_candidate = node;
+            self.hover_since = time;
+            return;
+        }
+        if (time - self.hover_since < SCENE_HOVER_HYSTERESIS) return;
+    }
+    if (node >= 0) {
+        SceneEvent e = _scene_event(SCENE_EVENT_HOVER, 1, &self.hit);
+        _scene_send(self, node, &e);
+    }
+    if (self.hovered >= 0) {
+        SceneEvent out = _scene_event(SCENE_EVENT_HOVER, 0, &self.hit);
+        out.has_point = false;
+        _scene_send(self, self.hovered, &out);
+    }
+    self.hovered = node;
+    self.hover_candidate = _SCENE_NO_CANDIDATE;
+}
+
+// Moves the pointer: ray is where it points now and time the event time in seconds.
+// Runs the hit test, reports hover changes and moves a node being dragged.
+void SceneInput_pointer(*SceneInput self, *Scene scene, SceneRay ray, double time) {
+    self.ray = ray;
+    if (self.dragged < 0) {
+        Scene_hit_test(scene, ray, &self.hit);
+        self.has_hit = true;
+        _scene_hover(self, scene, time);
+    }
+    if (self.dragged >= 0 && self.pinched < 0 && self.rotated < 0) _scene_drag_update(self, scene);
+}
+
+// Presses the pointer's button (a finger down, a mouse button, a controller trigger) where
+// the last SceneInput_pointer pointed: a click down on the node hit, and the start of a
+// drag when that node (or an ancestor) takes drags.
+void SceneInput_press(*SceneInput self, *Scene scene) {
+    if (!self.has_hit) return;
+    int node = _scene_handler_for(self, scene, SCENE_ON_CLICK, self.hit.node);
+    self.pressed = node;
+    self.pressing = true;
+    if (node >= 0) {
+        SceneEvent e = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICK_DOWN, &self.hit);
+        _scene_send(self, node, &e);
+    }
+    if (self.dragged >= 0) return;
+    int drag = _scene_handler_for(self, scene, SCENE_ON_DRAG, self.hit.node);
+    if (drag < 0) return;
+    *_SceneHandler h = &self.handlers.data[drag];
+    self.dragged = drag;
+    self.drag_start = _scene_node_world_position(scene, drag);
+    self.drag_last = self.drag_start;
+    if (h.drag_type == SCENE_DRAG_FIXED_DISTANCE_ORIGIN) {
+        self.drag_hit = self.drag_start;
+        self.drag_dist = (self.drag_start - self.ray.origin).length();
+    } else if (h.drag_type == SCENE_DRAG_FIXED_TO_PLANE) {
+        Vec3 p;
+        if (!_scene_plane_point(h, self.ray, &p)) p = self.drag_start;
+        self.drag_hit = p;
+        float off = h.plane_normal.length() < 1e-9 ? 0.0 : h.plane_normal.normalize().dot(self.drag_start - h.plane_point);
+        if (off > 0.01 || off < -0.01) self.drag_start = p;
+    } else {
+        self.drag_hit = self.hit.point;
+        self.drag_dist = self.hit.distance;
+    }
+    SceneEvent e = _scene_event(SCENE_EVENT_DRAG, SCENE_GESTURE_START, &self.hit);
+    e.position = self.drag_start;
+    _scene_send(self, drag, &e);
+}
+
+// Releases the button: a click up to the node that took the press, then clicked when the
+// pointer is still on it, and the end of a drag.
+void SceneInput_release(*SceneInput self, *Scene scene) {
+    if (!self.pressing) return;
+    self.pressing = false;
+    int was = self.pressed;
+    self.pressed = -1;
+    bool dragging = self.dragged >= 0;
+    if (dragging) _scene_drag_end(self, scene);
+    if (was < 0) return;
+    if (!scene.nodes.data[was].alive) return;
+    int now = dragging ? was : _scene_handler_for(self, scene, SCENE_ON_CLICK, self.hit.node);
+    SceneEvent up = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICK_UP, &self.hit);
+    if (now != was) up.has_point = false;
+    _scene_send(self, was, &up);
+    if (now == was) {
+        SceneEvent done = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICKED, &self.hit);
+        _scene_send(self, was, &done);
+    }
+}
+
+// Ends a press without a click (the system took the gesture, or a second finger came
+// down): the drag ends, and no click up or clicked is sent.
+void SceneInput_cancel(*SceneInput self, *Scene scene) {
+    self.pressing = false;
+    self.pressed = -1;
+    _scene_drag_end(self, scene);
+}
+
+// A pinch: scale is the fingers' distance over the starting one (1 at the start), state
+// a SCENE_GESTURE_* value. The pinch goes to the node under the pointer at its start.
+void SceneInput_pinch(*SceneInput self, *Scene scene, float scale, int state) {
+    if (state == SCENE_GESTURE_START) {
+        if (!self.has_hit) return;
+        self.pinch_last = scale;
+        self.pinched = _scene_handler_for(self, scene, SCENE_ON_PINCH, self.hit.node);
+    }
+    if (self.pinched < 0) return;
+    if (state == SCENE_GESTURE_MOVE) {
+        float d = scale - self.pinch_last;
+        if (d < SCENE_PINCH_THRESHOLD && d > -SCENE_PINCH_THRESHOLD) return;
+        self.pinch_last = scale;
+    }
+    SceneEvent e = _scene_event(SCENE_EVENT_PINCH, state, &self.hit);
+    e.scale = scale;
+    int node = self.pinched;
+    if (state == SCENE_GESTURE_END) self.pinched = -1;
+    _scene_send(self, node, &e);
+}
+
+// A two-finger rotation: radians turned since the start, state a SCENE_GESTURE_* value.
+void SceneInput_rotate(*SceneInput self, *Scene scene, float radians, int state) {
+    if (state == SCENE_GESTURE_START) {
+        if (!self.has_hit) return;
+        self.rotate_last = radians;
+        self.rotated = _scene_handler_for(self, scene, SCENE_ON_ROTATE, self.hit.node);
+    }
+    if (self.rotated < 0) return;
+    if (state == SCENE_GESTURE_MOVE) {
+        float d = radians - self.rotate_last;
+        if (d < SCENE_ROTATE_THRESHOLD && d > -SCENE_ROTATE_THRESHOLD) return;
+        self.rotate_last = radians;
+    }
+    SceneEvent e = _scene_event(SCENE_EVENT_ROTATE, state, &self.hit);
+    e.rotation = radians;
+    int node = self.rotated;
+    if (state == SCENE_GESTURE_END) self.rotated = -1;
+    _scene_send(self, node, &e);
+}
+
+// A thumbstick's position (x, y from -1 to 1) on source: a scroll event to the node under the
+// pointer that takes them (ViroReact's onScroll from a Quest controller).
+void SceneInput_scroll(*SceneInput self, *Scene scene, float x, float y, int source) {
+    if (!self.has_hit) return;
+    int node = _scene_handler_for(self, scene, SCENE_ON_SCROLL, self.hit.node);
+    if (node < 0) return;
+    SceneEvent e = _scene_event(SCENE_EVENT_SCROLL, 0, &self.hit);
+    e.scroll = Vec2{x, y};
+    e.source = source;
+    _scene_send(self, node, &e);
+}
+
+// The gaze, once a frame: ray is where the viewer looks (Scene_screen_ray through the
+// image's center, or a headset's forward ray) and time the frame time in seconds. A node
+// that takes fuse events gets its share of the fuse time left each call, from 1 down to
+// 0 once, and -1 when the gaze leaves it.
+void SceneInput_gaze(*SceneInput self, *Scene scene, SceneRay ray, double time) {
+    SceneHit hit;
+    Scene_hit_test(scene, ray, &hit);
+    int node = _scene_handler_for(self, scene, SCENE_ON_FUSE, hit.node);
+    if (node != self.fused) {
+        if (self.fused >= 0) {
+            SceneEvent out = _scene_event(SCENE_EVENT_FUSE, 0, &hit);
+            out.fuse = -1.0;
+            out.has_point = false;
+            _scene_send(self, self.fused, &out);
+        }
+        self.fused = node;
+        self.fuse_done = false;
+        self.fuse_at = node >= 0 ? time + self.handlers.data[node].fuse_time : 0.0;
+    }
+    if (node < 0 || self.fuse_done) return;
+    double total = self.handlers.data[node].fuse_time;
+    float left = total > 0.0 ? (float)((self.fuse_at - time) / total) : 0.0;
+    if (left <= 0.0) {
+        left = 0.0;
+        self.fuse_done = true;
+    }
+    SceneEvent e = _scene_event(SCENE_EVENT_FUSE, 0, &hit);
+    e.fuse = left;
+    _scene_send(self, node, &e);
+}
+
+float _scene_atan2(float y, float x) {
+    return (float)atan2((double)y, (double)x);
+}
+
+// A touch on a view showing the scene at width x height pixels: one finger points,
+// presses, drags and clicks; a second finger ends that press and starts a pinch and a
+// rotation, which end when either finger lifts.
+void SceneInput_touch(*SceneInput self, *Scene scene, GpuTouch t, uint32 width, uint32 height) {
+    int slot = -1;
+    for (k in 0..2) {
+        if (self.finger[k] == t.id) slot = k;
+    }
+    if (t.phase == GPU_TOUCH_DOWN) {
+        if (slot >= 0) return;
+        if (self.fingers >= 2) return;
+        slot = self.finger[0] < 0 ? 0 : 1;
+        self.finger[slot] = t.id;
+        self.fx[slot] = t.x;
+        self.fy[slot] = t.y;
+        self.fingers++;
+        if (self.fingers == 1) {
+            SceneInput_pointer(self, scene, Scene_screen_ray(scene, t.x, t.y, width, height), t.time);
+            SceneInput_press(self, scene);
+        } else {
+            SceneInput_cancel(self, scene);
+            float dx = self.fx[1] - self.fx[0];
+            float dy = self.fy[1] - self.fy[0];
+            self.gesture_dist = (float)sqrt((double)(dx * dx + dy * dy));
+            self.gesture_angle = _scene_atan2(dy, dx);
+            SceneInput_pinch(self, scene, 1.0, SCENE_GESTURE_START);
+            SceneInput_rotate(self, scene, 0.0, SCENE_GESTURE_START);
+        }
+        return;
+    }
+    if (slot < 0) return;
+    self.fx[slot] = t.x;
+    self.fy[slot] = t.y;
+    if (t.phase == GPU_TOUCH_MOVE) {
+        if (self.fingers == 1) {
+            SceneInput_pointer(self, scene, Scene_screen_ray(scene, t.x, t.y, width, height), t.time);
+        } else if (self.fingers == 2) {
+            float dx = self.fx[1] - self.fx[0];
+            float dy = self.fy[1] - self.fy[0];
+            float d = (float)sqrt((double)(dx * dx + dy * dy));
+            if (self.gesture_dist > 0.0) SceneInput_pinch(self, scene, d / self.gesture_dist, SCENE_GESTURE_MOVE);
+            SceneInput_rotate(self, scene, _scene_atan2(dy, dx) - self.gesture_angle, SCENE_GESTURE_MOVE);
+        }
+        return;
+    }
+    // up or cancel
+    if (self.fingers == 2) {
+        float dx = self.fx[1] - self.fx[0];
+        float dy = self.fy[1] - self.fy[0];
+        float d = (float)sqrt((double)(dx * dx + dy * dy));
+        SceneInput_pinch(self, scene, self.gesture_dist > 0.0 ? d / self.gesture_dist : 1.0, SCENE_GESTURE_END);
+        SceneInput_rotate(self, scene, _scene_atan2(dy, dx) - self.gesture_angle, SCENE_GESTURE_END);
+    } else if (self.fingers == 1) {
+        if (t.phase == GPU_TOUCH_UP) {
+            SceneInput_pointer(self, scene, Scene_screen_ray(scene, t.x, t.y, width, height), t.time);
+            SceneInput_release(self, scene);
+        } else {
+            SceneInput_cancel(self, scene);
+        }
+    }
+    self.finger[slot] = -1;
+    self.fingers--;
+    if (self.fingers < 0) self.fingers = 0;
+}
