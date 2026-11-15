@@ -183,12 +183,24 @@ void Scene_release(*Scene self) {
     List_free(&r.shadow_bufs);
     List_free(&r.draws);
     List_free(&r.recs);
+    _scene_msaa_release(r);
+    if (r.ms_resolve_made) {
+        r.ms_resolve.release();
+        r.ms_resolve_layout.release();
+        r.ms_resolve_made = false;
+    }
     if (r.bloom_made) {
         r.bloom_pre.release();
         r.bloom_buf.release();
         r.bloom_group.release();
+        r.bloom_sub.release();
+        r.bloom_sub_layout.release();
         r.bloom_made = false;
     }
+    for (i in 0..r.bloom_sub_groups.size) r.bloom_sub_groups.data[i].release();
+    for (i in 0..r.bloom_sub_bufs.size) r.bloom_sub_bufs.data[i].release();
+    List_free(&r.bloom_sub_groups);
+    List_free(&r.bloom_sub_bufs);
     if (r.bloom_w > 0) {
         r.bloom_src.release();
         r.bloom_depth.release();

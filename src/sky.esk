@@ -107,7 +107,7 @@ struct _SceneSkyGpu {
     WGPUTextureView bound360;
 }
 
-Result<GpuPipeline, string> _scene_sky_pipe(*Gpu gpu, *GpuBindLayout layout, string body, bool masked) {
+Result<GpuPipeline, string> _scene_sky_pipe(*Gpu gpu, *GpuBindLayout layout, string body, bool masked, uint32 samples) {
     String src;
     defer src.free();
     src.append(_scene_sky_head);
@@ -116,7 +116,7 @@ Result<GpuPipeline, string> _scene_sky_pipe(*Gpu gpu, *GpuBindLayout layout, str
     GpuPipelineDesc d = GpuPipelineDesc{wgsl: (string)src.data, vertex: "vs", fragment: "fs",
         format: WGPUTextureFormat_RGBA16Float, groups: &groups[0], group_count: 1, depth: true,
         depth_format: WGPUTextureFormat_Depth24PlusStencil8, depth_compare: WGPUCompareFunction_LessEqual,
-        depth_read_only: true};
+        depth_read_only: true, samples: samples > 1 ? samples : (uint32)1};
     if (masked) d.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_Equal};
     return gpu.pipeline(&d);
 }
@@ -126,14 +126,14 @@ Result<int, string> _scene_sky_make(*_SceneSkyGpu self, *Gpu gpu) {
     self.layout.uniform(0, WGPUShaderStage_Fragment);
     self.layout.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_Cube);
     self.layout.sampler(2, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
-    self.pipe = _scene_sky_pipe(gpu, &self.layout, _scene_sky_cube_wgsl, false)?;
-    self.pipe_masked = _scene_sky_pipe(gpu, &self.layout, _scene_sky_cube_wgsl, true)?;
+    self.pipe = _scene_sky_pipe(gpu, &self.layout, _scene_sky_cube_wgsl, false, 1)?;
+    self.pipe_masked = _scene_sky_pipe(gpu, &self.layout, _scene_sky_cube_wgsl, true, 1)?;
     self.layout360 = gpu.bind_layout();
     self.layout360.uniform(0, WGPUShaderStage_Fragment);
     self.layout360.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_2D);
     self.layout360.sampler(2, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
-    self.pipe360 = _scene_sky_pipe(gpu, &self.layout360, _scene_sky_360_wgsl, false)?;
-    self.pipe360_masked = _scene_sky_pipe(gpu, &self.layout360, _scene_sky_360_wgsl, true)?;
+    self.pipe360 = _scene_sky_pipe(gpu, &self.layout360, _scene_sky_360_wgsl, false, 1)?;
+    self.pipe360_masked = _scene_sky_pipe(gpu, &self.layout360, _scene_sky_360_wgsl, true, 1)?;
     self.uniforms = gpu.uniform(null, 144)?;
     GpuSamplerOptions so360 = GpuSamplerOptions{mipmaps: true, wrap_u: WGPUAddressMode_Repeat,
         wrap_v: WGPUAddressMode_ClampToEdge};
@@ -194,4 +194,17 @@ void _scene_sky_release(*_SceneSkyGpu self) {
     self.pipe360_masked.release();
     self.layout360.release();
     self.made = false;
+}
+
+// The sky's four pipelines made again for samples samples per pixel (the scene's pass).
+Result<int, string> _scene_sky_samples(*_SceneSkyGpu self, *Gpu gpu, uint32 samples) {
+    self.pipe.release();
+    self.pipe_masked.release();
+    self.pipe360.release();
+    self.pipe360_masked.release();
+    self.pipe = _scene_sky_pipe(gpu, &self.layout, _scene_sky_cube_wgsl, false, samples)?;
+    self.pipe_masked = _scene_sky_pipe(gpu, &self.layout, _scene_sky_cube_wgsl, true, samples)?;
+    self.pipe360 = _scene_sky_pipe(gpu, &self.layout360, _scene_sky_360_wgsl, false, samples)?;
+    self.pipe360_masked = _scene_sky_pipe(gpu, &self.layout360, _scene_sky_360_wgsl, true, samples)?;
+    return Ok<int, string>(0);
 }

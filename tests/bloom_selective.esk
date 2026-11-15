@@ -62,6 +62,20 @@ Result<int, string> run() {
     printf("glow left %d right %d corner %d\n", gl, gr, lum(px, 0, 0));
     check("the marked box glows", gl > 30);
     check("the unmarked box does not", gr < 10);
+    // a threshold of its own above the material's brightness: it does not glow, the other does
+    scene.material(plain).bloom = true;
+    scene.material(plain).bloom_threshold = 6.0;
+    scene.render_to(&t)?;
+    t.read(px)?;
+    printf("own threshold: left %d right %d\n", lum(px, lx, y), lum(px, rx, y));
+    check("a material's own higher threshold keeps it from glowing", lum(px, lx, y) > 30 && lum(px, rx, y) < 10);
+    scene.material(plain).bloom = false;
+    // with multisampling the same
+    scene.msaa = 4;
+    scene.render_to(&t)?;
+    t.read(px)?;
+    check("multisampled: only the marked box glows", lum(px, lx, y) > 30 && lum(px, rx, y) < 10);
+    scene.msaa = 0;
     // none marked: the old whole-image bloom, both glow
     scene.material(glow).bloom = false;
     scene.render_to(&t)?;

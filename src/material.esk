@@ -135,6 +135,9 @@ struct SceneMaterial {
     // marked, only marked ones bloom, hidden where other surfaces cover them; with none
     // marked, every bright part of the image does
     bool bloom;
+    // the luminance where this material starts to bloom (0: post.bloom_threshold); above
+    // post.bloom_threshold, which is then the lowest of the marked materials' thresholds
+    float bloom_threshold;
 }
 
 // How the material's textures repeat past 0..1 (SceneMaterial.wrap_s, wrap_t; ViroReact's

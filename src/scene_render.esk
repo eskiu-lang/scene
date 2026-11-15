@@ -247,6 +247,7 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
         r.depth_view = r.depth_prev_view;
         r.depth_prev_view = tv;
     }
+    _scene_msaa_targets(self, width, height)?;
     Scene_update(self);
     _scene_camera(self, width, height);
     List_clear(&r.draws);
@@ -396,9 +397,12 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
         sp.end()?;
     }
 
+    bool ms = r.samples > 1;
     GpuPassOptions mo = GpuPassOptions{clear: GpuColor{(double)self.background.x, (double)self.background.y,
-        (double)self.background.z, (double)self.background.w}, depth: &r.depth};
-    GpuPass pass = enc.pass_with(r.hdr.view, &mo);
+        (double)self.background.z, (double)self.background.w}, depth: ms ? &r.ms_depth : &r.depth};
+    // multisampled: drawn into the multisampled targets, the color resolved into hdr
+    if (ms) mo.resolve = r.hdr.view;
+    GpuPass pass = enc.pass_with(ms ? r.ms_color.view : r.hdr.view, &mo);
     // the real world's depth first: what is behind it fails the depth test
     if (self.occlusion_depth > 0) _scene_occlusion(self, &pass)?;
     int active = _scene_active_world(self);
@@ -408,6 +412,9 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     // turn, as ViroReact walks its portal tree
     _scene_portals_from(self, &pass, active, -1, 0)?;
     pass.end()?;
+    // the multisampled depth's first sample into depth, for what reads it after the frame
+    // (depth writers, tracking areas, modifiers' scene_depth_texture)
+    if (ms) _scene_msaa_resolve_depth(self, enc)?;
     *GpuTexture bg = self.camera_background > 0 && self.camera_background < self.textures.size &&
         self.textures.data[self.camera_background].handle != null ? &self.textures.data[self.camera_background] : null;
     *GpuTexture bloom_from = null;
@@ -446,6 +453,25 @@ string _scene_bloom_pre_wgsl =
     "}\n"
     "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }\n";
 
+string _scene_bloom_sub_wgsl =
+    "struct Pass { vp: mat4x4<f32>, eye: vec4<f32> };\n"
+    "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, lights: array<vec4<u32>, 2>, info: vec4<f32>, morph: vec4<f32> };\n"
+    "@group(0) @binding(0) var<uniform> sp: Pass;\n"
+    "@group(1) @binding(0) var<uniform> draw: Draw;\n"
+    "@group(1) @binding(1) var<storage, read> joints: array<mat4x4<f32>>;\n"
+    "@group(1) @binding(2) var<storage, read> morph: array<vec4<f32>>;\n"
+    "@group(1) @binding(3) var<storage, read> weights: array<f32>;\n"
+    "@group(2) @binding(0) var<uniform> excess: vec4<f32>;\n"
+    SCENE_DEFORM_WGSL
+    "@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32, @location(0) pos: vec3<f32>, @location(6) joint: vec4<f32>,\n"
+    "              @location(7) weight: vec4<f32>) -> @builtin(position) vec4<f32> {\n"
+    "    var p = pos;\n"
+    "    var nrm = vec3<f32>(0.0, 0.0, 1.0);\n"
+    "    morph_apply(vi, &p, &nrm);\n"
+    "    return sp.vp * (inst_model(ii) * (skin_matrix(joint, weight) * vec4<f32>(p, 1.0)));\n"
+    "}\n"
+    "@fragment fn fs() -> @location(0) vec4<f32> { return excess; }\n";
+
 // The bloom's source when materials are marked: the depth of the unmarked opaque surfaces of
 // world, then the marked ones drawn as in the frame, into bloom_src (cleared to black).
 Result<int, string> _scene_bloom_source(*Scene self, *GpuEncoder enc, int world) {
@@ -466,8 +492,20 @@ Result<int, string> _scene_bloom_source(*Scene self, *GpuEncoder enc, int world)
         _scene_vertex_layout(&layout);
         *GpuBindLayout[2] groups = {&r.shadow_layout, &r.draw_layout};
         GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_bloom_pre_wgsl, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA16Float,
-            layout: &layout, groups: &groups[0], group_count: 2, depth: true, depth_format: SCENE_DEPTH_FORMAT, no_color_write: true};
+            layout: &layout, groups: &groups[0], group_count: 2, depth: true, depth_format: SCENE_DEPTH_FORMAT, no_color_write: true,
+            samples: r.samples > 1 ? r.samples : (uint32)1};
         r.bloom_pre = self.gpu.pipeline(&d)?;
+        r.bloom_sub_layout = self.gpu.bind_layout();
+        r.bloom_sub_layout.uniform(0, WGPUShaderStage_Fragment);
+        *GpuBindLayout[3] sgroups = {&r.shadow_layout, &r.draw_layout, &r.bloom_sub_layout};
+        // destination minus source on the color, alpha left alone
+        WGPUBlendState sub = WGPUBlendState{color: WGPUBlendComponent{operation: WGPUBlendOperation_ReverseSubtract,
+            srcFactor: WGPUBlendFactor_One, dstFactor: WGPUBlendFactor_One}, alpha: WGPUBlendComponent{operation: WGPUBlendOperation_Add,
+            srcFactor: WGPUBlendFactor_Zero, dstFactor: WGPUBlendFactor_One}};
+        GpuPipelineDesc sd = GpuPipelineDesc{wgsl: _scene_bloom_sub_wgsl, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA16Float,
+            layout: &layout, groups: &sgroups[0], group_count: 3, depth: true, depth_format: SCENE_DEPTH_FORMAT, depth_read_only: true,
+            depth_compare: WGPUCompareFunction_LessEqual, blend_state: &sub, samples: r.samples > 1 ? r.samples : (uint32)1};
+        r.bloom_sub = self.gpu.pipeline(&sd)?;
         r.bloom_buf = self.gpu.uniform(null, 80)?;
         r.bloom_group = r.shadow_layout.group()?;
         r.bloom_group.buffer(0, &r.bloom_buf);
@@ -480,8 +518,10 @@ Result<int, string> _scene_bloom_source(*Scene self, *GpuEncoder enc, int world)
     pu[18] = r.eye.z;
     pu[19] = 1.0;
     r.bloom_buf.write(0, &pu[0], 80);
-    GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 0.0}, depth: &r.bloom_depth};
-    GpuPass pass = enc.pass_with(r.bloom_src.view, &o);
+    bool ms = r.samples > 1;
+    GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 0.0}, depth: ms ? &r.ms_bloom_depth : &r.bloom_depth};
+    if (ms) o.resolve = r.bloom_src.view;
+    GpuPass pass = enc.pass_with(ms ? r.ms_bloom.view : r.bloom_src.view, &o);
     for (i in 0..r.draws.size) {
         *_SceneDraw d = &r.draws.data[i];
         if (!d.in_view || d.world != world || d.blend || self.materials.data[d.material].bloom) continue;
@@ -495,6 +535,32 @@ Result<int, string> _scene_bloom_source(*Scene self, *GpuEncoder enc, int world)
         if (!d.in_view || d.world != world || !self.materials.data[d.material].bloom) continue;
         *GpuPipeline p = _scene_pipeline(self, d.key)?;
         _scene_draw(self, &pass, d, p);
+    }
+    // a material above the shared threshold: its excess taken off where it shows, so the
+    // shared cut leaves what passes its own threshold
+    float base = self.post.bloom_threshold > 0.0 ? self.post.bloom_threshold : 1.0;
+    int k = 0;
+    for (i in 0..r.draws.size) {
+        *_SceneDraw d = &r.draws.data[i];
+        if (!d.in_view || d.world != world) continue;
+        *SceneMaterial m = &self.materials.data[d.material];
+        if (!m.bloom || m.bloom_threshold <= base) continue;
+        while (r.bloom_sub_bufs.size <= k) {
+            GpuBuffer b = self.gpu.uniform(null, 16)?;
+            List_push(&r.bloom_sub_bufs, b);
+            GpuBindGroup g = r.bloom_sub_layout.group()?;
+            List_push(&r.bloom_sub_groups, g);
+            r.bloom_sub_groups.data[r.bloom_sub_groups.size - 1].buffer(0, &r.bloom_sub_bufs.data[r.bloom_sub_bufs.size - 1]);
+        }
+        float excess = m.bloom_threshold - base;
+        float[4] v = {excess, excess, excess, 0.0};
+        r.bloom_sub_bufs.data[k].write(0, &v[0], 16);
+        *SceneMesh mesh = &self.meshes.data[d.mesh];
+        pass.set_group(0, &r.bloom_group);
+        pass.set_group(1, &r.nodes.data[d.node].group);
+        pass.set_group(2, &r.bloom_sub_groups.data[k]);
+        pass.draw_indexed(&r.bloom_sub, &mesh.vertices, &mesh.indices, mesh.index_count, _scene_instance_count(self, d.node));
+        k++;
     }
     pass.end()?;
     return Ok<int, string>(0);
@@ -631,7 +697,8 @@ Result<int, string> _scene_occlusion(*Scene self, *GpuPass pass) {
         *GpuBindLayout[1] groups = {&r.occ_layout};
         GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_occlusion_wgsl, vertex: "vs", fragment: "fs",
             format: WGPUTextureFormat_RGBA16Float, groups: &groups[0], group_count: 1, depth: true,
-            depth_format: SCENE_DEPTH_FORMAT, depth_compare: WGPUCompareFunction_Always, no_color_write: true};
+            depth_format: SCENE_DEPTH_FORMAT, depth_compare: WGPUCompareFunction_Always, no_color_write: true,
+            samples: r.samples > 1 ? r.samples : (uint32)1};
         r.occ_pipe = self.gpu.pipeline(&d)?;
         r.occ_uniforms = self.gpu.uniform(null, 128)?;
         r.occ_group = r.occ_layout.group()?;
@@ -656,7 +723,7 @@ Result<int, string> _scene_depth_reset(*Scene self, *GpuPass pass) {
         GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_depth_reset_wgsl, vertex: "vs", fragment: "fs",
             format: WGPUTextureFormat_RGBA16Float, depth: true, depth_format: SCENE_DEPTH_FORMAT,
             depth_compare: WGPUCompareFunction_Always, no_color_write: true,
-            stencil_front: GpuStencilFace{compare: WGPUCompareFunction_Equal}};
+            stencil_front: GpuStencilFace{compare: WGPUCompareFunction_Equal}, samples: r.samples > 1 ? r.samples : (uint32)1};
         r.depth_reset = self.gpu.pipeline(&d)?;
         r.depth_reset_made = true;
     }
@@ -739,4 +806,112 @@ Result<int, string> Scene_render(*Scene self, WGPUTextureView view, uint32 width
 // Renders into a texture (Gpu_target, Gpu_target_with), to read back or sample.
 Result<int, string> Scene_render_to(*Scene self, *GpuTexture target) {
     return Scene_render(self, target.view, target.width, target.height, target.format);
+}
+
+// Scene.msaa applied: the pipelines of the scene's pass made again when the sample count
+// changes, and the multisampled targets sized to the frame.
+Result<int, string> _scene_msaa_targets(*Scene self, uint32 width, uint32 height) {
+    *_SceneRenderer r = &self._r;
+    uint32 want = self.msaa > 1 ? (uint32)4 : (uint32)1;
+    uint32 have = r.samples > 1 ? r.samples : (uint32)1;
+    if (want != have) {
+        for (i in 0..r.pipes.size) r.pipes.data[i].pipe.release();
+        List_clear(&r.pipes);
+        if (r.depth_reset_made) r.depth_reset.release();
+        r.depth_reset_made = false;
+        if (r.occ_made) {
+            r.occ_group.release();
+            r.occ_uniforms.release();
+            r.occ_pipe.release();
+            r.occ_layout.release();
+            r.occ_made = false;
+        }
+        if (r.bloom_made) {
+            r.bloom_pre.release();
+            r.bloom_buf.release();
+            r.bloom_group.release();
+            r.bloom_sub.release();
+            r.bloom_sub_layout.release();
+            r.bloom_made = false;
+        }
+        // their bind groups belong to the layout made again with the pipelines
+        for (i in 0..r.bloom_sub_groups.size) r.bloom_sub_groups.data[i].release();
+        for (i in 0..r.bloom_sub_bufs.size) r.bloom_sub_bufs.data[i].release();
+        List_clear(&r.bloom_sub_groups);
+        List_clear(&r.bloom_sub_bufs);
+        r.samples = want;
+        _scene_sky_samples(&r.sky, &self.gpu, want)?;
+    }
+    if (want > 1 && (r.ms_w != width || r.ms_h != height || r.ms_n != want)) {
+        _scene_msaa_release(r);
+        GpuTextureDesc cd = GpuTextureDesc{width: width, height: height, format: WGPUTextureFormat_RGBA16Float,
+            usage: WGPUTextureUsage_RenderAttachment, samples: want};
+        r.ms_color = self.gpu.texture_with(&cd)?;
+        r.ms_bloom = self.gpu.texture_with(&cd)?;
+        GpuTextureDesc dd = GpuTextureDesc{width: width, height: height, format: SCENE_DEPTH_FORMAT,
+            usage: WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding, samples: want};
+        r.ms_depth = self.gpu.texture_with(&dd)?;
+        dd.usage = WGPUTextureUsage_RenderAttachment;
+        r.ms_bloom_depth = self.gpu.texture_with(&dd)?;
+        GpuViewDesc dv = GpuViewDesc{format: WGPUTextureFormat_Depth24Plus, aspect: WGPUTextureAspect_DepthOnly, dimension: WGPUTextureViewDimension_2D};
+        r.ms_depth_view = r.ms_depth.view_with(&dv)?;
+        r.ms_w = width;
+        r.ms_h = height;
+        r.ms_n = want;
+    }
+    return Ok<int, string>(0);
+}
+
+void _scene_msaa_release(*_SceneRenderer r) {
+    if (r.ms_w == 0) return;
+    r.ms_depth_view.release();
+    r.ms_color.release();
+    r.ms_depth.release();
+    r.ms_bloom.release();
+    r.ms_bloom_depth.release();
+    r.ms_w = 0;
+    r.ms_h = 0;
+    r.ms_n = 0;
+}
+
+string _scene_msaa_depth_wgsl =
+    "@group(0) @binding(0) var ms_depth: texture_depth_multisampled_2d;\n"
+    "struct V { @builtin(position) pos: vec4<f32> };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    var v: V;\n"
+    "    v.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    return v;\n"
+    "}\n"
+    "struct F { @builtin(frag_depth) depth: f32, @location(0) color: vec4<f32> };\n"
+    "@fragment fn fs(v: V) -> F {\n"
+    "    var f: F;\n"
+    "    f.color = vec4<f32>(0.0);\n"
+    "    f.depth = textureLoad(ms_depth, vec2<i32>(v.pos.xy), 0);\n"
+    "    return f;\n"
+    "}\n";
+
+// The multisampled depth's first sample written into the single-sample depth.
+Result<int, string> _scene_msaa_resolve_depth(*Scene self, *GpuEncoder enc) {
+    *_SceneRenderer r = &self._r;
+    if (!r.ms_resolve_made) {
+        r.ms_resolve_layout = self.gpu.bind_layout();
+        List_push(&r.ms_resolve_layout.entries, WGPUBindGroupLayoutEntry{binding: 0, visibility: _gpu_visibility(WGPUShaderStage_Fragment),
+            texture: WGPUTextureBindingLayout{sampleType: WGPUTextureSampleType_Depth, viewDimension: WGPUTextureViewDimension_2D, multisampled: 1}});
+        *GpuBindLayout[1] groups = {&r.ms_resolve_layout};
+        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _scene_msaa_depth_wgsl, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA16Float,
+            groups: &groups[0], group_count: 1, depth: true, depth_format: SCENE_DEPTH_FORMAT, depth_compare: WGPUCompareFunction_Always,
+            no_color_write: true};
+        r.ms_resolve = self.gpu.pipeline(&d)?;
+        r.ms_resolve_made = true;
+    }
+    GpuBindGroup g = r.ms_resolve_layout.group()?;
+    defer g.release();
+    g.view(0, &r.ms_depth_view);
+    GpuPassOptions o = GpuPassOptions{load: true, depth: &r.depth};
+    GpuPass pass = enc.pass_with(r.hdr.view, &o);
+    pass.set_group(0, &g);
+    pass.draw(&r.ms_resolve, null, 3, 1);
+    pass.end()?;
+    return Ok<int, string>(0);
 }

@@ -444,6 +444,7 @@ Result<*GpuPipeline, string> _scene_pipeline(*Scene self, int key) {
         // reference), raising the stencil there by one: the next world's level
         d.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_Equal, pass: WGPUStencilOperation_IncrementClamp};
     }
+    d.samples = r.samples > 1 ? r.samples : (uint32)1;
     GpuPipeline p = self.gpu.pipeline(&d)?;
     List_push(&r.pipes, _ScenePipe{key, p});
     return Ok<*GpuPipeline, string>(&r.pipes.data[r.pipes.size - 1].pipe);

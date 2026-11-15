@@ -1,0 +1,98 @@
+// Multisampling: a slanted edge gets intermediate shades with msaa 4 and none without; the
+// depth resolved from the multisampled pass still hides what is behind for the tracking areas.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <scene>;
+import <scene/vr>;
+
+const int N = 64;
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+// pixels neither background nor fully the box's color, on the red channel
+int partial(*uint8 px) {
+    int n = 0;
+    for (i in 0..N * N) {
+        int v = (int)px[i * 4];
+        if (v > 20 && v < 235) n++;
+    }
+    return n;
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Scene scene = gpu.scene()?;
+    defer scene.release();
+    scene.post.gamma = false;
+    SceneGeometry g = scene_box(0.6, 0.6, 0.6);
+    int mesh = scene.add_geometry(&g)?;
+    g.free();
+    SceneMaterial red = scene_material(SCENE_CONSTANT);
+    red.diffuse = Vec4{1.0, 0.0, 0.0, 1.0};
+    int box = scene.add_object(0, mesh, scene.add_material(red));
+    scene.node(box).position = Vec3{0.0, 0.0, -2.0};
+    scene.node(box).rotation = quat_axis_angle(Vec3{0.0, 0.0, 1.0}, 0.4);
+    int front = scene.add_object(0, mesh, scene.add_material(red));
+    scene.node(front).position = Vec3{0.0, -0.2, -1.2};
+    scene.node(front).scale = Vec3{0.4, 0.4, 0.4};
+    int cam = scene.add_camera(0, scene_perspective(1.0, 0.05, 50.0));
+    scene.set_camera(cam);
+    GpuTexture t = gpu.target_with((uint32)N, (uint32)N, WGPUTextureFormat_RGBA8Unorm)?;
+    defer t.release();
+    *uint8 px = alloc<uint8>(N * N * 4);
+    defer free((*void)px);
+    scene.render_to(&t)?;
+    t.read(px)?;
+    int hard = partial(px);
+    // the same tracking-area check without multisampling first, then with it
+    for (pass in 0..2) {
+        scene.msaa = pass == 0 ? 0 : 4;
+        Scene_render_eye(&scene, &t, scene_eye(0.0, 1.0, 1.0, 0.05, 50.0))?;
+        GpuTexture ids = gpu.texture((uint32)N, (uint32)N, WGPUTextureFormat_R16Uint, WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc)?;
+        SceneIdWriter w = scene_id_writer();
+        int[1] nodes = {box};
+        uint32[1] values = {5};
+        w.write(&scene, &ids, &nodes[0], &values[0], 1)?;
+        *uint16 iv = alloc<uint16>(N * N);
+        ids.read(iv)?;
+        int c = N / 2;
+        printf("msaa %d: center %d, under the front box %d\n", scene.msaa, (int)iv[(c - 8) * N + c], (int)iv[(c + 10) * N + c]);
+        check("the back box's value above the front box", iv[(c - 8) * N + c] == 5);
+        check("hidden where the front box covers it", iv[(c + 10) * N + c] == 0);
+        free((*void)iv);
+        w.release();
+        ids.release();
+    }
+    scene.msaa = 0;
+    scene.render_to(&t)?;
+    t.read(px)?;
+    scene.msaa = 4;
+    scene.render_to(&t)?;
+    t.read(px)?;
+    int soft = partial(px);
+    printf("edge pixels: without %d, with msaa %d\n", hard, soft);
+    check("no intermediate shades without multisampling", hard == 0);
+    check("intermediate shades along the edges with multisampling", soft > 20);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    println("msaa ok");
+    return 0;
+}

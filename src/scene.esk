@@ -341,6 +341,26 @@ struct _SceneRenderer {
     GpuBuffer bloom_buf;
     GpuBindGroup bloom_group;
     bool bloom_made;
+    // per-material thresholds: each marked surface drawn again subtracting its threshold's excess
+    // over post.bloom_threshold from the bloom source (one value buffer per draw)
+    GpuBindLayout bloom_sub_layout;
+    GpuPipeline bloom_sub;
+    List<GpuBuffer> bloom_sub_bufs;
+    List<GpuBindGroup> bloom_sub_groups;
+    // multisampling: the sample count the pipelines were made with, the multisampled targets
+    // (color and depth of the scene's pass and of the bloom source) and the depth resolve
+    uint32 samples;
+    uint32 ms_w;
+    uint32 ms_h;
+    uint32 ms_n;
+    GpuTexture ms_color;
+    GpuTexture ms_depth;
+    GpuTexture ms_bloom;
+    GpuTexture ms_bloom_depth;
+    GpuTextureView ms_depth_view;
+    GpuBindLayout ms_resolve_layout;
+    GpuPipeline ms_resolve;
+    bool ms_resolve_made;
     List<_SceneDraw> draws;
     List<_SceneLightRec> recs;
     _ScenePostGpu post;
@@ -398,6 +418,9 @@ struct Scene {
     Quat sky_rotation;
     *GpuIbl ibl;
     ScenePost post;
+    // multisample antialiasing: samples per pixel of the scene's pass (0 or 1 none, else 4,
+    // the count every WebGPU device supports); its depth is resolved for what reads it after
+    int msaa;
     uint32 shadow_size;
     int active_portal;
     int camera_texture;
