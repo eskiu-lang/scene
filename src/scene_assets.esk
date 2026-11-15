@@ -57,7 +57,13 @@ int Scene_borrow_texture(*Scene self, int id, *GpuTexture texture) {
 // A texture from decoded pixels, stored as sRGB when srgb (color data) or linear (normal,
 // metal-roughness and occlusion maps), with mipmaps; returns its id.
 Result<int, string> Scene_image_texture(*Scene self, *Bitmap image, bool srgb) {
-    GpuImageOptions o = GpuImageOptions{srgb: srgb, mipmaps: true};
+    return Scene_image_texture_with(self, image, srgb, true);
+}
+
+// Scene_image_texture with or without its mipmaps (ViroImage's mipmap false: sampled at full
+// size only).
+Result<int, string> Scene_image_texture_with(*Scene self, *Bitmap image, bool srgb, bool mipmaps) {
+    GpuImageOptions o = GpuImageOptions{srgb: srgb, mipmaps: mipmaps};
     GpuTexture t = self.gpu.image_with(image.width, image.height, image.rgba, &o)?;
     return Ok<int, string>(Scene_add_texture(self, t));
 }
