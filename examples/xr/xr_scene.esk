@@ -1,6 +1,6 @@
 // The headset showcase the examples draw (visionos/ through CompositorServices, quest/ through
 // OpenXR): buttons in front of the viewer pick one of twelve scenes, each trying a part of
-// eskiu-lang/scene in a headset (materials, lights and shadows, images and a 360 sky, video,
+// eskiu-packages/scene in a headset (materials, lights and shadows, images and a 360 sky, video,
 // glTF and VRX models with their animations, text, particles, physics, dragging, animation,
 // a portal), over a lit floor. Pointing at a button and clicking (a Quest controller's
 // trigger or a pinch, a visionOS pinch) opens its scene.

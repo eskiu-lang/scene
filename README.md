@@ -13,14 +13,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/eskiu-lang/scene/actions/workflows/ci.yml"><img src="https://github.com/eskiu-lang/scene/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/eskiu-packages/scene/actions/workflows/ci.yml"><img src="https://github.com/eskiu-packages/scene/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/version-0.2.0-6448d4" alt="Version 0.2.0">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
 
 ---
 
-`scene` draws 3D scenes with [gpu](https://github.com/eskiu-lang/gpu) (WebGPU through
+`scene` draws 3D scenes with [gpu](https://github.com/eskiu-packages/gpu) (WebGPU through
 wgpu-native, so Metal, Vulkan and DirectX 12). It covers the core of what ViroReact's
 renderer does for an app: a tree of nodes, materials, lights, transparency and an HDR image
 pipeline.
@@ -40,13 +40,13 @@ pipeline.
 - **Sky.** A solid color, a cube map from `<gpu/ibl>` or six images, a 360 image, and
   image-based lighting for PBR materials.
 - **Images and video.** Animated GIFs decoded in Eskiu, and video frames from
-  eskiu-lang/video on surfaces or as a 360 sky.
+  eskiu-packages/video on surfaces or as a 360 sky.
 - **Portals.** ViroPortalScene's worlds seen through windows, with their own skies, that the
   camera can walk into.
 - **Shapes.** ViroPolygon's polygons with holes and ViroPolyline's camera-facing lines.
 - **Particles.** ViroParticleEmitter's emitters: rates, bursts, spawn volumes, modifiers
   over time, distance or speed, explosions.
-- **Text.** TrueType text from eskiu-lang/font in a box, wrapped, aligned, justified and
+- **Text.** TrueType text from eskiu-packages/font in a box, wrapped, aligned, justified and
   clipped as ViroText lays it out.
 - **Animation.** Position, scale, rotation, opacity and color animated in groups and
   chains with ViroReact's easing curves, node opacity down the tree, rendering order,
@@ -95,7 +95,7 @@ Result<int, string> draw(*Gpu gpu, *GpuTexture target) {
 ## Install
 
 ```bash
-eskiuc add scene --git https://github.com/eskiu-lang/scene --rev v0.2.0
+eskiuc add scene --git https://github.com/eskiu-packages/scene --rev v0.2.0
 ```
 
 It needs Eskiu 0.15.1 or newer and brings gpu 0.7.0, which downloads wgpu-native on the first build.

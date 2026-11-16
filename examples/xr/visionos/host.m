@@ -1,7 +1,7 @@
 // The frame loop of the visionOS example: CompositorServices hands over each frame's
 // drawables, ARKit gives the device's pose at the frame's presentation time, and the scene in
 // ../xr_scene.esk draws each view into the drawable's color texture through wgpu
-// (wgpuDeviceCreateTextureFromMetal, eskiu-lang/wgpu-native's eskiu branch).
+// (wgpuDeviceCreateTextureFromMetal, eskiu-packages/wgpu-native's eskiu branch).
 #import <CompositorServices/CompositorServices.h>
 #import <ARKit/ARKit.h>
 #import <Metal/Metal.h>

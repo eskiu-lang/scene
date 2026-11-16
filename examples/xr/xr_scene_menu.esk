@@ -219,7 +219,7 @@ Result<int, string> _xr_models_scene(int root) {
 Result<int, string> _xr_texts(int root) {
     if (!xr_has_font) return Ok<int, string>(0);
     _xr_text(root, "Eskiu in a headset", 18.0, Vec4{1.0, 1.0, 1.0, 1.0}, 0.0, 1.7, -1.8, 2.6, 0.3)?;
-    _xr_text(root, "Text drawn by eskiu-lang/scene", 10.0, Vec4{1.0, 0.8, 0.2, 1.0}, 0.0, 1.45, -1.8, 2.6, 0.2)?;
+    _xr_text(root, "Text drawn by eskiu-packages/scene", 10.0, Vec4{1.0, 0.8, 0.2, 1.0}, 0.0, 1.45, -1.8, 2.6, 0.2)?;
     SceneTextStyle st = scene_text_style();
     st.size = 14.0;
     st.color = Vec4{0.3, 0.9, 1.0, 1.0};

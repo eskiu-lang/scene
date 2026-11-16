@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds the visionOS example for the simulator (or a device with SDK=xros) into
-# build/EskiuXR.app. It needs wgpu-native built from eskiu-lang/wgpu-native's eskiu branch
+# build/EskiuXR.app. It needs wgpu-native built from eskiu-packages/wgpu-native's eskiu branch
 # (WGPU_LIB, its eskiu/build_apple.sh) and an eskiu-gpu with Gpu_texture_from_metal (GPU_DIR,
 # until a gpu release has it).
 #

@@ -152,7 +152,7 @@ ambient lights. Both pointers must outlive their use; the scene does not release
 ## AR: the camera picture
 
 An AR app draws the camera picture behind the scene: `Scene.camera_background` is a texture
-id holding the picture already fitted to the view (eskiu-lang/ar's frame drawn with
+id holding the picture already fitted to the view (eskiu-packages/ar's frame drawn with
 `<gpu/yuv>` into a texture of the view's size, then `Scene_borrow_texture`), with
 `Scene.background` at alpha 0. The final pass puts the scene over it as premultiplied color,
 after tone mapping and effects, so the picture stays as the camera shot it: opaque surfaces
@@ -174,7 +174,7 @@ scene.background = Vec4{0.0, 0.0, 0.0, 0.0};
 ViroReact's `occlusionMode` `DepthBased` does. It holds the depth of the real world in meters
 in its red channel (`R32Float` or `R16Float`, 0 where unknown), the AR session's depth image
 uploaded as it comes, and `occlusion_transform` maps the view's coordinates (x and y from 0
-to 1 from the top left) to the image's: eskiu-lang/ar's `ArFrame_display_transform`. Before
+to 1 from the top left) to the image's: eskiu-packages/ar's `ArFrame_display_transform`. Before
 the scene is drawn, a full-screen pass writes that depth, converted with the camera's
 projection, into the depth buffer, so a virtual surface farther than the real one at a pixel
 fails the depth test there and the camera picture shows instead. Nothing in the materials

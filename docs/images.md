@@ -29,7 +29,7 @@ was set.
 
 `Scene_borrow_texture(id, &texture)` shows a texture that stays the caller's: the scene never
 releases it, and every material with that texture id shows it. This is how a video plays on
-a surface (ViroReact's video materials and `ViroVideo`): eskiu-lang/video hands decoded
+a surface (ViroReact's video materials and `ViroVideo`): eskiu-packages/video hands decoded
 frames to Eskiu, `<gpu/yuv>` turns each into an RGBA texture, and the scene shows it.
 
 ```c

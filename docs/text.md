@@ -1,7 +1,7 @@
 # Text
 
 `<scene/text>` draws text in the scene with a TrueType font from
-[eskiu-lang/font](https://github.com/eskiu-lang/font), laid out as ViroReact's `ViroText` is.
+[eskiu-packages/font](https://github.com/eskiu-packages/font), laid out as ViroReact's `ViroText` is.
 
 ```c
 Font f = font_load("Inter.ttf")?;

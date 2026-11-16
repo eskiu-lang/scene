@@ -1,7 +1,7 @@
 // The frame loop of the Quest example: an OpenXR session on the Vulkan device the scene
 // draws with (XR_KHR_vulkan_enable, the device made by wgpu, whose objects xr_scene_vulkan
 // gives), one swapchain per eye, and ../xr_scene.esk drawing each eye into its swapchain
-// image through wgpu (wgpuDeviceCreateTextureFromVulkan, eskiu-lang/wgpu-native's eskiu
+// image through wgpu (wgpuDeviceCreateTextureFromVulkan, eskiu-packages/wgpu-native's eskiu
 // branch). A NativeActivity: android_main is the app's thread.
 #include <android/asset_manager.h>
 #include <android/log.h>

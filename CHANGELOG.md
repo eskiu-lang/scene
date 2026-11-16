@@ -70,7 +70,7 @@ All notable changes to this package are documented here. The format follows
   alpha, scale, rotation, velocity and acceleration modifiers over time, distance or
   speed, explosions, camera-facing quads with additive blending. `docs/particles.md`.
 - `Scene_set_geometry` writes in place when the new data fits the mesh's buffers.
-- `<scene/text>`: `Scene_add_text` and `SceneText_set` draw TrueType text (eskiu-lang/font,
+- `<scene/text>`: `Scene_add_text` and `SceneText_set` draw TrueType text (eskiu-packages/font,
   now a dependency) from a glyph atlas, laid out as ViroText: points at 0.01 world units, a
   box, word, character or no wrapping, justification by ViroReact's Knuth-Plass formatter,
   alignment, clipping, a line cap,

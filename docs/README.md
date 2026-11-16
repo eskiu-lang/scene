@@ -55,7 +55,7 @@ macOS; on Linux and Windows, an SDL3 build from your package manager or libsdl.o
 | `<scene/gif>` | `gif_decode`, `gif_load`, `SceneAnimatedImage` |
 | `<scene/shapes>` | `scene_polygon` (holes, uv bounds), `ScenePolyline` (camera-facing ribbons) |
 | `<scene/particles>` | `SceneParticleEmitter`, modifiers, bursts, spawn volumes |
-| `<scene/text>` | `SceneText`, `SceneTextStyle`, layout, glyph atlases, outlines, drop shadows and extrusion over eskiu-lang/font |
+| `<scene/text>` | `SceneText`, `SceneTextStyle`, layout, glyph atlases, outlines, drop shadows and extrusion over eskiu-packages/font |
 | `<scene/animation>` | `SceneAnimations`: groups, easing curves, chains, playback |
 | `<scene/physics>` | `ScenePhysicsWorld`, bodies, shapes, forces, collision events, ray and shape tests |
 | `<scene/input>` | screen rays, hit tests, `SceneInput` and node events, `SceneOrbit` |

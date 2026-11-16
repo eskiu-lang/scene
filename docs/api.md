@@ -3433,7 +3433,7 @@ with Scene_set_skybox_faces, the +Z image is what a camera looking down -Z sees.
 
 Text in the scene (`<scene/text>`).
 
-A text node draws a string of a TrueType font (eskiu-lang/font) as glyph quads facing
+A text node draws a string of a TrueType font (eskiu-packages/font) as glyph quads facing
 +Z, laid out the way ViroReact's ViroText is: a font size in points, 0.01 world units a
 point, inside a box of width x height world units centered on the node, wrapped by
 words, by characters, justified or only at newlines, aligned left, center or right and

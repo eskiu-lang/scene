@@ -105,7 +105,7 @@ a Quest controller's aim pose and its trigger, or of a visionOS pinch (`xr_scene
 (`xr_scene_open`, `xr_scene_step`, `xr_scene_render`, `xr_scene_wait`); for each view the host
 hands over the system's color image, the view's world pose and its field-of-view tangents,
 and the scene wraps the image as a `GpuTexture` and draws with `Scene_render_eye`. Both hosts
-link wgpu-native from eskiu-lang/wgpu-native's eskiu branch (`WGPU`), which adds the calls that
+link wgpu-native from eskiu-packages/wgpu-native's eskiu branch (`WGPU`), which adds the calls that
 wrap a system image, and an eskiu-gpu that has them (`GPU_DIR`, until a gpu release does).
 
 ### visionOS

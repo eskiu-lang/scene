@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the Quest example into build/EskiuXR.apk (arm64, debug-signed): ../xr_scene.esk and
 # host.c over the OpenXR loader (OPENXR_DIR: the include/ and jni/ of Khronos'
-# openxr_loader_for_android AAR) and wgpu-native from eskiu-lang/wgpu-native's eskiu branch
+# openxr_loader_for_android AAR) and wgpu-native from eskiu-packages/wgpu-native's eskiu branch
 # (WGPU, its eskiu/build_android.sh).
 #
 #     examples/xr/quest/build.sh
