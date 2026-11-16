@@ -418,11 +418,14 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     *GpuTexture bg = self.camera_background > 0 && self.camera_background < self.textures.size &&
         self.textures.data[self.camera_background].handle != null ? &self.textures.data[self.camera_background] : null;
     *GpuTexture bloom_from = null;
-    if (self.post.bloom && _scene_bloom_marked(self, active)) {
+    ScenePost post = self.post;
+    if (post.bloom && _scene_bloom_marked(self, active)) {
         _scene_bloom_source(self, enc, active)?;
         bloom_from = &r.bloom_src;
+    } else if (post.bloom_marked_only) {
+        post.bloom = false;
     }
-    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post, bg, bloom_from);
+    return _scene_post_run(&r.post, enc, &r.hdr, view, format, &post, bg, bloom_from);
 }
 
 import "worlds.esk";
