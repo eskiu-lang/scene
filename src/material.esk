@@ -542,4 +542,4 @@ string _scene_fs_head =
     "    s.rough = clamp(mat.pbr.y * mr_s.g, 0.04, 1.0);\n"
     "    s.ao = 1.0 + mat.pbr.w * (o_s - 1.0);\n";
 
-import "material_shader.esk";
+import "_material/shader.esk";

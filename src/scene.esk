@@ -436,7 +436,7 @@ struct Scene {
     _SceneRenderer _r;
 }
 
-import "scene_nodes.esk";
-import "scene_assets.esk";
-import "scene_gpu.esk";
-import "scene_render.esk";
+import "_scene/nodes.esk";
+import "_scene/assets.esk";
+import "_scene/gpu.esk";
+import "_scene/render.esk";

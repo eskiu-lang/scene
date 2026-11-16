@@ -1,4 +1,4 @@
-// input_dispatch.esk: pointer, gaze, gesture and touch dispatch to the handlers (part of input.esk, which imports it in order after the ones before it)
+// _input/dispatch.esk: pointer, gaze, gesture and touch dispatch to the handlers (part of input.esk, which imports it in order after the ones before it)
 
 int _scene_handler_for(*SceneInput self, *Scene scene, int event, int node) {
     while (node >= 0 && node < scene.nodes.size) {

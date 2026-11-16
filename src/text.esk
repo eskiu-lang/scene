@@ -519,4 +519,4 @@ void _scene_text_free_layout(*_SceneTextLayout l) {
     l.lines.free();
 }
 
-import "text_mesh.esk";
+import "_text/mesh.esk";

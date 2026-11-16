@@ -572,5 +572,5 @@ void ScenePhysicsWorld_on_collision(*ScenePhysicsWorld self, int id, escaping fn
 
 // --- collision ---
 
-import "physics_collide.esk";
-import "physics_solve.esk";
+import "_physics/collide.esk";
+import "_physics/solve.esk";

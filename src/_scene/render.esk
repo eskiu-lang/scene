@@ -1,4 +1,4 @@
-// scene_render.esk: lights, the world bind group, draws and the render passes (part of scene.esk, which imports it in order after the ones before it)
+// _scene/render.esk: lights, the world bind group, draws and the render passes (part of scene.esk, which imports it in order after the ones before it)
 
 Result<int, string> _scene_lights(*Scene self, *Vec3 ambient) {
     *_SceneRenderer r = &self._r;
@@ -425,5 +425,5 @@ Result<int, string> Scene_render_in(*Scene self, *GpuEncoder enc, WGPUTextureVie
     return _scene_post_run(&r.post, enc, &r.hdr, view, format, &self.post, bg, bloom_from);
 }
 
-import "scene_worlds.esk";
-import "scene_targets.esk";
+import "worlds.esk";
+import "targets.esk";

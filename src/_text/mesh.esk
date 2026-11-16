@@ -1,4 +1,4 @@
-// text_mesh.esk: text measurement, quads, extruded outlines and the glyph atlas texture (part of text.esk, which imports it in order after the ones before it)
+// _text/mesh.esk: text measurement, quads, extruded outlines and the glyph atlas texture (part of text.esk, which imports it in order after the ones before it)
 
 // Lays out text with style and returns its size in world units without building it
 // (ViroText's getTextSize), into width and height.

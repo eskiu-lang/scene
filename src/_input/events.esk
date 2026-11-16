@@ -1,4 +1,4 @@
-// input_events.esk: event kinds, handlers and the SceneInput state (part of input.esk, which imports it in order after the ones before it)
+// _input/events.esk: event kinds, handlers and the SceneInput state (part of input.esk, which imports it in order after the ones before it)
 
 // Events a handler takes (SceneInput_on), bits of a mask.
 const int SCENE_ON_CLICK = 1;

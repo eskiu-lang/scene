@@ -1,4 +1,4 @@
-// glsl_stmt.esk: GLSL statements and declarations into WGSL (part of glsl.esk, which imports it in order after the ones before it)
+// _glsl/stmt.esk: GLSL statements and declarations into WGSL (part of glsl.esk, which imports it in order after the ones before it)
 
 // --- statements ---
 

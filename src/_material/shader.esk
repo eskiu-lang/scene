@@ -1,4 +1,4 @@
-// material_shader.esk: the material shaders and ViroReact's shader modifiers (part of material.esk, which imports it in order after the ones before it)
+// _material/shader.esk: the material shaders and ViroReact's shader modifiers (part of material.esk, which imports it in order after the ones before it)
 
 // The WGSL shader of a material key (scene_material_key): the vertex stage vs and the
 // fragment stage fs, over the bind groups the renderer sets (0: frame, lights, shadow

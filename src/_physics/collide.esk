@@ -1,4 +1,4 @@
-// physics_collide.esk: contacts between shapes: spheres, boxes, capsules and triangle meshes (part of physics.esk, which imports it in order after the ones before it)
+// _physics/collide.esk: contacts between shapes: spheres, boxes, capsules and triangle meshes (part of physics.esk, which imports it in order after the ones before it)
 
 struct _PhPart {
     int kind;

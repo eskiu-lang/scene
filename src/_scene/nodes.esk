@@ -1,4 +1,4 @@
-// scene_nodes.esk: the renderer's setup, nodes, transforms, geometry and morph weights (part of scene.esk, which imports it in order after the ones before it)
+// _scene/nodes.esk: the renderer's setup, nodes, transforms, geometry and morph weights (part of scene.esk, which imports it in order after the ones before it)
 
 void _scene_vertex_layout(*GpuVertexLayout l) {
     l.add(WGPUVertexFormat_Float32x3, 0);

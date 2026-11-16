@@ -1,4 +1,4 @@
-// physics_solve.esk: the solver, collision events and their callbacks (part of physics.esk, which imports it in order after the ones before it)
+// _physics/solve.esk: the solver, collision events and their callbacks (part of physics.esk, which imports it in order after the ones before it)
 
 float _ph_bound_radius(*ScenePhysicsBody b) {
     float r = 0.0;

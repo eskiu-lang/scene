@@ -1,4 +1,4 @@
-// scene_assets.esk: textures, lights, the sky and glTF models in the scene (part of scene.esk, which imports it in order after the ones before it)
+// _scene/assets.esk: textures, lights, the sky and glTF models in the scene (part of scene.esk, which imports it in order after the ones before it)
 
 // Adds a texture the scene takes over (it is released with the scene) and returns its id.
 // Color textures (diffuse, specular, emissive) should be in an sRGB format; normal,

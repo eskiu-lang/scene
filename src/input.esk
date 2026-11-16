@@ -235,6 +235,6 @@ bool _scene_hit_draw_before(*Scene self, *SceneHit a, *SceneHit b) {
     return a.distance > b.distance;
 }
 
-import "input_events.esk";
-import "input_dispatch.esk";
-import "input_orbit.esk";
+import "_input/events.esk";
+import "_input/dispatch.esk";
+import "_input/orbit.esk";

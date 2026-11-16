@@ -1,4 +1,4 @@
-// scene_worlds.esk: the bloom source, portals, real-world occlusion and portal crossing (part of scene_render.esk, which imports it in order after the ones before it)
+// _scene/worlds.esk: the bloom source, portals, real-world occlusion and portal crossing (part of scene_render.esk, which imports it in order after the ones before it)
 
 // Whether a draw in view of world uses a material marked to bloom.
 bool _scene_bloom_marked(*Scene self, int world) {

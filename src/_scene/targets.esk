@@ -1,4 +1,4 @@
-// scene_targets.esk: rendering to a view or a texture, and the multisampled targets (part of scene_render.esk, which imports it in order after the ones before it)
+// _scene/targets.esk: rendering to a view or a texture, and the multisampled targets (part of scene_render.esk, which imports it in order after the ones before it)
 
 // Scene_render_in with an encoder of its own, submitted at the end.
 Result<int, string> Scene_render(*Scene self, WGPUTextureView view, uint32 width, uint32 height, WGPUTextureFormat format) {

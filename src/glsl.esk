@@ -701,4 +701,4 @@ _GExpr _g_assign(*GlslTranslator self) {
     return left;
 }
 
-import "glsl_stmt.esk";
+import "_glsl/stmt.esk";

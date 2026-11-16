@@ -1,4 +1,4 @@
-// scene_gpu.esk: GPU resources per frame: samplers, shader layouts, uniforms, node buffers, culling and the camera (part of scene.esk, which imports it in order after the ones before it)
+// _scene/gpu.esk: GPU resources per frame: samplers, shader layouts, uniforms, node buffers, culling and the camera (part of scene.esk, which imports it in order after the ones before it)
 
 *GpuTexture _scene_tex(*Scene self, int id) {
     if (id <= 0 || id >= self.textures.size || self.textures.data[id].handle == null) return &self._r.white;

@@ -1,4 +1,4 @@
-// input_orbit.esk: the orbit camera (part of input.esk, which imports it in order after the ones before it)
+// _input/orbit.esk: the orbit camera (part of input.esk, which imports it in order after the ones before it)
 
 // An orbit camera (ViroReact's ViroOrbitCamera): the camera node stays distance away from
 // target, turned yaw radians about the world Y axis and pitch radians up or down, looking
