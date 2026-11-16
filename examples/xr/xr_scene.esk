@@ -22,6 +22,7 @@ import <gpu/model>;
 import <font/ttf>;
 import <scene>;
 import <scene/vr>;
+import <gpu/external>;
 import <scene/input>;
 import <scene/text>;
 import <scene/particles>;

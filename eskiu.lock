@@ -1,4 +1,4 @@
 # eskiu.lock: written by eskiuc (eskiuc fetch updates it); do not edit.
 font	git	https://github.com/eskiu-lang/font	v0.1.0	656a3d0bc678b88c8e57c496408fb63664c64fe1
-gpu	git	https://github.com/eskiu-lang/gpu	631b4a8fee86fc4378c30cdb774f3c207f5ae521	631b4a8fee86fc4378c30cdb774f3c207f5ae521
+gpu	git	https://github.com/eskiu-lang/gpu	6444d77ee56a3638bc969954801da8ddc59e9bcf	6444d77ee56a3638bc969954801da8ddc59e9bcf
 scene	root	.
