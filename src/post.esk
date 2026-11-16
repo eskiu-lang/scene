@@ -49,7 +49,8 @@ const int SCENE_TONE_HABLE_LUMINANCE = 4;
 // - gamma22 encodes with a power of 1/2.2 instead of the sRGB curve (ViroReact's software
 //   gamma pass). backdrop, when its alpha is above 0, is a display color shown where the scene
 //   leaves the picture uncovered (give the scene a background of alpha 0), untouched by tone
-//   mapping and gamma, as ViroReact's clear color.
+//   mapping and gamma, as ViroReact's clear color. With neither a backdrop (alpha 0) nor a
+//   camera picture, the output keeps the scene's alpha (a headset's passthrough shows through).
 struct ScenePost {
     int tone_mapping;
     float exposure;
@@ -362,9 +363,13 @@ void _scene_post_shader(*int effects, *String out) {
         "        let a = clamp(textureSampleLevel(src, samp, v.uv, 0.0).a, 0.0, 1.0);\n"
         "        e = e + post.e.rgb * (1.0 - a);\n"
         "    }\n");
+    // with no picture and no backdrop behind it (a headset's passthrough, composited under the
+    // image) the scene's own alpha goes out, premultiplied as its color is
+    out.append("    var oa = 1.0;\n"
+        "    if (post.c.w <= 0.5 && post.e.w <= 0.0) { oa = clamp(textureSampleLevel(src, samp, v.uv, 0.0).a, 0.0, 1.0); }\n");
     // an sRGB target encodes what it is given: hand it back the linear value
-    out.append("    if (post.b.y > 0.5) { return vec4<f32>(linear(e), 1.0); }\n");
-    out.append("    return vec4<f32>(e, 1.0);\n}\n");
+    out.append("    if (post.b.y > 0.5) { return vec4<f32>(linear(e), oa); }\n");
+    out.append("    return vec4<f32>(e, oa);\n}\n");
 }
 
 struct _ScenePipeFmt {
