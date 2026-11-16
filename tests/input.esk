@@ -173,6 +173,23 @@ void events(*Scene scene, int box_mesh) {
     check("tiny drag not reported", got.size == before);
     input.touch(scene, touch(1, GPU_TOUCH_UP, 250.0, 200.0, 2.3), W, H);
     check("drag ends", count_kind(SCENE_EVENT_DRAG, SCENE_GESTURE_END) == 1);
+
+    // a press that drags its node is not a click; a tap still is
+    input.off(model);
+    input.on(model, SCENE_ON_CLICK | SCENE_ON_DRAG, void(*SceneEvent e) {
+        record(e);
+    });
+    scene.node(model).position = Vec3{0.0, 0.0, 0.0};
+    List_clear(&got);
+    input.touch(scene, touch(1, GPU_TOUCH_DOWN, 200.0, 200.0, 2.5), W, H);
+    input.touch(scene, touch(1, GPU_TOUCH_MOVE, 250.0, 200.0, 2.6), W, H);
+    input.touch(scene, touch(1, GPU_TOUCH_UP, 250.0, 200.0, 2.7), W, H);
+    check("a drag ends with click up, no clicked", count_kind(SCENE_EVENT_CLICK, SCENE_CLICK_UP) == 1 && count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == 0);
+    scene.node(model).position = Vec3{0.0, 0.0, 0.0};
+    List_clear(&got);
+    input.touch(scene, touch(1, GPU_TOUCH_DOWN, 200.0, 200.0, 2.8), W, H);
+    input.touch(scene, touch(1, GPU_TOUCH_UP, 200.0, 200.0, 2.9), W, H);
+    check("a tap on a draggable node is a click", count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == 1);
     scene.node(model).position = Vec3{0.0, 0.0, 0.0};
     List_clear(&got);
 

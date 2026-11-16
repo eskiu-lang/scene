@@ -98,6 +98,7 @@ void _scene_drag_update(*SceneInput self, *Scene scene) {
     }
     _scene_set_world_position(scene, node, to);
     if ((to - self.drag_last).length() < SCENE_DRAG_THRESHOLD) return;
+    self.drag_moved = true;
     SceneEvent e = _scene_event(SCENE_EVENT_DRAG, SCENE_GESTURE_MOVE, &self.hit);
     e.position = to;
     self.drag_last = to;
@@ -170,6 +171,7 @@ void SceneInput_press(*SceneInput self, *Scene scene) {
     int node = _scene_handler_for(self, scene, SCENE_ON_CLICK, self.hit.node);
     self.pressed = node;
     self.pressing = true;
+    self.drag_moved = false;
     if (node >= 0 || _scene_listens(self, SCENE_EVENT_CLICK)) {
         SceneEvent e = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICK_DOWN, &self.hit);
         _scene_send(self, node, &e);
@@ -200,7 +202,7 @@ void SceneInput_press(*SceneInput self, *Scene scene) {
 }
 
 // Releases the button: a click up to the node that took the press, then clicked when the
-// pointer is still on it, and the end of a drag.
+// pointer is still on it and the press did not drag anything, and the end of a drag.
 void SceneInput_release(*SceneInput self, *Scene scene) {
     if (!self.pressing) return;
     self.pressing = false;
@@ -223,7 +225,8 @@ void SceneInput_release(*SceneInput self, *Scene scene) {
     SceneEvent up = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICK_UP, &self.hit);
     if (now != was) up.has_point = false;
     _scene_send(self, was, &up);
-    if (now == was) {
+    // a press that dragged its node somewhere is not a click
+    if (now == was && !self.drag_moved) {
         SceneEvent done = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICKED, &self.hit);
         _scene_send(self, was, &done);
     }

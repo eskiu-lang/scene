@@ -114,6 +114,8 @@ struct SceneInput {
     int fingers;
     float gesture_dist;
     float gesture_angle;
+    // the press moved what it drags (a drag, not a click)
+    bool drag_moved;
     // SceneInput_listen's listener and the events it takes (SCENE_ON_* bits; 0 none)
     int listen;
     fn(*SceneEvent)->void listener;
