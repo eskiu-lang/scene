@@ -149,6 +149,9 @@ struct SceneNode {
     Vec3 position;
     Quat rotation;
     Vec3 scale;
+    Vec3 rotation_pivot;
+    Vec3 scale_pivot;
+    bool has_pivot;
     bool visible;
     bool alive;
     int mesh;
@@ -167,6 +170,7 @@ struct SceneNode {
     bool portal_sky_pano;
     *GpuIbl portal_ibl;
     bool ignore_events;
+    bool precise_hits;
     Mat4 world;
     List<Mat4> joints;
     List<float> weights;
@@ -205,6 +209,8 @@ struct SceneMesh {
     uint32 vertex_count;
     int targets;
     GpuBuffer morph;
+    List<float> cpu_positions;
+    List<uint32> cpu_indices;
 }
 ```
 
@@ -255,6 +261,7 @@ struct Scene {
     Quat sky_rotation;
     *GpuIbl ibl;
     ScenePost post;
+    int msaa;
     uint32 shadow_size;
     int active_portal;
     int camera_texture;
@@ -265,6 +272,7 @@ struct Scene {
     int semantic_texture;
     int semantic_confidence_texture;
     Mat4 semantic_transform;
+    bool keep_mesh_copies;
 }
 ```
 
@@ -395,6 +403,14 @@ Mat4 Scene_local(*Scene self, int node)
 ```
 
 The local matrix of node: translation * rotation * scale.
+
+### Scene_set_pivots
+
+```eskiu
+void Scene_set_pivots(*Scene self, int node, Vec3 rotation_pivot, Vec3 scale_pivot)
+```
+
+Sets the points node's rotation and scale are about, in its own space.
 
 ### Scene_world
 
@@ -544,6 +560,15 @@ Result<int, string> Scene_image_texture(*Scene self, *Bitmap image, bool srgb)
 
 A texture from decoded pixels, stored as sRGB when srgb (color data) or linear (normal,
 metal-roughness and occlusion maps), with mipmaps; returns its id.
+
+### Scene_image_texture_with
+
+```eskiu
+Result<int, string> Scene_image_texture_with(*Scene self, *Bitmap image, bool srgb, bool mipmaps)
+```
+
+Scene_image_texture with or without its mipmaps (ViroImage's mipmap false: sampled at full
+size only).
 
 ### Scene_load_texture
 
@@ -1542,7 +1567,7 @@ over everything before it). Without rendering orders or depth settings this is t
 nearest hit. When the ray hits nothing, it returns false and hit is the background
 (node 0, background true, the point SCENE_BACKGROUND_DISTANCE along the ray).
 
-### SCENE_ON_CLICK, SCENE_ON_DRAG, SCENE_ON_PINCH, SCENE_ON_ROTATE, SCENE_ON_HOVER, SCENE_ON_FUSE
+### SCENE_ON_CLICK, SCENE_ON_DRAG, SCENE_ON_PINCH, SCENE_ON_ROTATE, SCENE_ON_HOVER, SCENE_ON_FUSE, SCENE_ON_SCROLL
 
 ```eskiu
 const int SCENE_ON_CLICK = 1;
@@ -1551,11 +1576,12 @@ const int SCENE_ON_PINCH = 4;
 const int SCENE_ON_ROTATE = 8;
 const int SCENE_ON_HOVER = 16;
 const int SCENE_ON_FUSE = 32;
+const int SCENE_ON_SCROLL = 64;
 ```
 
 Events a handler takes (SceneInput_on), bits of a mask.
 
-### SCENE_EVENT_CLICK, SCENE_EVENT_DRAG, SCENE_EVENT_PINCH, SCENE_EVENT_ROTATE, SCENE_EVENT_HOVER, SCENE_EVENT_FUSE
+### SCENE_EVENT_CLICK, SCENE_EVENT_DRAG, SCENE_EVENT_PINCH, SCENE_EVENT_ROTATE, SCENE_EVENT_HOVER, SCENE_EVENT_FUSE, SCENE_EVENT_SCROLL
 
 ```eskiu
 const int SCENE_EVENT_CLICK = 1;
@@ -1564,6 +1590,7 @@ const int SCENE_EVENT_PINCH = 3;
 const int SCENE_EVENT_ROTATE = 4;
 const int SCENE_EVENT_HOVER = 5;
 const int SCENE_EVENT_FUSE = 6;
+const int SCENE_EVENT_SCROLL = 7;
 ```
 
 SceneEvent.kind.
@@ -1616,6 +1643,8 @@ struct SceneEvent {
     float scale;
     float rotation;
     float fuse;
+    Vec2 scroll;
+    int source;
 }
 ```
 
@@ -1626,7 +1655,8 @@ for hover 1 on entering and 0 on leaving. point is the world point under the poi
 position is the dragged node's new world position; scale the pinch's distance over the
 starting one; rotation the two fingers' turn since the start, in radians; fuse the
 share of the fuse time left (1 down to 0, at which the node is fused; -1 when the gaze
-left it).
+left it). scroll is a thumbstick's position (x right, y up, -1 to 1) and source the
+controller part it came from (the caller's number).
 
 ### SCENE_DRAG_THRESHOLD, SCENE_PINCH_THRESHOLD, SCENE_ROTATE_THRESHOLD
 
@@ -1790,6 +1820,15 @@ void SceneInput_rotate(*SceneInput self, *Scene scene, float radians, int state)
 ```
 
 A two-finger rotation: radians turned since the start, state a SCENE_GESTURE_* value.
+
+### SceneInput_scroll
+
+```eskiu
+void SceneInput_scroll(*SceneInput self, *Scene scene, float x, float y, int source)
+```
+
+A thumbstick's position (x, y from -1 to 1) on source: a scroll event to the node under the
+pointer that takes them (ViroReact's onScroll from a Quest controller).
 
 ### SceneInput_gaze
 
@@ -2154,6 +2193,8 @@ struct SceneMaterial {
     bool chroma_key;
     Vec3 chroma_key_color;
     bool no_color_write;
+    bool bloom;
+    float bloom_threshold;
 }
 ```
 
@@ -3186,6 +3227,16 @@ const int SCENE_EFFECT_ZOOM = 12;
 
 The circle inside ScenePost.window magnified twice.
 
+### SCENE_EFFECT_FXAA
+
+```eskiu
+const int SCENE_EFFECT_FXAA = 13;
+```
+
+Antialiasing of the displayed image (FXAA): edges are found by luminance and blended
+along their direction. Not one of ViroReact's; put it first, before effects that move
+pixels. Headset views, drawn without multisampling, need it most.
+
 ### scene_effect_named
 
 ```eskiu
@@ -3851,3 +3902,93 @@ void SceneController_free(*SceneController self)
 ```
 
 Frees the controller's reticle lines.
+
+### SceneDepthWriter
+
+```eskiu
+struct SceneDepthWriter {
+    bool made;
+    WGPUTextureFormat color_format;
+    WGPUTextureFormat depth_format;
+    bool reverse;
+    GpuBindLayout layout;
+    GpuPipeline pipe;
+}
+```
+
+Copies the depth of the last frame drawn (Scene_render_eye, Scene_render_to) into a depth
+texture of the same size that a headset's compositor reads to reproject the frame:
+visionOS's drawable depth (reverse: 1 at near, 0 at far, with the drawable's depth range
+set to the eye's far and near) or an OpenXR depth swapchain (forward: 0 at near). The
+pass also takes the color texture just drawn, untouched, to match the pipeline's target.
+
+### scene_depth_writer
+
+```eskiu
+SceneDepthWriter scene_depth_writer()
+```
+
+A depth writer; its pipeline is made on the first write.
+
+### SceneDepthWriter_write
+
+```eskiu
+Result<int, string> SceneDepthWriter_write(*SceneDepthWriter self, *Scene scene, *GpuTexture color, *GpuTexture depth, bool reverse)
+```
+
+Writes scene's last depth into depth (a depth texture as large as color, color being the
+texture that frame was drawn into). reverse writes 1 - d: the same projection with
+reverse-Z, as visionOS wants; the background (d = 1) gets the smallest depth above 0
+instead of 0, since visionOS's compositor drops what is at depth 0 as empty (in tiles,
+so the background would show only around the objects).
+
+### SceneDepthWriter_release
+
+```eskiu
+void SceneDepthWriter_release(*SceneDepthWriter self)
+```
+
+Frees the writer's pipeline; it can write again after.
+
+### SceneIdWriter
+
+```eskiu
+struct SceneIdWriter {
+    bool made;
+    WGPUTextureFormat format;
+    GpuBindLayout value_layout;
+    GpuPipeline pipe;
+    GpuBuffer pass_buf;
+    GpuBindGroup pass_group;
+    List<GpuBuffer> value_bufs;
+    List<GpuBindGroup> value_groups;
+}
+```
+
+Writes the values of tracking areas (SceneIdWriter_write); made empty by scene_id_writer.
+
+### scene_id_writer
+
+```eskiu
+SceneIdWriter scene_id_writer()
+```
+
+An id writer; its pipeline is made on the first write, for the target's format.
+
+### SceneIdWriter_write
+
+```eskiu
+Result<int, string> SceneIdWriter_write(*SceneIdWriter self, *Scene scene, *GpuTexture target, *int nodes, *uint32 values, int count)
+```
+
+Draws nodes[i] (and the meshes under it, a nearer registered node winning) as values[i]
+into target (an unsigned integer texture the size of the eye last drawn, cleared to 0
+first), tested against that eye's depth. Fails when target is not that size.
+
+### SceneIdWriter_release
+
+```eskiu
+void SceneIdWriter_release(*SceneIdWriter self)
+```
+
+Frees the writer's pipeline and buffers; it can write again after.

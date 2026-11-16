@@ -524,6 +524,7 @@ struct SceneDepthWriter {
     GpuPipeline pipe;
 }
 
+// A depth writer; its pipeline is made on the first write.
 SceneDepthWriter scene_depth_writer() {
     SceneDepthWriter w;
     return w;
@@ -590,6 +591,7 @@ Result<int, string> SceneDepthWriter_write(*SceneDepthWriter self, *Scene scene,
     return enc.submit();
 }
 
+// Frees the writer's pipeline; it can write again after.
 void SceneDepthWriter_release(*SceneDepthWriter self) {
     if (!self.made) return;
     self.pipe.release();
@@ -603,6 +605,7 @@ void SceneDepthWriter_release(*SceneDepthWriter self) {
 // Scene_render_eye, SceneIdWriter_write draws the nodes given (with their descendants' meshes)
 // into such a texture as their values, hidden where the scene hides them.
 
+// Writes the values of tracking areas (SceneIdWriter_write); made empty by scene_id_writer.
 struct SceneIdWriter {
     bool made;
     WGPUTextureFormat format;
@@ -614,6 +617,7 @@ struct SceneIdWriter {
     List<GpuBindGroup> value_groups;
 }
 
+// An id writer; its pipeline is made on the first write, for the target's format.
 SceneIdWriter scene_id_writer() {
     SceneIdWriter w;
     return w;
@@ -716,6 +720,7 @@ Result<int, string> SceneIdWriter_write(*SceneIdWriter self, *Scene scene, *GpuT
     return enc.submit();
 }
 
+// Frees the writer's pipeline and buffers; it can write again after.
 void SceneIdWriter_release(*SceneIdWriter self) {
     if (!self.made) return;
     self.pipe.release();
