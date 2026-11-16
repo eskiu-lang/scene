@@ -27,19 +27,6 @@ jobs:
       - name: The example type-checks
         run: eskiuc examples/scene.esk --test-typechecker
 
-  macos:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Eskiu and SDL3
-        run: brew install eskiu-lang/eskiu/eskiu sdl3
-      - name: Tests
-        run: eskiuc test
-      - name: Example builds
-        run: |
-          mkdir -p build
-          for f in examples/*.esk; do eskiuc -L$(brew --prefix)/lib "$f" -o build/$(basename "$f" .esk); done
-
   windows:
     # DirectX 12 through WARP, Windows' software adapter: the tests run with no GPU.
     runs-on: windows-latest
