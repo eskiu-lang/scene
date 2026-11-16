@@ -2851,6 +2851,7 @@ placed at offset and turned by rotation in the body's space.
 struct ScenePhysicsShape {
     List<ScenePhysicsPart> parts;
     bool by_volume;
+    bool node_scale;
 }
 ```
 
@@ -3001,7 +3002,8 @@ int ScenePhysicsWorld_add(*ScenePhysicsWorld self, *Scene scene, int node, int t
 
 Adds a body to node and returns its id. mass must be above 0 for a dynamic body and 0
 for the others (ViroReact's rule); a wrong mass is fixed to 1 or 0. The shape is taken
-over; its sizes are in the node's space without its scale, which the world applies.
+over; the node's scale goes into it only when it is in the node's unscaled space
+(ScenePhysicsShape.node_scale).
 
 ### ScenePhysicsWorld_body
 
@@ -3202,7 +3204,8 @@ encoding off (Gpu_scene turns gamma on):
 - gamma22 encodes with a power of 1/2.2 instead of the sRGB curve (ViroReact's software
   gamma pass). backdrop, when its alpha is above 0, is a display color shown where the scene
   leaves the picture uncovered (give the scene a background of alpha 0), untouched by tone
-  mapping and gamma, as ViroReact's clear color.
+  mapping and gamma, as ViroReact's clear color. With neither a backdrop (alpha 0) nor a
+  camera picture, the output keeps the scene's alpha (a headset's passthrough shows through).
 
 ### SCENE_EFFECT_NONE, SCENE_EFFECT_GRAYSCALE, SCENE_EFFECT_SEPIA, SCENE_EFFECT_SINCITY, SCENE_EFFECT_BARREL, SCENE_EFFECT_PINCUSHION, SCENE_EFFECT_THERMAL, SCENE_EFFECT_CROSSHATCH, SCENE_EFFECT_PIXELATED, SCENE_EFFECT_TOONIFY, SCENE_EFFECT_INVERTED
 

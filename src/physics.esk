@@ -61,6 +61,10 @@ struct _PhTriangles {
 struct ScenePhysicsShape {
     List<ScenePhysicsPart> parts;
     bool by_volume;
+    // sizes in the node's space without its scale, which the world applies when the body is
+    // added (a compound from the node's meshes, a triangle mesh); the others are as given, as
+    // ViroReact's explicit Box and Sphere and its Auto box (already in the node's scale)
+    bool node_scale;
 }
 
 // A box width x height x length, centered on the node.
@@ -89,6 +93,7 @@ ScenePhysicsShape scene_physics_compound() {
 // physics against the world mesh). A dynamic body with it moves as the box around it.
 ScenePhysicsShape scene_physics_triangles(*Vec3 corners, int count) {
     ScenePhysicsShape s;
+    s.node_scale = true;
     if (count < 3) return s;
     Vec3 lo = corners[0];
     Vec3 hi = corners[0];
@@ -176,6 +181,7 @@ ScenePhysicsShape scene_physics_auto(*Scene scene, int node) {
 ScenePhysicsShape scene_physics_auto_compound(*Scene scene, int node) {
     Scene_update(scene);
     ScenePhysicsShape s;
+    s.node_scale = true;
     Vec3 t;
     Quat r;
     Vec3 sc;
@@ -426,7 +432,8 @@ void _ph_read_node(*ScenePhysicsBody b, *Scene scene) {
 
 // Adds a body to node and returns its id. mass must be above 0 for a dynamic body and 0
 // for the others (ViroReact's rule); a wrong mass is fixed to 1 or 0. The shape is taken
-// over; its sizes are in the node's space without its scale, which the world applies.
+// over; the node's scale goes into it only when it is in the node's unscaled space
+// (ScenePhysicsShape.node_scale).
 int ScenePhysicsWorld_add(*ScenePhysicsWorld self, *Scene scene, int node, int type, float mass, ScenePhysicsShape shape) {
     Scene_update(scene);
     ScenePhysicsBody b;
@@ -439,11 +446,11 @@ int ScenePhysicsWorld_add(*ScenePhysicsWorld self, *Scene scene, int node, int t
     b.enabled = true;
     b.alive = true;
     b.tag = "";
-    // the node's scale goes into the parts
+    // the node's scale goes into the parts of a shape in its unscaled space
     Vec3 t;
     Quat r;
-    Vec3 s;
-    scene_decompose(Scene_node(scene, node).world, &t, &r, &s);
+    Vec3 s = Vec3{1.0, 1.0, 1.0};
+    if (shape.node_scale) scene_decompose(Scene_node(scene, node).world, &t, &r, &s);
     for (i in 0..shape.parts.size) {
         *ScenePhysicsPart p = &shape.parts.data[i];
         if (p.kind == _PH_SPHERE) {
