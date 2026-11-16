@@ -98,7 +98,7 @@ Result<int, string> draw(*Gpu gpu, *GpuTexture target) {
 eskiuc add scene --git https://github.com/eskiu-packages/scene --rev v0.2.0
 ```
 
-It needs Eskiu 0.15.1 or newer and brings gpu 0.7.0, which downloads wgpu-native on the first build.
+It needs Eskiu 0.15.1 or newer and brings gpu 0.7.1, which downloads wgpu-native on the first build.
 
 ## License
 
