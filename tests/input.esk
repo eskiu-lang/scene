@@ -1,6 +1,6 @@
 // Hit testing and node events: screen rays, exact tests of rotated, scaled and nested
 // nodes, hidden and ignore_events nodes, bubbling to an ancestor's handler, click
-// states, the drag types, pinch, rotation, hover hysteresis and fuse.
+// states, the drag types, pinch, rotation, hover hysteresis, fuse and the listener.
 import <io>;
 import <mem>;
 import <list>;
@@ -254,6 +254,35 @@ void events(*Scene scene, int box_mesh) {
     fz.gaze(scene, away, 22.0);
     check("fuse resets when the gaze leaves", got.size == 4 && got.data[3].fuse == -1.0);
     fz.free();
+    List_clear(&got);
+
+    // the listener: every click and gesture, on a node or on nothing (ViroController)
+    SceneInput li = scene_input();
+    li.listen(SCENE_ON_CLICK | SCENE_ON_PINCH | SCENE_ON_ROTATE, void(*SceneEvent e) {
+        record(e);
+    });
+    input.touch(scene, touch(1, GPU_TOUCH_DOWN, 390.0, 200.0, 30.0), W, H);
+    input.touch(scene, touch(1, GPU_TOUCH_UP, 390.0, 200.0, 30.1), W, H);
+    check("listener off: nothing", got.size == 0);
+    li.touch(scene, touch(1, GPU_TOUCH_DOWN, 390.0, 200.0, 30.0), W, H);
+    li.touch(scene, touch(1, GPU_TOUCH_UP, 390.0, 200.0, 30.1), W, H);
+    bool none = got.size == 3;
+    for (i in 0..got.size) {
+        if (got.data[i].node != -1) none = false;
+    }
+    check("a tap on nothing reaches the listener: down, up, clicked, node -1", none && count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == 1);
+    List_clear(&got);
+    li.touch(scene, touch(1, GPU_TOUCH_DOWN, 200.0, 200.0, 31.0), W, H);
+    li.touch(scene, touch(1, GPU_TOUCH_UP, 200.0, 200.0, 31.1), W, H);
+    check("a tap on a node without a handler reaches the listener with its target", count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == 1 && got.data[0].target == part);
+    List_clear(&got);
+    li.touch(scene, touch(1, GPU_TOUCH_DOWN, 380.0, 200.0, 32.0), W, H);
+    li.touch(scene, touch(2, GPU_TOUCH_DOWN, 395.0, 200.0, 32.0), W, H);
+    li.touch(scene, touch(2, GPU_TOUCH_MOVE, 410.0, 200.0, 32.1), W, H);
+    li.touch(scene, touch(2, GPU_TOUCH_UP, 410.0, 200.0, 32.2), W, H);
+    li.touch(scene, touch(1, GPU_TOUCH_UP, 380.0, 200.0, 32.2), W, H);
+    check("a pinch on nothing reaches the listener", count_kind(SCENE_EVENT_PINCH, SCENE_GESTURE_START) == 1 && count_kind(SCENE_EVENT_PINCH, SCENE_GESTURE_END) == 1);
+    li.free();
     List_clear(&got);
 
     input.free();

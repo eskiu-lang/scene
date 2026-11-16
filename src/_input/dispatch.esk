@@ -8,11 +8,43 @@ int _scene_handler_for(*SceneInput self, *Scene scene, int event, int node) {
     return -1;
 }
 
+// The SCENE_ON_* bit of an event kind.
+int _scene_on_bit(int kind) {
+    if (kind == SCENE_EVENT_CLICK) return SCENE_ON_CLICK;
+    if (kind == SCENE_EVENT_DRAG) return SCENE_ON_DRAG;
+    if (kind == SCENE_EVENT_PINCH) return SCENE_ON_PINCH;
+    if (kind == SCENE_EVENT_ROTATE) return SCENE_ON_ROTATE;
+    if (kind == SCENE_EVENT_HOVER) return SCENE_ON_HOVER;
+    if (kind == SCENE_EVENT_FUSE) return SCENE_ON_FUSE;
+    return SCENE_ON_SCROLL;
+}
+
+// Whether the listener takes events of kind.
+bool _scene_listens(*SceneInput self, int kind) {
+    return (self.listen & _scene_on_bit(kind)) != 0;
+}
+
+// An event to node's handler (none when node is -1), then to the listener.
 void _scene_send(*SceneInput self, int node, *SceneEvent e) {
-    if (node < 0 || node >= self.handlers.size || !self.handlers.data[node].set) return;
-    e.node = node;
-    fn(*SceneEvent)->void call = self.handlers.data[node].call;
-    call(e);
+    bool handled = node >= 0 && node < self.handlers.size && self.handlers.data[node].set;
+    e.node = handled ? node : -1;
+    if (handled) {
+        fn(*SceneEvent)->void call = self.handlers.data[node].call;
+        call(e);
+    }
+    if (_scene_listens(self, e.kind)) {
+        fn(*SceneEvent)->void tell = self.listener;
+        tell(e);
+    }
+}
+
+// The pointer's hit, or a background hit on nothing when it has none.
+SceneHit _scene_hit_or_none(*SceneInput self) {
+    if (self.has_hit) return self.hit;
+    SceneHit none;
+    none.node = -1;
+    none.background = true;
+    return none;
 }
 
 SceneEvent _scene_event(int kind, int state, *SceneHit hit) {
@@ -125,11 +157,20 @@ void SceneInput_pointer(*SceneInput self, *Scene scene, SceneRay ray, double tim
 // the last SceneInput_pointer pointed: a click down on the node hit, and the start of a
 // drag when that node (or an ancestor) takes drags.
 void SceneInput_press(*SceneInput self, *Scene scene) {
-    if (!self.has_hit) return;
+    if (!self.has_hit) {
+        // on nothing: only the listener hears it
+        if (!_scene_listens(self, SCENE_EVENT_CLICK)) return;
+        self.pressed = -1;
+        self.pressing = true;
+        SceneHit none = _scene_hit_or_none(self);
+        SceneEvent e = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICK_DOWN, &none);
+        _scene_send(self, -1, &e);
+        return;
+    }
     int node = _scene_handler_for(self, scene, SCENE_ON_CLICK, self.hit.node);
     self.pressed = node;
     self.pressing = true;
-    if (node >= 0) {
+    if (node >= 0 || _scene_listens(self, SCENE_EVENT_CLICK)) {
         SceneEvent e = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICK_DOWN, &self.hit);
         _scene_send(self, node, &e);
     }
@@ -167,7 +208,16 @@ void SceneInput_release(*SceneInput self, *Scene scene) {
     self.pressed = -1;
     bool dragging = self.dragged >= 0;
     if (dragging) _scene_drag_end(self, scene);
-    if (was < 0) return;
+    if (was < 0) {
+        // a press no node took: up and clicked to the listener only
+        if (!_scene_listens(self, SCENE_EVENT_CLICK)) return;
+        SceneHit at = _scene_hit_or_none(self);
+        SceneEvent up = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICK_UP, &at);
+        _scene_send(self, -1, &up);
+        SceneEvent done = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICKED, &at);
+        _scene_send(self, -1, &done);
+        return;
+    }
     if (!scene.nodes.data[was].alive) return;
     int now = dragging ? was : _scene_handler_for(self, scene, SCENE_ON_CLICK, self.hit.node);
     SceneEvent up = _scene_event(SCENE_EVENT_CLICK, SCENE_CLICK_UP, &self.hit);
@@ -191,11 +241,18 @@ void SceneInput_cancel(*SceneInput self, *Scene scene) {
 // a SCENE_GESTURE_* value. The pinch goes to the node under the pointer at its start.
 void SceneInput_pinch(*SceneInput self, *Scene scene, float scale, int state) {
     if (state == SCENE_GESTURE_START) {
-        if (!self.has_hit) return;
         self.pinch_last = scale;
-        self.pinched = _scene_handler_for(self, scene, SCENE_ON_PINCH, self.hit.node);
+        self.pinched = self.has_hit ? _scene_handler_for(self, scene, SCENE_ON_PINCH, self.hit.node) : -1;
     }
-    if (self.pinched < 0) return;
+    if (self.pinched < 0) {
+        // no node takes it: the listener alone
+        if (!_scene_listens(self, SCENE_EVENT_PINCH)) return;
+        SceneHit at = _scene_hit_or_none(self);
+        SceneEvent e = _scene_event(SCENE_EVENT_PINCH, state, &at);
+        e.scale = scale;
+        _scene_send(self, -1, &e);
+        return;
+    }
     if (state == SCENE_GESTURE_MOVE) {
         float d = scale - self.pinch_last;
         if (d < SCENE_PINCH_THRESHOLD && d > -SCENE_PINCH_THRESHOLD) return;
@@ -211,11 +268,18 @@ void SceneInput_pinch(*SceneInput self, *Scene scene, float scale, int state) {
 // A two-finger rotation: radians turned since the start, state a SCENE_GESTURE_* value.
 void SceneInput_rotate(*SceneInput self, *Scene scene, float radians, int state) {
     if (state == SCENE_GESTURE_START) {
-        if (!self.has_hit) return;
         self.rotate_last = radians;
-        self.rotated = _scene_handler_for(self, scene, SCENE_ON_ROTATE, self.hit.node);
+        self.rotated = self.has_hit ? _scene_handler_for(self, scene, SCENE_ON_ROTATE, self.hit.node) : -1;
     }
-    if (self.rotated < 0) return;
+    if (self.rotated < 0) {
+        // no node takes it: the listener alone
+        if (!_scene_listens(self, SCENE_EVENT_ROTATE)) return;
+        SceneHit at = _scene_hit_or_none(self);
+        SceneEvent e = _scene_event(SCENE_EVENT_ROTATE, state, &at);
+        e.rotation = radians;
+        _scene_send(self, -1, &e);
+        return;
+    }
     if (state == SCENE_GESTURE_MOVE) {
         float d = radians - self.rotate_last;
         if (d < SCENE_ROTATE_THRESHOLD && d > -SCENE_ROTATE_THRESHOLD) return;
@@ -231,10 +295,10 @@ void SceneInput_rotate(*SceneInput self, *Scene scene, float radians, int state)
 // A thumbstick's position (x, y from -1 to 1) on source: a scroll event to the node under the
 // pointer that takes them (ViroReact's onScroll from a Quest controller).
 void SceneInput_scroll(*SceneInput self, *Scene scene, float x, float y, int source) {
-    if (!self.has_hit) return;
-    int node = _scene_handler_for(self, scene, SCENE_ON_SCROLL, self.hit.node);
-    if (node < 0) return;
-    SceneEvent e = _scene_event(SCENE_EVENT_SCROLL, 0, &self.hit);
+    int node = self.has_hit ? _scene_handler_for(self, scene, SCENE_ON_SCROLL, self.hit.node) : -1;
+    if (node < 0 && !_scene_listens(self, SCENE_EVENT_SCROLL)) return;
+    SceneHit at = _scene_hit_or_none(self);
+    SceneEvent e = _scene_event(SCENE_EVENT_SCROLL, 0, &at);
     e.scroll = Vec2{x, y};
     e.source = source;
     _scene_send(self, node, &e);

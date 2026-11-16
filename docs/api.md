@@ -1709,6 +1709,8 @@ struct SceneInput {
     int fingers;
     float gesture_dist;
     float gesture_angle;
+    int listen;
+    fn(*SceneEvent)->void listener;
 }
 ```
 
@@ -1758,6 +1760,17 @@ void SceneInput_set_fuse_time(*SceneInput self, int node, double seconds)
 ```
 
 The seconds a gaze must stay on node before it is fused (2 by default).
+
+### SceneInput_listen
+
+```eskiu
+void SceneInput_listen(*SceneInput self, int events, escaping fn(*SceneEvent)->void listener)
+```
+
+Sets the listener: it gets every event of the kinds in events (SCENE_ON_* bits) the input
+makes, whether a node takes it or not (a controller's own handlers, as ViroReact's
+ViroController). An event no node takes has node -1, and no point when the pointer hit
+nothing. events 0 removes it.
 
 ### SceneInput_free
 

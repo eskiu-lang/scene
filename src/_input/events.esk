@@ -114,6 +114,9 @@ struct SceneInput {
     int fingers;
     float gesture_dist;
     float gesture_angle;
+    // SceneInput_listen's listener and the events it takes (SCENE_ON_* bits; 0 none)
+    int listen;
+    fn(*SceneEvent)->void listener;
 }
 
 // An empty SceneInput.
@@ -181,10 +184,23 @@ void SceneInput_set_fuse_time(*SceneInput self, int node, double seconds) {
     if (h != null) h.fuse_time = seconds;
 }
 
+// Sets the listener: it gets every event of the kinds in events (SCENE_ON_* bits) the input
+// makes, whether a node takes it or not (a controller's own handlers, as ViroReact's
+// ViroController). An event no node takes has node -1, and no point when the pointer hit
+// nothing. events 0 removes it.
+void SceneInput_listen(*SceneInput self, int events, escaping fn(*SceneEvent)->void listener) {
+    if (self.listen != 0) free_closure(self.listener);
+    self.listen = events;
+    if (events != 0) self.listener = listener;
+    else free_closure(listener);
+}
+
 // Frees the handlers.
 void SceneInput_free(*SceneInput self) {
     for (i in 0..self.handlers.size) {
         if (self.handlers.data[i].set) free_closure(self.handlers.data[i].call);
     }
     self.handlers.free();
+    if (self.listen != 0) free_closure(self.listener);
+    self.listen = 0;
 }
