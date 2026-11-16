@@ -10,8 +10,8 @@ out=${1:?usage: preview.sh OUT [seconds]}
 secs=${2:-2}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-GPU_DIR=${GPU_DIR:-$root/../eskiu-gpu}
-WGPU=${WGPU:-$root/../wgpu-native-eskiu}
+GPU_DIR=${GPU_DIR:-$root/../gpu}
+WGPU=${WGPU:-$root/../wgpu-native}
 ESKIUC=${ESKIUC:-eskiuc}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)

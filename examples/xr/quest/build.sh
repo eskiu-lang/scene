@@ -9,8 +9,8 @@
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
-GPU_DIR=${GPU_DIR:-$root/../eskiu-gpu}
-WGPU=${WGPU:-$root/../wgpu-native-eskiu}
+GPU_DIR=${GPU_DIR:-$root/../gpu}
+WGPU=${WGPU:-$root/../wgpu-native}
 WGPU_LIB=${WGPU_LIB:-$WGPU/eskiu/out/aarch64-linux-android/libwgpu_native.a}
 ESKIUC=${ESKIUC:-eskiuc}
 SDK=${ANDROID_HOME:-$HOME/Library/Android/sdk}

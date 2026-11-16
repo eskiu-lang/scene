@@ -56,7 +56,7 @@
 			CODE_SIGN_STYLE = Automatic;
 			SWIFT_OBJC_BRIDGING_HEADER = bridge.h;
 			OTHER_LDFLAGS = ("$(PROJECT_DIR)/build/xr_scene.o", "$(ESKIU_WGPU_LIB)", "-framework", Metal, "-framework", QuartzCore, "-framework", CompositorServices, "-framework", ARKit, "-framework", AVFoundation, "-framework", CoreMedia, "-framework", CoreVideo, "-lc++", );
-			ESKIU_WGPU_LIB = "$(PROJECT_DIR)/../../../../wgpu-native-eskiu/eskiu/out/aarch64-apple-visionos/libwgpu_native.a";
+			ESKIU_WGPU_LIB = "$(PROJECT_DIR)/../../../../wgpu-native/eskiu/out/aarch64-apple-visionos/libwgpu_native.a";
 			DEAD_CODE_STRIPPING = NO;
 		}; name = Release; };
 		A70000000000000000000001 = {isa = XCConfigurationList; buildConfigurations = (A80000000000000000000001, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };

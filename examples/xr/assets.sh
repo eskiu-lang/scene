@@ -9,7 +9,7 @@ set -eu
 dest=${1:?usage: assets.sh DEST}
 here=$(cd "$(dirname "$0")" && pwd)
 SHOWCASE=${SHOWCASE:-$HOME/Documents/ViroWorkspace/showcase/assets}
-VIRO=${VIRO:-$here/../../../eskiu-viro}
+VIRO=${VIRO:-$here/../../../../eskiu-projects/viro}
 mkdir -p "$dest"
 cp "$VIRO/web/fonts/Roboto.ttf" "$dest/Roboto.ttf"
 cp "$SHOWCASE/360/360_guadalupe.jpg" "$dest/photo.jpg"

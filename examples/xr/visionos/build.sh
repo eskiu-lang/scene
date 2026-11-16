@@ -11,8 +11,8 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 SDK=${SDK:-xrsimulator}
-GPU_DIR=${GPU_DIR:-$root/../eskiu-gpu}
-WGPU=${WGPU:-$root/../wgpu-native-eskiu}
+GPU_DIR=${GPU_DIR:-$root/../gpu}
+WGPU=${WGPU:-$root/../wgpu-native}
 ESKIUC=${ESKIUC:-eskiuc}
 case $SDK in
     xrsimulator) triple=arm64-apple-xros26.0-simulator; rust=aarch64-apple-visionos-sim ;;
