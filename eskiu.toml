@@ -4,5 +4,5 @@ version = "0.1.0"
 main = "examples/scene.esk"
 
 [deps]
-gpu = { git = "https://github.com/eskiu-lang/gpu", rev = "6444d77ee56a3638bc969954801da8ddc59e9bcf" }
+gpu = { git = "https://github.com/eskiu-lang/gpu", rev = "dbfbea646557c2bde53826858fbaa419fd42fca9" }
 font = { git = "https://github.com/eskiu-lang/font", rev = "v0.1.0" }
