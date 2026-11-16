@@ -1709,6 +1709,7 @@ struct SceneInput {
     int fingers;
     float gesture_dist;
     float gesture_angle;
+    bool drag_moved;
     int listen;
     fn(*SceneEvent)->void listener;
 }
@@ -1806,7 +1807,7 @@ void SceneInput_release(*SceneInput self, *Scene scene)
 ```
 
 Releases the button: a click up to the node that took the press, then clicked when the
-pointer is still on it, and the end of a drag.
+pointer is still on it and the press did not drag anything, and the end of a drag.
 
 ### SceneInput_cancel
 
@@ -3181,6 +3182,7 @@ struct ScenePost {
     float bloom_threshold;
     float bloom_strength;
     int bloom_passes;
+    bool bloom_marked_only;
     int[8] effects;
     float time;
     Vec4 window;
@@ -3198,6 +3200,8 @@ encoding off (Gpu_scene turns gamma on):
 - bloom: add a blur of the bright parts; bloom_threshold is the luminance where it
   starts (0 is 1.0), bloom_strength scales it (0 is 1.0), bloom_passes is the number of
   horizontal and vertical blur pairs at half size (0 is 4; more spreads wider).
+  bloom_marked_only blooms only the materials marked for it (SceneMaterial.bloom), as
+  ViroReact: with none of them in view nothing blooms, instead of the whole image.
 - effects: SCENE_EFFECT_* in order. time (seconds, set each frame) drives the swirl, and
   window (left, bottom, right, top in 0..1 from the bottom left; all 0 is the whole
   image) is where the swirl and the zoom happen, as ViroReact's window mask.
