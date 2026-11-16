@@ -1,8 +1,8 @@
 [package]
 name = "scene"
-version = "0.1.0"
+version = "0.2.0"
 main = "examples/scene.esk"
 
 [deps]
-gpu = { git = "https://github.com/eskiu-lang/gpu", rev = "dbfbea646557c2bde53826858fbaa419fd42fca9" }
+gpu = { git = "https://github.com/eskiu-lang/gpu", rev = "v0.7.0" }
 font = { git = "https://github.com/eskiu-lang/font", rev = "v0.1.0" }

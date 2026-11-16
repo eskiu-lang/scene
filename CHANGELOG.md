@@ -4,7 +4,7 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-11-16
 
 ### Added
 
@@ -112,8 +112,34 @@ All notable changes to this package are documented here. The format follows
   pause, resume and stop. `docs/animation.md`.
 - `Scene_camera_matrices` and `Scene_camera_is_ortho`: the view and projection the camera
   renders with.
+- `Scene.msaa`: 4x multisampling of the scene's pass, its depth resolved for what reads it
+  after the frame.
+- Selective bloom: `SceneMaterial.bloom` and `bloom_threshold` bloom only the marked
+  materials, each from its own threshold; `ScenePost.bloom_marked_only` (ViroReact's
+  behavior) blooms nothing when none of them is in view, instead of the whole image.
+- Headsets: `SceneDepthWriter` writes the scene's depth into a compositor's depth texture
+  (reverse-Z or not) for reprojection, and `SceneIdWriter` the ids of the nodes under the
+  gaze into visionOS's tracking areas texture. The `examples/xr` hosts run on Meta Quest
+  (OpenXR, controllers, hands, passthrough) and Apple Vision Pro (CompositorServices).
+- `SceneInput_listen`: one listener for every event of the kinds asked, besides the node
+  handlers.
+- `SCENE_EFFECT_FXAA` among the post effects.
 
-## [0.1.0] - 2026-11-07
+### Changed
+
+- Depends on gpu 0.7.0.
+- The larger modules keep their parts in private `src/_module/` directories. No API change.
+
+### Fixed
+
+- A press that moves past the drag threshold is a drag, not a click as well: releasing a
+  dragged body no longer pushes it as a click would.
+- Explicit physics shapes (Box, Sphere) keep the size given, as in ViroReact, instead of
+  being scaled again by the node's scale; shapes made from the node's meshes still take it.
+- With no backdrop and no camera picture, the post pass keeps the scene's alpha, so a
+  headset's passthrough shows behind the scene.
+
+## [0.1.0]
 
 ### Added
 

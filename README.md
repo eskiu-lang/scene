@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/eskiu-lang/scene/actions/workflows/ci.yml"><img src="https://github.com/eskiu-lang/scene/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.1.0-6448d4" alt="Version 0.1.0">
+  <img src="https://img.shields.io/badge/version-0.2.0-6448d4" alt="Version 0.2.0">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
 
@@ -95,10 +95,10 @@ Result<int, string> draw(*Gpu gpu, *GpuTexture target) {
 ## Install
 
 ```bash
-eskiuc add scene --git https://github.com/eskiu-lang/scene --rev v0.1.0
+eskiuc add scene --git https://github.com/eskiu-lang/scene --rev v0.2.0
 ```
 
-It needs Eskiu 0.15.1 or newer and brings gpu 0.6.0, which downloads wgpu-native on the first build.
+It needs Eskiu 0.15.1 or newer and brings gpu 0.7.0, which downloads wgpu-native on the first build.
 
 ## License
 
