@@ -173,7 +173,7 @@ void _ph_write_nodes(*ScenePhysicsWorld self, *Scene scene) {
         *SceneNode n = Scene_node(scene, b.node);
         if (!n.alive) continue;
         Vec3 origin = b._pos - b._rot.rotate(b._com);
-        Mat4 parent = n.parent >= 0 ? scene.nodes.data[n.parent].world : mat4_identity();
+        Mat4 parent = scene_node_frame(scene, b.node);
         Vec3 pt;
         Quat pr;
         Vec3 ps;

@@ -158,6 +158,12 @@ struct SceneNode {
     // hit tests against its and its descendants' triangles instead of bounds (needs Scene.keep_mesh_copies
     // when the mesh is made; ViroReact's highAccuracyEvents)
     bool precise_hits;
+    // a transform between the parent and the node's own position, rotation and scale, when
+    // has_base (Scene_set_base): world = parent's world * base * local. An AR anchor's
+    // correction goes here (eskiu-packages/arscene), so the node's position, its animations,
+    // drags and physics stay in the parent's coordinates.
+    Mat4 base;
+    bool has_base;
     Mat4 world;
     List<Mat4> joints;
     List<float> weights;

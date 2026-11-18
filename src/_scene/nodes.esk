@@ -460,9 +460,29 @@ Mat4 _scene_billboard(*SceneNode n, Vec3 eye) {
 
 void _scene_update_node(*Scene self, int node, Mat4 parent, bool billboards, Vec3 eye) {
     *SceneNode n = &self.nodes.data[node];
-    n.world = parent * _scene_node_local(n);
+    n.world = n.has_base ? parent * n.base * _scene_node_local(n) : parent * _scene_node_local(n);
     if (billboards && n.billboard != SCENE_BILLBOARD_NONE) n.world = _scene_billboard(n, eye);
     for (i in 0..n.children.size) _scene_update_node(self, n.children.data[i], n.world, billboards, eye);
+}
+
+// Sets the transform between node's parent and the node's own position, rotation and scale
+// (SceneNode.base); Scene_clear_base removes it.
+void Scene_set_base(*Scene self, int node, Mat4 base) {
+    *SceneNode n = &self.nodes.data[node];
+    n.base = base;
+    n.has_base = true;
+}
+
+void Scene_clear_base(*Scene self, int node) {
+    self.nodes.data[node].has_base = false;
+}
+
+// The space node's position, rotation and scale are in: its parent's world matrix, times
+// the node's base when it has one.
+Mat4 scene_node_frame(*Scene self, int node) {
+    *SceneNode n = &self.nodes.data[node];
+    Mat4 parent = n.parent >= 0 ? self.nodes.data[n.parent].world : mat4_identity();
+    return n.has_base ? parent * n.base : parent;
 }
 
 // Recomputes every node's world matrix (SceneNode.world) from the tree, turning

@@ -173,6 +173,21 @@ Result<int, string> graph() {
     scene.remove(bb);
     scene.remove(viewer);
 
+    // a base between the parent and the node (an AR anchor's correction): the node's own
+    // position stays in the parent's space, its world moves with the base
+    int based = scene.add_node(0, "based");
+    scene.node(based).position = Vec3{1.0, 0.0, 0.0};
+    scene.set_base(based, mat4_translate(Vec3{0.0, 0.5, 0.0}));
+    scene.update();
+    check("base moves the world", near3(scene.node(based).world.point(Vec3{0.0, 0.0, 0.0}), Vec3{1.0, 0.5, 0.0}, 1e-5));
+    check("base: the node's frame", near3(scene_node_frame(&scene, based).point(Vec3{0.0, 0.0, 0.0}), Vec3{0.0, 0.5, 0.0}, 1e-5));
+    scene.node(based).position = scene_node_frame(&scene, based).inverse().point(Vec3{2.0, 0.5, 0.0});
+    check("a world position into the node's frame", near3(scene.node(based).position, Vec3{2.0, 0.0, 0.0}, 1e-5));
+    scene.clear_base(based);
+    scene.update();
+    check("base cleared", near3(scene.node(based).world.point(Vec3{0.0, 0.0, 0.0}), Vec3{2.0, 0.0, 0.0}, 1e-5));
+    scene.remove(based);
+
     // the view frustum test behind culling: a camera at the origin looking down -Z
     Mat4 vp = mat4_perspective(1.0, 1.0, 0.1, 100.0);
     check("in front is in view", _scene_sphere_in_view(vp, Vec3{0.0, 0.0, -5.0}, 0.5));

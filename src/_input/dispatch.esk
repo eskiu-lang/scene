@@ -59,9 +59,8 @@ SceneEvent _scene_event(int kind, int state, *SceneHit hit) {
 }
 
 void _scene_set_world_position(*Scene scene, int node, Vec3 p) {
-    *SceneNode n = &scene.nodes.data[node];
-    Mat4 parent = n.parent >= 0 ? scene.nodes.data[n.parent].world : mat4_identity();
-    n.position = parent.inverse().point(p);
+    Mat4 frame = scene_node_frame(scene, node);
+    scene.nodes.data[node].position = frame.inverse().point(p);
     Scene_update(scene);
 }
 
