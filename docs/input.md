@@ -62,7 +62,8 @@ source of touches in view pixels):
 
 Another controller (a mouse, a headset's controller, a hand) calls the parts directly:
 `SceneInput_pointer(scene, ray, time)` when it moves, `SceneInput_press` and
-`SceneInput_release` for its button, `SceneInput_cancel` when the system takes the
+`SceneInput_release` for its button (`SceneInput_release_tap` for a touch that `scene_is_tap`
+calls a tap), `SceneInput_cancel` when the system takes the
 gesture, `SceneInput_pinch` and `SceneInput_rotate` for gestures it recognizes, and
 `SceneInput_gaze(scene, ray, time)` once a frame for fuse. Times are seconds on any clock
 that only goes forward.
@@ -71,7 +72,7 @@ that only goes forward.
 
 | Event | `state` | Fields |
 |---|---|---|
-| `SCENE_EVENT_CLICK` | `SCENE_CLICK_DOWN` on the press, `SCENE_CLICK_UP` on the release (sent to the node that took the press), then `SCENE_CLICKED` when the release is still on that node | `point`, `has_point` (false for an up that left the node) |
+| `SCENE_EVENT_CLICK` | `SCENE_CLICK_DOWN` on the press, `SCENE_CLICK_UP` on the release (sent to the node that took the press), then `SCENE_CLICKED` when the release is still on that node, or the touch was a tap (it lifted within 2% of the view's shorter side of where it went down, within 0.5 s: a node that moved away under the finger is still clicked, at the press's point) | `point`, `has_point` (false for an up that left the node) |
 | `SCENE_EVENT_DRAG` | `SCENE_GESTURE_START` on the press, `SCENE_GESTURE_MOVE` as the node moves, `SCENE_GESTURE_END` on the release | `position`, the node's world position |
 | `SCENE_EVENT_PINCH` | start, move, end | `scale`, the fingers' distance over the starting one |
 | `SCENE_EVENT_ROTATE` | start, move, end | `rotation`, radians turned since the start |

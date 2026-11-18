@@ -1710,6 +1710,10 @@ struct SceneInput {
     float gesture_dist;
     float gesture_angle;
     bool drag_moved;
+    SceneHit press_hit;
+    float tap_x;
+    float tap_y;
+    double tap_time;
     int listen;
     fn(*SceneEvent)->void listener;
 }
@@ -1808,6 +1812,33 @@ void SceneInput_release(*SceneInput self, *Scene scene)
 
 Releases the button: a click up to the node that took the press, then clicked when the
 pointer is still on it and the press did not drag anything, and the end of a drag.
+
+### SceneInput_release_tap
+
+```eskiu
+void SceneInput_release_tap(*SceneInput self, *Scene scene)
+```
+
+Releases a tap (a touch that lifted close to where it went down, soon: scene_is_tap): as
+SceneInput_release, but clicked also when the node moved out from under the finger during
+the press (an animation, physics, the camera), at the point the press hit.
+
+### SCENE_TAP_SLOP, SCENE_TAP_SECONDS
+
+```eskiu
+const float SCENE_TAP_SLOP = 0.02;
+const double SCENE_TAP_SECONDS = 0.5;
+```
+
+A touch that lifts within SCENE_TAP_SLOP of the view's shorter side from where it went down,
+and within SCENE_TAP_SECONDS, is a tap (Android's touch slop and long-press timeout). dx and
+dy are pixels, as width and height.
+
+### scene_is_tap
+
+```eskiu
+bool scene_is_tap(float dx, float dy, double seconds, uint32 width, uint32 height)
+```
 
 ### SceneInput_cancel
 

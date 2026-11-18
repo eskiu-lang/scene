@@ -4,6 +4,12 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- A tap on a node that moved during the press (an animation, physics, the camera) is a click: a touch that lifts close to where it went down, soon, clicks the node it pressed, at the press's point, instead of only when the release still hits it (`SceneInput_release_tap`, `scene_is_tap`; `SceneInput_touch` uses them). A mouse or a controller still clicks only when it releases on the node.
+
 ## [0.2.1] - 2026-11-16
 
 ### Changed
