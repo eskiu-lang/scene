@@ -171,6 +171,8 @@ struct SceneNode {
     *GpuIbl portal_ibl;
     bool ignore_events;
     bool precise_hits;
+    Mat4 base;
+    bool has_base;
     Mat4 world;
     List<Mat4> joints;
     List<float> weights;
@@ -419,6 +421,30 @@ Mat4 Scene_world(*Scene self, int node)
 ```
 
 The world matrix of node, computed now from its ancestors' current transforms.
+
+### Scene_set_base
+
+```eskiu
+void Scene_set_base(*Scene self, int node, Mat4 base)
+```
+
+Sets the transform between node's parent and the node's own position, rotation and scale
+(SceneNode.base); Scene_clear_base removes it.
+
+### Scene_clear_base
+
+```eskiu
+void Scene_clear_base(*Scene self, int node)
+```
+
+### scene_node_frame
+
+```eskiu
+Mat4 scene_node_frame(*Scene self, int node)
+```
+
+The space node's position, rotation and scale are in: its parent's world matrix, times
+the node's base when it has one.
 
 ### Scene_update
 

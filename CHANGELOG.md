@@ -6,6 +6,10 @@ All notable changes to this package are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `SceneNode.base`, a transform between a node's parent and its own position, rotation and scale (`Scene_set_base`, `Scene_clear_base`; `scene_node_frame` is the space the node's transform is in). Drags and physics place the node through it. eskiu-packages/arscene puts an AR anchor's correction there.
+
 ### Fixed
 
 - A tap on a node that moved during the press (an animation, physics, the camera) is a click: a touch that lifts close to where it went down, soon, clicks the node it pressed, at the press's point, instead of only when the release still hits it (`SceneInput_release_tap`, `scene_is_tap`; `SceneInput_touch` uses them). A mouse or a controller still clicks only when it releases on the node.
