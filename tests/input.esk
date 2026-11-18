@@ -154,6 +154,27 @@ void events(*Scene scene, int box_mesh) {
     check("the up off the node has no point", nopoint);
     List_clear(&got);
 
+    // a tap on a node that moves away during the press (an animation, physics, the camera):
+    // clicked on that node, at the point the press hit
+    input.touch(scene, touch(1, GPU_TOUCH_DOWN, 200.0, 200.0, 3.0), W, H);
+    scene.node(model).position = Vec3{50.0, 0.0, 0.0};
+    input.touch(scene, touch(1, GPU_TOUCH_UP, 201.0, 200.0, 3.15), W, H);
+    bool at_press = false;
+    for (i in 0..got.size) {
+        if (got.data[i].state == SCENE_CLICKED) at_press = got.data[i].has_point && got.data[i].node == model;
+    }
+    check("a tap on a node that moved away: up and clicked", count_kind(SCENE_EVENT_CLICK, SCENE_CLICK_UP) == 1 && count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == 1);
+    check("the moved node's click is at the press's point", at_press);
+    List_clear(&got);
+    // a long press on it is no tap: up, no clicked
+    scene.node(model).position = Vec3{0.0, 0.0, 0.0};
+    input.touch(scene, touch(1, GPU_TOUCH_DOWN, 200.0, 200.0, 4.0), W, H);
+    scene.node(model).position = Vec3{50.0, 0.0, 0.0};
+    input.touch(scene, touch(1, GPU_TOUCH_UP, 200.0, 200.0, 4.6), W, H);
+    check("a long press on a node that moved away: up, no clicked", count_kind(SCENE_EVENT_CLICK, SCENE_CLICK_UP) == 1 && count_kind(SCENE_EVENT_CLICK, SCENE_CLICKED) == 0);
+    scene.node(model).position = Vec3{0.0, 0.0, 0.0};
+    List_clear(&got);
+
     // fixed-distance drag: grabbed on the front face 4.5 away, moved to the pixel whose
     // ray is 0.5 to the right at that distance
     input.off(model);
