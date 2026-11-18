@@ -437,6 +437,8 @@ Sets the transform between node's parent and the node's own position, rotation a
 void Scene_clear_base(*Scene self, int node)
 ```
 
+Removes node's base: its transform is its parent's world again.
+
 ### scene_node_frame
 
 ```eskiu
@@ -1865,6 +1867,9 @@ dy are pixels, as width and height.
 ```eskiu
 bool scene_is_tap(float dx, float dy, double seconds, uint32 width, uint32 height)
 ```
+
+True when a touch that moved dx, dy pixels from where it went down and lasted seconds, on a
+view of width x height pixels, is a tap (SCENE_TAP_SLOP, SCENE_TAP_SECONDS).
 
 ### SceneInput_cancel
 

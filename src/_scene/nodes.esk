@@ -473,6 +473,7 @@ void Scene_set_base(*Scene self, int node, Mat4 base) {
     n.has_base = true;
 }
 
+// Removes node's base: its transform is its parent's world again.
 void Scene_clear_base(*Scene self, int node) {
     self.nodes.data[node].has_base = false;
 }

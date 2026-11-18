@@ -216,6 +216,8 @@ void SceneInput_release_tap(*SceneInput self, *Scene scene) { _scene_release(sel
 const float SCENE_TAP_SLOP = 0.02;
 const double SCENE_TAP_SECONDS = 0.5;
 
+// True when a touch that moved dx, dy pixels from where it went down and lasted seconds, on a
+// view of width x height pixels, is a tap (SCENE_TAP_SLOP, SCENE_TAP_SECONDS).
 bool scene_is_tap(float dx, float dy, double seconds, uint32 width, uint32 height) {
     float side = (float)(width < height ? width : height);
     float slop = SCENE_TAP_SLOP * side;
